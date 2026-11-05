@@ -51,6 +51,8 @@ function mysqlAgent() {
     // Freshly apt-installed: Debian's global alias is enabled, nothing published yet.
     'db.phpmyadmin.detect': () => ({ installed: true, dir: '/usr/share/phpmyadmin', version: '5.2.1', configFile: '/etc/phpmyadmin/config.inc.php', webConfigs: [{ path: '/etc/apache2/conf-enabled/phpmyadmin.conf', enabled: true, server: 'apache', urlPath: '/phpmyadmin', global: true }], urlPath: '/phpmyadmin', php: true, candidates: [], dbConfigured: true, globalAlias: { enabled: true, path: '/etc/apache2/conf-enabled/phpmyadmin.conf', urlPath: '/phpmyadmin', a2disconf: true }, published: null, packageHint: 'apt-get install phpmyadmin' }),
     'db.phpmyadmin.global_conf.disable': () => { state.globalAliasDisabled = true; return { path: '/etc/apache2/conf-enabled/phpmyadmin.conf', disabled: true, changed: true, reloaded: true, validated: true, unit: 'apache2' }; },
+    'db.phpmyadmin.signon.write': (a) => { const changed = JSON.stringify(state.signon) !== JSON.stringify(a); state.signon = a; return { path: '/etc/phpmyadmin/conf.d/keel-signon.php', changed, validated: true }; },
+    'db.phpmyadmin.signon.remove': () => { const removed = Boolean(state.signon); state.signon = null; return { path: '/etc/phpmyadmin/conf.d/keel-signon.php', removed }; },
     'web.host.ensure': ({ hostname, reload = true }) => ({ hostname, path: '/etc/apache2/sites-available/keel-host.conf', link: '/etc/apache2/sites-enabled/keel-host.conf', docroot: '/var/www/keel-host', docrootCreated: false, indexWritten: false, appsDir: '/etc/apache2/keel-host.d', phpSocket: '/run/php/php8.5-fpm.sock', ssl: true, certificate: { fullchain: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem', present: true }, changed: false, validated: null, reloaded: false, unit: reload ? 'apache2' : null, warnings: [] }),
     'web.host.status': () => ({ installed: true, flavor: 'debian', path: '/etc/apache2/sites-available/keel-host.conf', link: '/etc/apache2/sites-enabled/keel-host.conf', exists: true, managed: true, enabled: true, hostname: 'panel.example.com', meta: { hostname: 'panel.example.com', ssl: true }, ssl: true, certificate: { fullchain: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem', present: true }, docroot: '/var/www/keel-host', docrootExists: true, phpSocket: '/run/php/php8.5-fpm.sock', appsDir: '/etc/apache2/keel-host.d', apps: [] }),
     'web.host.app.write': ({ name, alias, root, reload = true }) => { state.hostApps.set(name, { alias, root }); return { name, alias: alias.replace(/\/+$/, ''), root, path: `/etc/apache2/keel-host.d/${name}.conf`, phpSocket: '/run/php/php8.5-fpm.sock', vhostPresent: true, changed: true, validated: true, reloaded: reload, unit: reload ? 'apache2' : null, warnings: [] }; },
@@ -705,7 +707,7 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       try { expect((await rGet('/phpmyadmin').expect(200)).body.data.url).toBeNull(); } finally { restore('web.host.status'); }
       await put('/phpmyadmin', { url: 'https://pma.example.com/' }).expect(200);
       const mine = await rGet('/phpmyadmin').expect(200);
-      expect(mine.body.data).toEqual({ installed: true, version: '5.2.1', url: 'https://pma.example.com/', php: true, featureEnabled: true });
+      expect(mine.body.data).toEqual({ installed: true, version: '5.2.1', url: 'https://pma.example.com/', php: true, featureEnabled: true, sso: false });
       expect(JSON.stringify(mine.body.data)).not.toMatch(/\/usr\/share|\/etc\/|webConfigs|candidates|packageHint|published|globalAlias/);
       await rPut('/phpmyadmin', { url: '' }).expect(403);
       await put('/phpmyadmin', { url: 'javascript:alert(1)' }).expect(422);
@@ -754,8 +756,109 @@ describe('Database Services API (MariaDB via mock agent)', () => {
 
       const gone = await del('/phpmyadmin/publish').expect(200);
       expect(gone.body.data).toMatchObject({ published: false, removed: true, reloaded: true, path: '/etc/apache2/keel-host.d/phpmyadmin.conf' });
-      expect(app.agent.callsTo('web.host.app.remove').map((c) => c.args)).toEqual([{ name: 'phpmyadmin' }]);
+      // The signon pieces go with the publication whether or not the switch is on.
+      expect(app.agent.callsTo('web.host.app.remove').map((c) => c.args)).toEqual([{ name: 'phpmyadmin' }, { name: 'keel-signon' }]);
       expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'db.phpmyadmin.unpublish'").get().n).toBe(1);
+      restore('db.phpmyadmin.detect');
+    });
+
+    it('single sign-on: root switches it on host-first (script as /keel, conf.d drop-in), the sign-on rotates a hidden prefix-granted user, off removes the host pieces', async () => {
+      const signonOf = () => app.agent.state.signon;
+      const SIGNON_ON = { path: '/etc/phpmyadmin/conf.d/keel-signon.php', exists: true, managed: true, confDir: true };
+      // Not published yet: the switch refuses, nothing is written.
+      detectWith({ published: null, signon: { ...SIGNON_ON, exists: false, managed: false } });
+      expect((await get('/phpmyadmin/sso').expect(200)).body.data).toMatchObject({ enabled: false, available: false, installed: true, published: false, userSuffix: '_pma', sessionName: 'KeelPmaSignon' });
+      expect((await put('/phpmyadmin/sso', { enabled: true })).status).toBe(409);
+      expect((await put('/phpmyadmin/sso', { enabled: 'yes' })).status).toBe(422);
+      expect((await resellerHttp.get('/api/databases/phpmyadmin/sso')).status).toBe(403);
+      expect(signonOf()).toBeFalsy();
+      // Published: on.
+      detectWith({ published: PUBLISHED, signon: { ...SIGNON_ON, exists: false, managed: false } });
+      app.agent.calls.length = 0;
+      const on = await put('/phpmyadmin/sso', { enabled: true }).expect(200);
+      expect(on.body.data).toMatchObject({ enabled: true, applied: { app: { url: 'https://panel.example.com/keel/', changed: true }, conf: { path: '/etc/phpmyadmin/conf.d/keel-signon.php', changed: true, validated: true } } });
+      const names = app.agent.calls.map((c) => c.name);
+      expect(names.indexOf('web.host.app.write')).toBeLessThan(names.indexOf('db.phpmyadmin.signon.write'));
+      const write = app.agent.callsTo('web.host.app.write')[0].args;
+      expect(write).toMatchObject({ name: 'keel-signon', alias: '/keel', php: true, options: ['-Indexes', '-FollowSymLinks'], directoryIndex: ['pma-signon.php'] });
+      expect(write.root.replace(/\\/g, '/')).toMatch(/\/deploy\/phpmyadmin$/);
+      expect(signonOf()).toEqual({ signonUrl: '/keel/pma-signon.php', logoutUrl: '/phpmyadmin/', sessionName: 'KeelPmaSignon', endpoint: 'http://127.0.0.1:2086/api/panel/sso/phpmyadmin/' });
+      expect(app.ctx.settings.get('panel.phpmyadmin.sso')).toBe(true);
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'phpmyadmin.sso.set'").get().n).toBe(1);
+      detectWith({ published: PUBLISHED, signon: SIGNON_ON });
+      expect((await get('/phpmyadmin/sso').expect(200)).body.data).toMatchObject({ enabled: true, available: true, signonUrl: 'https://panel.example.com/keel/pma-signon.php', script: { published: true, alias: '/keel' }, hints: [] });
+      expect((await rGet('/phpmyadmin').expect(200)).body.data).toMatchObject({ sso: true, url: 'https://panel.example.com/phpmyadmin/' });
+
+      // A sign-on for alice: the hidden user is created at localhost only with one grant per database the account owns
+      // (never a prefix pattern), then dropped and recreated on the next one.
+      const aliceId = app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'alice'").get().id;
+      const owned = app.ctx.db.prepare('SELECT name FROM databases WHERE account_id = ? ORDER BY name').all(aliceId).map((d) => d.name);
+      expect(owned.length).toBeGreaterThan(0);
+      app.agent.calls.length = 0;
+      const first = await app.ctx.databases.phpmyadmin.sso.signon('alice', null);
+      expect(first).toMatchObject({ user: 'alice_pma', host: 'localhost' });
+      expect(first.password).toHaveLength(32);
+      expect(app.agent.callsTo('db.user.drop')).toEqual([]);
+      expect(app.agent.callsTo('db.user.create')[0].args).toMatchObject({ user: 'alice_pma', hosts: ['localhost'], password: first.password });
+      expect(app.agent.callsTo('db.grant').map((c) => c.args)).toEqual(owned.map((database) => expect.objectContaining({ user: 'alice_pma', database, privileges: ['ALL PRIVILEGES'], hosts: ['localhost'] })));
+      expect(app.agent.state.users.has('alice_pma@localhost')).toBe(true);
+      expect(app.agent.state.users.has('alice_pma@203.0.113.5')).toBe(false);
+      expect([...app.agent.state.grants.get('alice_pma@localhost').keys()].sort()).toEqual(owned);
+      expect(app.ctx.db.prepare("SELECT account_id FROM db_users WHERE name = 'alice_pma'").get().account_id).toBe(aliceId);
+      app.agent.calls.length = 0;
+      const second = await app.ctx.databases.phpmyadmin.sso.signon('alice', null);
+      expect(second.password).not.toBe(first.password);
+      expect(app.agent.callsTo('db.user.drop')[0].args).toMatchObject({ user: 'alice_pma', hosts: ['localhost'] });
+      expect(app.agent.callsTo('db.user.create')[0].args).toMatchObject({ user: 'alice_pma', hosts: ['localhost'], password: second.password });
+      expect(app.agent.callsTo('db.user.set_password')).toEqual([]);
+      await expect(app.ctx.databases.phpmyadmin.sso.signon('nobody', null)).rejects.toMatchObject({ status: 404 });
+      // MySQL limits user names to 32 characters: an account whose `<name>_pma` does not fit gets a clear 409, before any op runs.
+      const long = 'averyveryverylongaccountname1';
+      await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: long, domain: 'long.example' }).expect(201);
+      app.ctx.db.prepare("UPDATE db_instances SET engine = 'mysql' WHERE is_active = 1").run();
+      app.agent.calls.length = 0;
+      try {
+        await expect(app.ctx.databases.phpmyadmin.sso.signon(long, null)).rejects.toMatchObject({ status: 409, code: 'sso_unavailable' });
+        expect(app.agent.calls.filter((c) => c.name.startsWith('db.'))).toEqual([]);
+      } finally { app.ctx.db.prepare("UPDATE db_instances SET engine = 'mariadb' WHERE is_active = 1").run(); }
+      expect((await app.ctx.databases.phpmyadmin.sso.signon(long, null)).user).toBe(`${long}_pma`);
+
+      // Hidden from every listing unless system users are asked for; untouchable through the user functions; the name is reserved.
+      expect((await get('/users?pageSize=100').expect(200)).body.data.some((u) => u.name === 'alice_pma')).toBe(false);
+      expect((await get('/users?pageSize=100&system=true').expect(200)).body.data.find((u) => u.name === 'alice_pma')).toMatchObject({ account: 'alice', hidden: true });
+      expect((await rGet('/accounts/alice').expect(200)).body.data.users.map((u) => u.name)).not.toContain('alice_pma');
+      expect((await del('/users/alice_pma')).status).toBe(400);
+      expect((await put('/users/alice_pma/password', { password: 'N3w-Passw0rd!!' })).status).toBe(400);
+      expect((await get('/users/alice_pma/grants')).status).toBe(400);
+      expect((await put('/users/alice_pma/grants', { grants: [] })).status).toBe(400);
+      expect((await post('/users', { name: 'pma', password: 'Str0ng-Passw0rd!', account: 'alice' })).status).toBe(400);
+      expect(app.agent.state.users.has('alice_pma@localhost')).toBe(true);
+
+      // Publishing again re-applies the signon pieces; unpublish removes them but keeps the switch.
+      app.agent.calls.length = 0;
+      await post('/phpmyadmin/publish', {}).expect(200);
+      expect(app.agent.callsTo('web.host.app.write').map((c) => c.args.name)).toEqual(['phpmyadmin', 'keel-signon']);
+      expect(app.agent.callsTo('db.phpmyadmin.signon.write')).toHaveLength(1);
+      app.agent.calls.length = 0;
+      const gone = await del('/phpmyadmin/publish').expect(200);
+      expect(gone.body.data.sso).toMatchObject({ conf: { removed: true }, app: { removed: true }, errors: [] });
+      expect(app.agent.callsTo('web.host.app.remove').map((c) => c.args.name)).toEqual(['phpmyadmin', 'keel-signon']);
+      expect(signonOf()).toBeNull();
+      expect(app.ctx.settings.get('panel.phpmyadmin.sso')).toBe(true);
+      detectWith({ published: null, signon: { ...SIGNON_ON, exists: false, managed: false } });
+      expect((await rGet('/phpmyadmin').expect(200)).body.data.sso).toBe(false);
+      await expect(app.ctx.databases.phpmyadmin.sso.signon('alice', null)).resolves.toMatchObject({ user: 'alice_pma' });
+
+      // Off: setting first, then the drop-in and the script go; the hidden user stays for the account cleanup.
+      const off = await put('/phpmyadmin/sso', { enabled: false }).expect(200);
+      expect(off.body.data).toMatchObject({ enabled: false, applied: { conf: { removed: false }, errors: [] } });
+      expect(app.ctx.settings.get('panel.phpmyadmin.sso')).toBe(false);
+      await expect(app.ctx.databases.phpmyadmin.sso.signon('alice', null)).rejects.toMatchObject({ status: 409 });
+      expect(app.agent.state.users.has('alice_pma@localhost')).toBe(true);
+      for (const r of app.ctx.db.prepare('SELECT args_redacted FROM audit_log').all()) for (const pw of [first.password, second.password]) expect(String(r.args_redacted || '')).not.toContain(pw);
+      await app.ctx.databases.dropUser('alice_pma', { id: null, username: 'root', role: 'root' }).catch(() => {});
+      app.ctx.db.prepare("DELETE FROM db_users WHERE name = 'alice_pma'").run();
+      app.agent.state.users.delete('alice_pma@localhost');
       restore('db.phpmyadmin.detect');
     });
 

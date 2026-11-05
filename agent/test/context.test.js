@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { fileURLToPath } from 'node:url';
 import { createContext, executeOp, DEFAULT_ALLOWED_ROOTS, OpError } from '../src/lib.js';
 
 function rejects(ctx, p, mode) {
@@ -63,6 +64,20 @@ describe('createContext().assertAllowedPath', () => {
     expect(only.assertAllowedPath('/srv/only/a')).toBe('/srv/only/a');
     expect(rejects(only, '/home/u').code).toBe('path_not_allowed');
     expect(rejects(createContext({ allowedRoots: [] }), '/home').code).toBe('path_not_allowed');
+  });
+
+  it('allows deploy/roundcube and deploy/phpmyadmin of the tree the agent runs from as well as /opt/whm', () => {
+    const tree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
+    // Only the deploy roots: a checkout under /home would otherwise be allowed wholesale.
+    const deploy = createContext({ allowedRoots: DEFAULT_ALLOWED_ROOTS.filter((r) => r.includes('/deploy/')) });
+    for (const app of ['roundcube', 'phpmyadmin']) {
+      expect(deploy.assertAllowedPath(`/opt/whm/deploy/${app}/x`)).toBe(`/opt/whm/deploy/${app}/x`);
+      expect(deploy.assertAllowedPath(`${tree}/deploy/${app}/x`)).toBe(`${tree}/deploy/${app}/x`);
+      expect(rejects(deploy, `${tree}/deploy/${app}X`).code).toBe('path_not_allowed');
+    }
+    expect(rejects(deploy, `${tree}/deploy`).code).toBe('path_not_allowed');
+    expect(rejects(deploy, `${tree}/agent/src/lib.js`).code).toBe('path_not_allowed');
+    expect(new Set(DEFAULT_ALLOWED_ROOTS).size).toBe(DEFAULT_ALLOWED_ROOTS.length);
   });
 });
 

@@ -60,6 +60,29 @@ Inline `style={{}}` is acceptable only for one-off layout (a width, a gap, `marg
 colours, fonts, radii or shadows. Prefer the utility classes: `.muted`, `.align-right`, `.grid-2`,
 `.list-plain`, `.form-narrow`, `.row-actions`.
 
+## Phones (≤ 640 px)
+
+`base.css` ends with one additive `@media (max-width: 640px)` block; desktop rendering never
+changes and no class is renamed. What it does, and the rules a page must follow to stay inside it:
+
+- **Nothing scrolls sideways.** `e2e/panel-check.cjs` opens the home page and every account-panel
+  function at 390×844 and fails on `document.documentElement.scrollWidth > innerWidth`, on header
+  actions outside the viewport, and on a visible keyboard hint. Tables are the one exception:
+  they scroll inside `.table-wrap`, so every table stays inside one.
+- **Header and hero stack.** `.page-header` and `.home-hero` become columns; `.page-header-actions`
+  wraps. Keep header actions to two or three buttons; a page with more collapses the rest into the
+  kit's row menu (`RowActions` from `DataTable.jsx`, see the file manager's `.fm-actions-compact`).
+- **Fluid search.** `.search .input` loses its fixed width (`280px` / `220px` on desktop) and fills
+  its row; `.card-header`, `.card-actions`, `.datatable-actions`, `.datatable-footer`, `.form-actions`
+  and `.modal-footer` wrap; `.segmented` wraps.
+- **Key/value lists** (`.kv`) go single column, value under label, left aligned.
+- **Top bar.** The account name next to the avatar is hidden (`.user-menu .user-name`) and the
+  keyboard hint (`<kbd class="kbd-hint">`) is hidden here and under `(pointer: coarse)`; the
+  `Alt /` shortcut still works.
+- **Fixed widths in JSX** are the usual cause of a failure: put the width on a class in `base.css`
+  (`.fm-path-go { width: 300px }`) and override it in the phone block, never `style={{ width }}`
+  on something that must shrink.
+
 ## Naming
 
 The product is **Keel** (default `branding.company_name`; operators change it under

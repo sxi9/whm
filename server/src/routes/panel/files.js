@@ -1,6 +1,7 @@
 import { validate, z, fields } from '../../lib/validate.js';
 import { panelRouter, wrap, created, accepted, relPath, requireFeature } from './index.js';
 import { createPanelFilesService, relPathOrRoot, fileName, fileMode, archiveFormat, JOB_ARCHIVE, JOB_EXTRACT, MAX_TEXT_BYTES, MAX_UPLOAD_BYTES } from '../../services/panel-files.js';
+import { createPanelHtaccessService, dirPath, REALM, HTPASSWD_USER } from '../../services/panel-htaccess.js';
 
 // /api/panel/files — mounted by routes/categories/panel.js behind panelScope,
 // so every handler finds the pinned account in req.panel.
@@ -19,6 +20,21 @@ export async function register(ctx) {
   ctx.jobs.register(JOB_EXTRACT, (job) => svc.runExtractJob(job));
 
   const r = panelRouter(ctx, 'files');
+
+  // Indexes and directory privacy (the .htaccess family, services/panel-htaccess.js)
+  // have their own plan features, so they sit ahead of the file-manager gate.
+  ctx.panelHtaccess ??= createPanelHtaccessService(ctx);
+  const ht = ctx.panelHtaccess;
+  const dirQuery = z.object({ path: dirPath });
+  r.get('/htaccess', validate({ query: dirQuery }), wrap((req) => ht.get(req.panel, req.query, req)));
+  r.post('/htaccess/probe', validate({ body: z.object({ path: dirPath }).strict() }), wrap((req) => ht.probe(req.panel, req.body, req)));
+  r.get('/indexes', requireFeature('indexmanager'), validate({ query: dirQuery }), wrap((req) => ht.indexes.get(req.panel, req.query, req)));
+  r.put('/indexes', requireFeature('indexmanager'), validate({ body: z.object({ path: dirPath, indexes: z.enum(['inherit', 'off', 'on']) }).strict() }), wrap((req) => ht.indexes.set(req.panel, req.body, req)));
+  r.get('/privacy', requireFeature('dirprivacy'), validate({ query: dirQuery }), wrap((req) => ht.privacy.get(req.panel, req.query, req)));
+  r.put('/privacy', requireFeature('dirprivacy'), validate({ body: z.object({ path: dirPath, enabled: z.boolean(), realm: z.string().trim().regex(REALM, 'Letters, digits, spaces and . _ ( ) \' -; max 64 characters').optional() }).strict() }), wrap((req) => ht.privacy.set(req.panel, req.body, req)));
+  r.post('/privacy/users', requireFeature('dirprivacy'), validate({ body: z.object({ path: dirPath, user: z.string().regex(HTPASSWD_USER, 'Letters, digits and . _ @ -; max 64 characters'), password: fields.password }).strict() }), created((req) => ht.privacy.addUser(req.panel, req.body, req)));
+  r.delete('/privacy/users', requireFeature('dirprivacy'), validate({ query: z.object({ path: dirPath, user: z.string().regex(HTPASSWD_USER) }) }), wrap((req) => ht.privacy.removeUser(req.panel, req.query, req)));
+
   r.use(requireFeature('filemanager'));
 
   r.get('/list', validate({ query: pathQuery.extend({ limit: z.coerce.number().int().min(1).max(10000).default(2000) }) }), wrap((req) => svc.list(req.panel, req.query, req)));

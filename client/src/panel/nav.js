@@ -49,6 +49,7 @@ export const PANEL_CATEGORY_DEFS = [
   ['Overview', 'LayoutDashboard', [
     ['Dashboard', 'Usage at a glance, your domains and quick links.', 1],
     ['Account details', 'Your account, plan limits and included features.', 1, { slug: 'account' }],
+    ['Preferences', 'Contact addresses, language and notifications.', 1, { slug: 'preferences' }],
   ]],
   ['Domains', 'Globe', [
     ['Domains', 'Every domain on this account and where it is served from.', 1],
@@ -68,14 +69,19 @@ export const PANEL_CATEGORY_DEFS = [
   ['Files', 'FolderOpen', [
     ['File manager', 'Browse, upload, edit and organise the files of your sites.', 1, { feature: 'filemanager' }],
     ['Disk usage', 'Which folders use the most space.', 1],
+    ['Directory privacy', 'Ask visitors for a username and password before a folder opens.', 1, { feature: 'dirprivacy' }],
+    ['Indexes', 'Whether a folder without an index page lists its files.', 1, { feature: 'indexmanager' }],
   ]],
   ['Email', 'Mail', [
     ['Email accounts', 'Mailboxes on your domains.', 1, { slug: 'accounts', feature: 'emailaccts' }],
     ['Forwarders', 'Copy or redirect incoming mail to another address.', 1, { feature: 'forwarders' }],
     ['Default address', 'What happens to mail for addresses that do not exist.', 1, { feature: 'defaultaddress' }],
     ['Autoresponders', 'Automatic replies while you are away.', 1, { feature: 'autoresponders' }],
+    ['Email filters', 'Sort, forward or discard incoming mail per mailbox.', 1, { slug: 'filters', feature: 'emailfilters' }],
+    ['Account-wide filters', 'Rules that apply to every mailbox on this account.', 1, { slug: 'global-filters', feature: 'emailfilters' }],
     ['Spam filters', 'Scoring thresholds, allow and block lists.', 1, { slug: 'spam', feature: 'spamassassin' }],
     ['Deliverability', 'SPF, DKIM and DMARC records for your domains.', 1],
+    ['Email routing', 'Deliver mail for a domain here or at another mail server.', 1, { slug: 'routing' }],
     ['Webmail', 'Read your mail in the browser.', 1],
     ['Mail usage', 'Messages sent and delivered recently.', 1, { slug: 'usage' }],
   ]],
@@ -98,6 +104,7 @@ export const PANEL_CATEGORY_DEFS = [
   ['Logs', 'ScrollText', [
     ['Access logs', 'Web server access and error logs for your domains.', 1, { feature: 'rawlog' }],
     ['Bandwidth', 'Traffic per month against your plan.', 1],
+    ['Visitors', 'Who visits your sites: visitors, pages, referrers and the full report.', 1, { feature: 'webstats' }],
   ]],
   ['PHP', 'Code', [
     ['PHP versions', 'The PHP version each domain runs.', 1, { slug: 'versions', feature: 'phpversion' }],
@@ -109,9 +116,16 @@ export const PANEL_CATEGORY_DEFS = [
     ['SSH keys', 'Public keys allowed to open a shell on this account.', 1, { feature: 'ssh' }],
     ['Sessions', 'Where this account is signed in.', 1],
     ['API tokens', 'Tokens for scripts that use the panel API.', 1, { slug: 'tokens', feature: 'api' }],
+    ['IP blocker', 'Keep addresses and ranges away from your sites.', 1, { feature: 'ipblocker' }],
   ]],
   ['Usage', 'Gauge', [
     ['Usage', 'Disk, bandwidth and object counts against your plan.', 1],
+  ]],
+  ['Advanced', 'Wrench', [
+    ['Error pages', 'Your own pages for 404 and the other error responses.', 1, { feature: 'errpgs' }],
+  ]],
+  ['Software', 'Package', [
+    ['WordPress', 'Install, update and remove WordPress on your domains.', 1, { feature: 'wordpress' }],
   ]],
 ];
 

@@ -245,7 +245,7 @@ describe('/api/panel/databases', () => {
     app.ctx.settings.set('basic.hostname', 'panel.example.com');
     try {
       const res = await get('/phpmyadmin').expect(200);
-      expect(res.body.data).toEqual({ installed: true, url: 'https://panel.example.com/phpmyadmin/', featureEnabled: true, version: '5.2.1', users: ['alice_app'] });
+      expect(res.body.data).toEqual({ installed: true, url: 'https://panel.example.com/phpmyadmin/', featureEnabled: true, version: '5.2.1', users: ['alice_app'], sso: false });
       for (const key of ['dir', 'configFile', 'webConfigs', 'candidates', 'packageHint', 'published', 'globalAlias']) expect(res.body.data).not.toHaveProperty(key);
       // Not published and no hostname site: the global alias alone is not an address the panel advertises.
       app.agent.set('db.phpmyadmin.detect', () => ({ installed: true, dir: '/usr/share/phpmyadmin', version: '5.2.1', configFile: null, webConfigs: [], urlPath: '/phpmyadmin', php: true, candidates: [], dbConfigured: true, globalAlias: { enabled: true, path: '/etc/apache2/conf-enabled/phpmyadmin.conf', urlPath: '/phpmyadmin', a2disconf: true }, published: null, packageHint: null }));
@@ -261,6 +261,116 @@ describe('/api/panel/databases', () => {
     } finally { app.ctx.settings.set('db.phpmyadmin.enabled', true); }
     setPlan(app, 'alice', (p) => ({ ...p, features: { ...(p.features || {}), phpmyadmin: false } }));
     try { expect((await get('/phpmyadmin').expect(403)).body.error.code).toBe('feature_disabled'); } finally { setPlan(app, 'alice', (p) => ({ ...p, features: { ...(p.features || {}), phpmyadmin: true } })); }
+  });
+
+  it('single sign-on into phpMyAdmin: a one-time link for the hidden prefix user, exchanged once over loopback, never for API tokens', async () => {
+    const previousHostname = app.ctx.settings.get('basic.hostname');
+    app.ctx.settings.set('basic.hostname', 'panel.example.com');
+    app.ctx.settings.set('panel.phpmyadmin.sso', true);
+    const detect = app.agent.ops['db.phpmyadmin.detect'];
+    app.agent.set('db.phpmyadmin.detect', () => ({ ...detect(), signon: { path: '/etc/phpmyadmin/conf.d/keel-signon.php', exists: true, managed: true, confDir: true } }));
+    const exchange = (token) => app.http.get(`/api/panel/sso/phpmyadmin/${token}`);
+    const audit = (action) => app.ctx.db.prepare('SELECT * FROM audit_log WHERE action = ? ORDER BY id').all(action);
+    try {
+      expect((await get('/phpmyadmin').expect(200)).body.data).toMatchObject({ sso: true, users: ['alice_app'] });
+      expect((await post('/phpmyadmin/sso', { extra: 1 })).status).toBe(422);
+      const res = await post('/phpmyadmin/sso').expect(200);
+      const url = new URL(res.body.data.url);
+      expect(url.origin + url.pathname).toBe('https://panel.example.com/keel/pma-signon.php');
+      const token = url.searchParams.get('_keel');
+      expect(token).toMatch(/^[A-Za-z0-9_-]{32,128}$/);
+      expect(res.body.data).toMatchObject({ user: 'alice_pma' });
+      expect(res.body.data).not.toHaveProperty('password');
+      expect(new Date(res.body.data.expiresAt).getTime() - Date.now()).toBeLessThanOrEqual(60_000);
+      const row = app.ctx.db.prepare('SELECT * FROM panel_sso_tokens ORDER BY id DESC').get();
+      expect(row).toMatchObject({ account: 'alice', kind: 'phpmyadmin', used_at: null, token_hash: app.ctx.crypto.hashToken(token) });
+      const password = app.agent.callsTo('db.user.create')[0].args.password;
+      expect(row.payload_enc).not.toContain(password);
+      expect(JSON.parse(app.ctx.crypto.decrypt(row.payload_enc))).toEqual({ user: 'alice_pma', password, host: 'localhost' });
+      expect(app.agent.callsTo('db.user.create')[0].args).toMatchObject({ user: 'alice_pma', hosts: ['localhost'] });
+      const owned = app.ctx.db.prepare("SELECT d.name FROM databases d JOIN accounts a ON a.id = d.account_id WHERE a.username = 'alice' ORDER BY d.name").all().map((d) => d.name);
+      expect(owned.length).toBeGreaterThan(0);
+      expect(app.agent.callsTo('db.grant').map((c) => c.args)).toEqual(owned.map((database) => ({ user: 'alice_pma', database, privileges: ['ALL PRIVILEGES'], hosts: ['localhost'] })));
+      expect([...app.agent.state.grants.get('alice_pma@localhost').keys()].sort()).toEqual(owned);
+      const a = audit('panel.db.phpmyadmin.sso').pop();
+      expect(a).toMatchObject({ target: 'alice' });
+      expect(a.args_redacted).not.toContain(password);
+      expect(a.args_redacted).not.toContain(token);
+
+      // Exchanged once with the stored payload; replay, wrong kind and garbage are refused.
+      const ex = await exchange(token).expect(200);
+      expect(ex.body.data).toEqual({ user: 'alice_pma', password, host: 'localhost' });
+      expect(app.ctx.db.prepare('SELECT used_at FROM panel_sso_tokens WHERE id = ?').get(row.id).used_at).toBeTruthy();
+      expect(JSON.parse(audit('panel.sso.exchange').pop().args_redacted)).toMatchObject({ kind: 'phpmyadmin', subject: 'alice_pma' });
+      expect((await exchange(token)).status).toBe(404);
+      expect((await app.http.get(`/api/panel/sso/webmail/${token}`)).status).toBe(404);
+      expect((await exchange('short')).status).toBe(422);
+
+      // The hidden user never shows in the account's own lists and cannot be touched by name; the name is reserved.
+      expect((await get('/users').expect(200)).body.data.map((u) => u.name)).toEqual(['alice_app']);
+      expect((await get('/phpmyadmin').expect(200)).body.data.users).toEqual(['alice_app']);
+      expect((await del('/users/alice_pma')).status).toBe(404);
+      expect((await put('/users/alice_pma/password', { password: 'An0ther-pass!' })).status).toBe(404);
+      expect((await post('/users', { name: 'pma', password: 'S3cret-pass!' })).status).toBe(400);
+
+      // A second sign-on drops and recreates the user with a new password; the next exchange returns the new one only.
+      app.agent.calls.length = 0;
+      const again = new URL((await post('/phpmyadmin/sso').expect(200)).body.data.url).searchParams.get('_keel');
+      expect(app.agent.callsTo('db.user.drop')[0].args).toMatchObject({ user: 'alice_pma', hosts: ['localhost'] });
+      const rotated = app.agent.callsTo('db.user.create')[0].args.password;
+      expect(rotated).not.toBe(password);
+      expect(app.agent.callsTo('db.user.set_password')).toEqual([]);
+      expect((await exchange(again).expect(200)).body.data.password).toBe(rotated);
+
+      // API tokens, the feature flag, the switch and the exchange after the switch is off.
+      expect((await api.post('/api/panel/databases/phpmyadmin/sso').set(as('alice')).set('X-Token-Scopes', 'panel:databases').send({})).status).toBe(403);
+      setPlan(app, 'alice', (p) => ({ ...p, features: { ...(p.features || {}), phpmyadmin: false } }));
+      try { expect((await post('/phpmyadmin/sso')).status).toBe(403); } finally { setPlan(app, 'alice', (p) => ({ ...p, features: { ...(p.features || {}), phpmyadmin: true } })); }
+      const last = new URL((await post('/phpmyadmin/sso').expect(200)).body.data.url).searchParams.get('_keel');
+      app.ctx.settings.set('panel.phpmyadmin.sso', false);
+      expect((await get('/phpmyadmin').expect(200)).body.data.sso).toBe(false);
+      expect((await post('/phpmyadmin/sso')).status).toBe(409);
+      expect((await exchange(last)).status).toBe(409);
+      for (const r of app.ctx.db.prepare('SELECT args_redacted FROM audit_log').all()) for (const pw of [password, rotated]) expect(String(r.args_redacted || '')).not.toContain(pw);
+    } finally {
+      app.ctx.settings.set('basic.hostname', previousHostname);
+      app.ctx.settings.set('panel.phpmyadmin.sso', false);
+      app.agent.set('db.phpmyadmin.detect', detect);
+      app.ctx.db.prepare("DELETE FROM db_users WHERE name = 'alice_pma'").run();
+      app.agent.state.users.delete('alice_pma@localhost');
+    }
+  });
+
+  it('a sign-on grants the account\'s own databases only: "bob" never reaches the databases of "bob_shop"', async () => {
+    const previousHostname = app.ctx.settings.get('basic.hostname');
+    app.ctx.settings.set('basic.hostname', 'panel.example.com');
+    app.ctx.settings.set('panel.phpmyadmin.sso', true);
+    const detect = app.agent.ops['db.phpmyadmin.detect'];
+    app.agent.set('db.phpmyadmin.detect', () => ({ ...detect(), signon: { path: '/etc/phpmyadmin/conf.d/keel-signon.php', exists: true, managed: true, confDir: true } }));
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'bob_shop', domain: 'bobshop.com' }).expect(201);
+    try {
+      expect((await post('/', { name: 'data' }, 'bob').expect(201)).body.data.name).toBe('bob_data');
+      expect((await post('/', { name: 'site' }, 'bob_shop').expect(201)).body.data.name).toBe('bob_shop_site');
+      app.agent.calls.length = 0;
+      const res = await post('/phpmyadmin/sso', {}, 'bob').expect(200);
+      expect(res.body.data.user).toBe('bob_pma');
+      const bobs = app.ctx.db.prepare("SELECT d.name FROM databases d JOIN accounts a ON a.id = d.account_id WHERE a.username = 'bob' ORDER BY d.name").all().map((d) => d.name);
+      expect(bobs).toContain('bob_data');
+      expect(app.agent.callsTo('db.grant').map((c) => c.args)).toEqual(bobs.map((database) => ({ user: 'bob_pma', database, privileges: ['ALL PRIVILEGES'], hosts: ['localhost'] })));
+      expect([...app.agent.state.grants.get('bob_pma@localhost').keys()].sort()).toEqual(bobs);
+      expect(app.agent.state.grants.get('bob_shop_pma@localhost')).toBeUndefined();
+      for (const c of app.agent.calls) expect(JSON.stringify(c.args)).not.toMatch(/bob_shop|\\\\_%/);
+      // The other way round: bob_shop's user holds only bob_shop_site.
+      app.agent.calls.length = 0;
+      await post('/phpmyadmin/sso', {}, 'bob_shop').expect(200);
+      expect(app.agent.callsTo('db.grant').map((c) => c.args.database)).toEqual(['bob_shop_site']);
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'db.phpmyadmin.signon' ORDER BY id DESC").get().args_redacted)).toMatchObject({ account: 'bob_shop', databases: ['bob_shop_site'] });
+    } finally {
+      app.ctx.settings.set('basic.hostname', previousHostname);
+      app.ctx.settings.set('panel.phpmyadmin.sso', false);
+      app.agent.set('db.phpmyadmin.detect', detect);
+      for (const name of ['bob_pma', 'bob_shop_pma']) { app.ctx.db.prepare('DELETE FROM db_users WHERE name = ?').run(name); app.agent.state.users.delete(`${name}@localhost`); }
+    }
   });
 
   it('gates everything on the mysql feature', async () => {

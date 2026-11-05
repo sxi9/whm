@@ -2,6 +2,7 @@ import { Link } from 'react-router-dom';
 import { Star, Hammer, AlertTriangle, PackageX } from 'lucide-react';
 import { Card, EmptyState } from '../components/Common.jsx';
 import { useT } from '../i18n/useT.js';
+import { fill } from '../i18n/fill.js';
 import { useShell } from './ShellContext.js';
 import { usePanelFavorites } from './hooks/usePanel.js';
 import { panelId } from './nav.js';
@@ -20,7 +21,7 @@ export function PanelPageHeader({ fn, title, description, actions, children }) {
   return (
     <header className="page-header">
       <div className="page-header-main">
-        <nav className="breadcrumbs" aria-label="Breadcrumb">
+        <nav className="breadcrumbs" aria-label={t('panel.shell.breadcrumb', 'Breadcrumb')}>
           <Link to={shell.home}>{t('panel.common.home', 'Home')}</Link>
           {fn && <><span>›</span><span>{t(`${shell.categoryPrefix}.${fn.categorySlug}`, fn.category)}</span></>}
           {heading && <><span>›</span><span className="current">{heading}</span></>}
@@ -54,13 +55,14 @@ export function PanelPage({ fn, title, description, actions, children }) {
 // 501 from the API: the daemon behind this screen is not installed on the server.
 // Customers cannot install anything, so the prompt tells them whom to ask.
 export function PanelCapabilityState({ error, onRetry }) {
+  const { t } = useT();
   if (!error) return null;
   if (error.status !== 501 && error.code !== 'capability_missing' && error.code !== 'binary_not_found') return null;
   return (
-    <EmptyState icon={PackageX} title="Not available on this server">
-      <p>{error.message || 'The service behind this screen is not installed.'}</p>
-      <p className="muted">Ask your hosting provider to enable it. Everything else in the account panel keeps working.</p>
-      {onRetry && <p><button className="btn btn-sm" onClick={onRetry}>Re-check</button></p>}
+    <EmptyState icon={PackageX} title={t('panel.shell.capability_title', 'Not available on this server')}>
+      <p>{error.message || t('panel.shell.capability_text', 'The service behind this screen is not installed.')}</p>
+      <p className="muted">{t('panel.shell.capability_help', 'Ask your hosting provider to enable it. Everything else in the account panel keeps working.')}</p>
+      {onRetry && <p><button className="btn btn-sm" onClick={onRetry}>{t('panel.shell.recheck', 'Re-check')}</button></p>}
     </EmptyState>
   );
 }
@@ -68,18 +70,21 @@ export function PanelCapabilityState({ error, onRetry }) {
 // A mutation answered `applied:false, reason:'capability_missing'` (dev hosts): the
 // record is saved, the host-side change waits for the daemon.
 export function PendingPill({ result }) {
+  const { t } = useT();
   if (!result || result.applied !== false) return null;
-  return <span className="pill pill-info" title={result.reason || 'pending'}>Pending</span>;
+  return <span className="pill pill-info" title={result.reason || 'pending'}>{t('panel.shell.pending', 'Pending')}</span>;
 }
 
 // Feature gate for a page (plan feature off → 403 feature_disabled from the API).
 export function FeatureDisabledState({ fn }) {
+  const { t } = useT();
+  const label = fn && t(`panel.${panelId(fn)}.label`, fn.label);
   return (
     <Card>
-      <EmptyState icon={AlertTriangle} title="Not included in your plan">
-        <p>{fn ? `${fn.label} is not part of the hosting plan on this account.` : 'This feature is not part of the hosting plan on this account.'}</p>
-        <p className="muted">Ask your hosting provider about upgrading the plan.</p>
-        <p><Link to="/panel">Back to the dashboard</Link></p>
+      <EmptyState icon={AlertTriangle} title={t('panel.shell.feature_disabled_title', 'Not included in your plan')}>
+        <p>{fn ? fill(t('panel.shell.feature_disabled_text', '{feature} is not part of the hosting plan on this account.'), { feature: label }) : t('panel.shell.feature_disabled_generic', 'This feature is not part of the hosting plan on this account.')}</p>
+        <p className="muted">{t('panel.shell.feature_disabled_help', 'Ask your hosting provider about upgrading the plan.')}</p>
+        <p><Link to="/panel">{t('panel.shell.back_to_dashboard', 'Back to the dashboard')}</Link></p>
       </EmptyState>
     </Card>
   );
@@ -87,13 +92,14 @@ export function FeatureDisabledState({ fn }) {
 
 // Every function in panel/nav.js routes here until its page exists under pages/panel/.
 export function PanelFunctionPage({ fn }) {
+  const { t } = useT();
   return (
     <PanelPage fn={fn}>
       <Card>
-        <EmptyState icon={Hammer} title="This screen is on its way">
-          <p>{fn.description}</p>
-          <p className="muted">It is already in the navigation and search; its interface lands with the next panel build.</p>
-          <p><Link to="/panel">Back to the dashboard</Link></p>
+        <EmptyState icon={Hammer} title={t('panel.shell.placeholder_title', 'This screen is on its way')}>
+          <p>{t(`panel.${panelId(fn)}.description`, fn.description)}</p>
+          <p className="muted">{t('panel.shell.placeholder_text', 'It is already in the navigation and search; its interface lands with the next panel build.')}</p>
+          <p><Link to="/panel">{t('panel.shell.back_to_dashboard', 'Back to the dashboard')}</Link></p>
         </EmptyState>
       </Card>
     </PanelPage>
@@ -101,9 +107,10 @@ export function PanelFunctionPage({ fn }) {
 }
 
 export function PanelNotFoundPage() {
+  const { t } = useT();
   return (
-    <PanelPage title="Page not found">
-      <Card><EmptyState title="Nothing is at this address"><p>Check the link, or use the search above to find what you were looking for.</p><p><Link to="/panel">Back to the dashboard</Link></p></EmptyState></Card>
+    <PanelPage title={t('panel.shell.not_found_title', 'Page not found')}>
+      <Card><EmptyState title={t('panel.shell.not_found_heading', 'Nothing is at this address')}><p>{t('panel.shell.not_found_text', 'Check the link, or use the search above to find what you were looking for.')}</p><p><Link to="/panel">{t('panel.shell.back_to_dashboard', 'Back to the dashboard')}</Link></p></EmptyState></Card>
     </PanelPage>
   );
 }

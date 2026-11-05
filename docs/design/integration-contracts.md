@@ -649,6 +649,20 @@ Nothing is ever added to customer vhosts; the distro's global aliases (`conf-ena
   Panel › Customization › Account panel renders the status and the Publish/Unpublish actions (`WebmailPublishCard`).
 - **Not done here:** SSO (P1-1); the installer never installs Roundcube; the distro `roundcube.conf` fragment is never
   disabled by the panel (its alias ships commented out on Debian, unlike phpMyAdmin's).
+- **Truthful publish (P1, A3):** Apache accepting a drop-in is not the application answering (Ubuntu 26.04's Roundcube
+  1.6.11 fatals on PHP 8.5 until `bootstrap.php` guards its `array_first()` polyfill). Agent `web.host.app.probe { alias,
+  timeoutMs=5000 }` (`agent/src/ops/web.js`) does one GET to `https://127.0.0.1:<sslPort><alias>/` (http on `port` when the
+  site has no certificate) with SNI and `Host` = the hostname from the site's meta line, `rejectUnauthorized:false`, no
+  redirects, and answers `{ alias, url, hostname, port, tls, status, ok (200–399), location, error, phpFatal }`;
+  `phpFatal` is the last `PHP Fatal error…` line of the last 64 KiB of `keel-host[-ssl]-error.log` when the status is
+  5xx (`lastPhpFatal()`), 300 characters at most. `not_found` when `keel-host.conf` is not panel-managed. Service:
+  `ctx.web.hostApps.probe(alias)` → `{ status, ok, url, error, phpFatal }` (never throws; `status:null, ok:null` when
+  the probe itself failed) and `ctx.web.hostApps.warning(http, label)` → the one line an admin card shows
+  (`Published but answering 500: <phpFatal | log hint>`, `… 404: the alias is not served …`, null when fine or
+  unprobed). `webmail.status()` carries `http` + `warning` once the managed drop-in and the site exist;
+  `webmail.publish()` probes after the reload (`http`, `warning`, `service_config_applies.webmail.ok` false and its
+  `error` = the warning on a failing answer); `ctx.databases.phpmyadmin.status()` carries the same two fields.
+  `WebmailPublishCard` shows the *Answers* row and the state `Published but answering <status>`.
 
 ## 42. Customer panel: DNS delegation awareness (`ctx.panelDns.delegation`)
 Public DNS for a hosted domain may be served elsewhere (the live host's zones are at Cloudflare while BIND answers only
@@ -695,3 +709,429 @@ Account users lose passwords and authenticators; neither recovery may widen what
   role-`user` row only, destroys its sessions, audits `panel.admin.2fa.reset` (`userId`, `wasEnabled`); answers
   `{ username, totpEnabled:false, wasEnabled, enrollmentRequired }`. 404 when the account has no login row.
 - Migration `034_panel-recovery.sql` (`password_reset_tokens`); rows older than a day past expiry are purged on the next request.
+
+## 44. Customer panel: single sign-on into published applications (`ctx.panelSso`, webmail first)
+A browser hand-off from the panel into an application published under the hostname site (Roundcube now, phpMyAdmin
+in P1-2): the panel mints a short-lived single-use token, the application's signon code exchanges it **over loopback
+only** for a credential that kind's handler produces. The master credential never leaves the server any other way.
+- **Table (`034b_panel-sso.sql`):** `panel_sso_tokens (id, user_id → users, account TEXT, kind 'webmail'|'phpmyadmin',
+  token_hash sha256 UNIQUE, payload_enc (lib/crypto.js, JSON), expires_at, used_at, created_at)`; generic across kinds.
+  Rows older than a day past expiry are purged on the next issue.
+- **Service (`services/panel-sso.js`, created by `routes/categories/panel.js` before the sub-routers load):**
+  - `ctx.panelSso.issue({ kind, userId, account, payload, ttlMs = 60_000 })` → `{ token, expiresAt }`; `token` is
+    `crypto.randomToken(32)` (43 base64url chars, matches `SSO_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/`).
+  - `ctx.panelSso.redeem(kind, token)` → `{ id, userId, account, kind, payload }` exactly once: unknown, spent, expired or
+    wrong-kind → `404 sso_token_invalid`; the burn is one `UPDATE … SET used_at WHERE id = ? AND used_at IS NULL` whose
+    `changes === 1` is the single-use guarantee.
+  - `ctx.panelSso.register(kind, handler)` — `handler(claim, req)` builds the exchange answer; **phpMyAdmin registers
+    `'phpmyadmin'` the same way** (P1-2) and gets the route, loopback check, burn and audit for free.
+  - `ctx.panelSso.exchange(kind, token, req)` — `isLoopbackRequest(req)` (socket peer **and** `req.ip` loopback, and no
+    `X-Forwarded-For`/`Forwarded`/`X-Real-IP` header: `trust proxy = loopback` would otherwise honour a forwarded address
+    from the loopback peer) else `403 loopback_only` without burning the token; `403 panel_disabled` with the panel off;
+    then redeem → handler → audit `panel.sso.exchange` (target = account, `kind`, `tokenId`, `userId`, `subject`).
+- **Route:** `GET /api/panel/sso/:kind/:token` is a **public mount** (`{ path: '/panel/sso', public: true }`, served before
+  `requireAuth`; `kind` ∈ `SSO_KINDS`, token validated by the regex → 422 otherwise) — the signon code has no session.
+- **Webmail kind (P1-1):**
+  - Dovecot master user `keel-master` (`WEBMAIL_SSO` in service-configuration: `masterUser`, `masterFile
+    /etc/dovecot/whm/master-users`, separator `*`, plugin `keel_sso`, settings `panel.webmail.sso`,
+    `panel.webmail.master_enc`, `panel.login_as_webmail`). `renderDovecotVirtualAuth({ …, masterFile })` adds
+    `auth_master_user_separator = *` and a `master = yes` passwd-file passdb (`passdb master-users { driver = passwd-file;
+    master = yes; passwd_file_path = <masterFile>; result_success = continue }` on 2.4, `passdb { driver = passwd-file;
+    args = <masterFile>; master = yes; result_success = continue }` on 2.3) **before** the virtual passdb, only while
+    `panel.webmail.sso` is on and a master credential exists (`virtualMail.renderDovecot` reads the settings, so the boot
+    job and every apply render it). `result_success = continue` keeps the mailbox lookup (existence, `disabled`) in force.
+  - Agent `vmail.master.write { user /^[a-z][a-z0-9_-]{0,31}$/, hash (crypt) }` → `{ user, path, changed }`: whole file
+    `# managed\n<user>:{SHA512-CRYPT}<hash>\n`, atomic 0640 root:dovecot; `vmail.master.remove {}` (destructive).
+  - `ctx.web.webmail.sso.set({ enabled?, loginAs? }, req)` (`PUT /api/panel/admin/webmail/sso`, requireRoot): on enable,
+    `capabilities.require('dovecot')`, the password is `crypto.randomPassword(32)` generated **once** (kept across
+    off/on), `vmail.hash` → `vmail.master.write` (host first) → `panel.webmail.master_enc` (`crypto.encrypt`) →
+    `panel.webmail.sso = true`; then, when `service_config.virtual_mail.enabled` and both daemons exist,
+    `virtualMail.apply({ enabled: true })` re-renders the include (reload), and for a published Roundcube
+    `writeWebmailConfig` (plugin install + block). Disable: setting off, `vmail.master.remove`, the same re-render and
+    block rewrite without the plugin (the plugin directory stays). Audit `webmail.sso.set`; `service_config_applies
+    .webmail_sso`. `sso.status()` / `GET /api/panel/admin/webmail/sso` and `ctx.web.webmail.status().sso` →
+    `{ enabled, loginAs, masterUser, masterFile, masterConfigured, plugin: { name, installed, loaded }, dovecot:
+    { rendered, path }|null, lastApply }`. `sso.credentials()` → `{ user, password, host: 'ssl://<hostname>:993' }`
+    (409 unless on) — called by the exchange handler only.
+  - `ctx.panelEmail.webmail(scope)` adds `sso: true` only for the panel-published Roundcube (never for
+    `panel.webmail_url`); `ctx.panelEmail.webmailSso(scope, { mailbox }, req)` (`POST /api/panel/email/webmail/sso`,
+    session only → `403 session_required` for API tokens; feature `emailaccts`; the mailbox must be the account's and not
+    suspended → 404/409; `409` while SSO is unavailable; `403 not_while_impersonating` while acting unless
+    `panel.login_as_webmail`) → `{ url: '<webmail url>?_keel=<token>', mailbox, expiresAt }`, audit
+    `panel.email.webmail.sso` (`mailbox`, `expiresAt`, `actingAs`/`by`). The registered handler answers
+    `{ user: '<mailbox>*keel-master', password, host, mailbox }` (the plugin takes the master user from the part after
+    `*`, or from an optional `masterUser` field). `clientSettings` carries `webmail` (the same URL) and `webmailSso`.
+  - Roundcube plugin `deploy/roundcube/keel_sso/` (`keel_sso.php` + `composer.json`; `install.sh` rsyncs `deploy/` into
+    the app dir, so it lives at `/opt/whm/deploy/roundcube/keel_sso`): hook `startup` on every task; with `?_keel=` it
+    GETs `<keel_sso_endpoint><token>` (the Keel block's `$config['keel_sso_endpoint']`, rendered from the panel's own
+    listener by `lib/sso-endpoint.js` `ssoEndpoint(config, 'webmail')` — `https://127.0.0.1:<tlsPort>/api/panel/sso/webmail/`
+    with TLS, `http://127.0.0.1:<port>/…` without; default `https://127.0.0.1:2087/…` when absent; peer verification is
+    skipped **only** when the endpoint host is loopback). **One Roundcube user record per mailbox:** the plugin splits the
+    answer's `user` at `*` (or takes `masterUser` when present), sets `imap_auth_type = smtp_auth_type = 'PLAIN'`,
+    `imap_auth_cid = smtp_auth_cid = <master>`, `imap_auth_pw = smtp_auth_pw = <master password>` and calls
+    `$rcmail->login(<mailbox>, <master password>, $host)` — SASL PLAIN with the mailbox as authorization identity and the
+    master user as authentication identity (Dovecot master passdb; Exim's dovecot authenticators pass it through for
+    SMTP), so password logins and single sign-on share the `users` row, identities, contacts and settings. The master
+    user is kept in `$_SESSION['keel_sso']`, the master password is the encrypted session password, and the six settings
+    are re-applied on every request of that session. With a session already open: the token is still exchanged (burned);
+    the same mailbox → redirect to `_task=mail` with the token stripped; another mailbox → `kill_session()` and the new
+    login; a failed exchange leaves the open mailbox with a notice. Without a session any failure → login form with a
+    notice. `auth_master_user_separator = *` stays in the Dovecot fragment (the `<mailbox>*<master>` form remains valid
+    for `doveadm auth test`).
+  - Agent `web.webmail.plugin.install { source }` (`source` must match `<deploy>/roundcube/<name>` under an allowed root —
+    `/opt/whm/deploy/roundcube` added to `DEFAULT_ALLOWED_ROOTS` — and contain `<name>.php`): copies the top-level
+    `.php/.json/.js/.css/.txt/.md` files into `<install>/plugins/<name>` as root:root 0755/0644 with a `.keel_plugin`
+    marker; refuses a symlinked plugins dir or a destination Keel did not create. `web.webmail.plugin.remove { name }`
+    (destructive, marker required). `web.webmail.detect` gains `plugins: { dir, keel: [names] }|null`;
+    `web.webmail.config.write` gains `plugins: [names]` → `$config['plugins'][] = '<name>';` lines inside the Keel block
+    (after the distro's `$config['plugins'] = [...]`) and `ssoEndpoint?` (pinned by `SSO_ENDPOINT_RE`
+    `^https?://127\.0\.0\.1:\d{1,5}/api/panel/sso/webmail/$`) → `$config['keel_sso_endpoint'] = '…';`;
+    `readConfigBlock()` returns `plugins` and `ssoEndpoint` (`null` when absent), `status().config.inSync` compares both
+    (`writeWebmailConfig` passes the endpoint only when the plugin is on).
+- **Client:** `pages/panel/email/webmail.jsx` `WebmailOpenButton` / `openWebmailSso` (POST, then the window opened on
+  the click navigates; plain `?_user=` link when `sso` is false or the mailbox is suspended), reused by the mailbox
+  connection sheet; Panel › Customization › Webmail card `WebmailSsoSettings` (toggle + "allow while logged in as").
+
+- **phpMyAdmin kind (P1-2, `ctx.databases.phpmyadmin.sso` + `ctx.panelDatabases.phpMyAdminSso`):**
+  - Credential: a hidden per-account MySQL user `<account>_pma` (`signonUserFor()`, `PHPMYADMIN_SSO` in
+    database-services) at `localhost` only, holding one `GRANT ALL PRIVILEGES ON \`<db>\`.*` (agent `db.grant`) per row
+    of `databases` the account owns at sign-on time — **never a prefix pattern**: usernames may contain `_`, so
+    `bob\_%` would also match every database of an account `bob_shop` (the `db.grant.wildcard` op was removed). Every
+    sign-on drops and recreates the user (`db.user.drop` when `db.users.list` shows it, then `db.user.create` with a
+    fresh `crypto.randomPassword(32)`), so it holds exactly the grants issued then; a database created afterwards is
+    covered by the next sign-on (tokens live 60 s). `signon()` answers `409 sso_unavailable` before any op when
+    `<account>_pma` exceeds the engine's user-name limit (`SIGNON_NAME_MAX`: MySQL 32, MariaDB 80). The audit
+    `db.phpmyadmin.signon` lists the `databases` granted. The row is kept in `db_users` (so terminate's `removeAccountData` drops it) but it is **hidden**: not in
+    `forAccount().users` (panel lists, backups), `listUsers` marks it `hidden: true` and drops it unless `?system=true`,
+    the user functions (drop / password / grants) answer `400` for it, the panel's `ownedUser` says 404, and the
+    `pma` name is reserved for the account (`400`). No migration: the suffix convention derives it.
+  - Switch `panel.phpmyadmin.sso` (`GET|PUT /api/databases/phpmyadmin/sso { enabled }`, requireRoot; audit
+    `phpmyadmin.sso.set`): on (MySQL/MariaDB profile, phpMyAdmin installed **and published by the panel** else 409),
+    host first — `ctx.web.hostApps.publish({ name: 'keel-signon', alias: '/keel', root: <deploy>/phpmyadmin, php: true,
+    options: ['-Indexes', '-FollowSymLinks'], directoryIndex: ['pma-signon.php'] })` then agent
+    `db.phpmyadmin.signon.write { signonUrl: '/keel/pma-signon.php', logoutUrl: '/phpmyadmin/', sessionName:
+    'KeelPmaSignon', endpoint: ssoEndpoint(config, 'phpmyadmin') }` (`endpoint` pinned by `PMA_SSO_ENDPOINT_RE`
+    `^https?://127\.0\.0\.1:\d{1,5}/api/panel/sso/phpmyadmin/$`; renders `/etc/phpmyadmin/conf.d/keel-signon.php`:
+    `defined('KEEL_SSO_ENDPOINT') || define('KEEL_SSO_ENDPOINT', '…');` first, then server 2 = a copy of server 1 with cookie
+    auth, server 1 → `auth_type = 'signon'`, `SignonSession`, `SignonURL`, `LogoutURL`, `ServerDefault = 1`; `php -l`
+    on a temp copy before the atomic write; refuses to overwrite a file without the Keel marker; `db.phpmyadmin.signon.remove`
+    is destructive, marker required; `db.phpmyadmin.detect` gains `signon: { path, exists, managed, confDir }`) — then
+    the setting. Off: setting, then drop-in and script removed; the hidden users stay. `phpmyadmin.publish()` re-applies
+    both while the switch is on (`result.sso`, warning `sso_not_applied`), `unpublish()` removes them and keeps the switch.
+    `/opt/whm/deploy/phpmyadmin` is in `DEFAULT_ALLOWED_ROOTS` (read root of the published app).
+  - `ctx.databases.phpMyAdmin(user).sso` is true only for the panel's own publication (never the URL override), with the
+    drop-in in place and the feature on; `ctx.panelDatabases.phpMyAdmin(scope)` carries it as `sso`.
+  - `POST /api/panel/databases/phpmyadmin/sso {}` (session only → `403 session_required`; feature `phpmyadmin` +
+    `mysql`; `409 sso_unavailable` while off) → `signon(username)` rotates the user, `panelSso.issue({ kind:
+    'phpmyadmin', payload: { user, password, host: 'localhost' } })` → `{ url: 'https://<hostname>/keel/pma-signon.php?_keel=
+    <token>', user, expiresAt }`, audit `panel.db.phpmyadmin.sso` (`user`, `expiresAt`; never the password) plus
+    `db.phpmyadmin.signon`. The registered handler answers the decrypted payload once (`404 sso_token_invalid` without
+    one, `409 sso_unavailable` once the switch is off), audited as `panel.sso.exchange` with `subject = user`.
+  - Script `deploy/phpmyadmin/pma-signon.php` (served as `/keel/pma-signon.php` by the hostname site's PHP-FPM www pool):
+    with `?_keel=` it GETs `<endpoint><token>` — the `KEEL_SSO_ENDPOINT` constant of the agent-written drop-in
+    (`/etc/phpmyadmin/conf.d/keel-signon.php`, included in a scope of its own; it is the one file phpMyAdmin and the
+    script both read), else a `KEEL_SSO_ENDPOINT` request variable / environment entry, else
+    `https://127.0.0.1:2087/api/panel/sso/phpmyadmin/`; peer verification skipped only for a loopback host), starts the
+    `KeelPmaSignon` session (cookie path `/`, `HttpOnly`,
+    `Secure` on HTTPS, `SameSite=Lax`, id regenerated, session emptied), stores `PMA_single_signon_user|password|host`
+    and redirects to `/phpmyadmin/index.php?server=1`. Without a token (phpMyAdmin's logout and failed-signon landing)
+    it shows phpMyAdmin's `PMA_single_signon_error_message` if any and links the cookie login `/phpmyadmin/index.php?server=2`.
+    The token never appears in the page or a log.
+  - Client: `pages/panel/databases/phpmyadmin.jsx` `PhpMyAdminOpenButton` / `openPhpMyAdminSso` (window-open-first,
+    plain link when `sso` is false); Panel › Customization › Account panel `PhpMyAdminSsoCard` (toggle, requires the
+    publication first).
+
+## 45. Customer panel: Sieve mail filters (`ctx.panelEmail.filters`, `vmail.sieve.*`)
+Structured rules in the panel's own table, Sieve rendered by the panel, compiled and installed by the agent as the account.
+- **Dovecot side (service-configuration owns it):** `renderDovecotVirtualAuth({ …, sieve })` loads the `sieve` plugin for
+  `protocol lmtp` only and emits `renderDovecotSieve(v24)` **only when `sieve` is true** — `virtualMail.renderDovecot`
+  passes `capabilities.has('sieve')` (sievec present ⇒ Pigeonhole installed); without it the fragment carries no `sieve`
+  token at all, because Dovecot loads plugins at delivery time, not in `doveconf -n`, and an unconditional line would
+  fail every LMTP delivery on a host without dovecot-sieve (re-apply the wiring after installing the package): 2.4 `sieve_script personal { type = personal; path = ~/mail/%{user | domain}/
+  %{user | username}/sieve; active_path = …/.dovecot.sieve }` + `sieve_script keel_account { type = before; path =
+  ~/mail/sieve-global/keel.sieve }`; 2.3 `plugin { sieve = file:~/mail/%d/%n/sieve;active=~/mail/%d/%n/.dovecot.sieve;
+  sieve_before = ~/mail/sieve-global/keel.sieve }`. `SIEVE_PATHS` names the pieces; `agent/src/ops/vmail.js`
+  `sievePaths(home, scope, mailbox)` builds the same paths (`agent/test/vmail-sieve.test.js` keeps them in step).
+  A missing script is skipped by Pigeonhole, so mailboxes without rules cost nothing. ManageSieve stays off.
+- **Agent ops** (`vmail.sieve.write { username, scope: 'mailbox'|'account', mailbox?, script }`, `vmail.sieve.test` same
+  args, `vmail.sieve.remove { username, scope, mailbox? }`, destructive): the home comes from `/etc/passwd`
+  (`assertManaged`), paths are pinned with `accountPath` (lexical + symlink containment under `/home`), a mailbox must have
+  a real maildir, and every command runs under the account uid (`as-user.js`: `mkdir -p -m 0700`, `dd` from stdin,
+  `chmod 0600`, `sievec <stage> <stage>.svbin`, `mv -f -T`, `ln -s -T` + `mv -T` for the active symlink). The live
+  script and the active symlink change only after a clean compile; a failed compile is `invalid_sieve` (→ 422) with
+  `details.errors[{ line, message }]` and the staged pair is removed. `sievec` missing → `capability_missing` (501,
+  capability `sieve` registered by `routes/panel/email.js` with binaries `['sievec']`). `vmail.sieve.test` runs
+  `sievec -d` on the staged copy and answers `{ ok, errors, warnings }`.
+- **Panel service** (`ctx.panelEmail.filters.list/create/update/remove/reorder/test`, routes `GET|POST
+  /api/panel/email/filters?mailbox=<id>`, `PUT|DELETE …/filters/:id`, `POST …/filters/reorder|test`, and
+  `/api/panel/email/global-filters…` for the account scope; feature `emailfilters`): the mailbox id is matched against the
+  pinned account (`loadMailbox`, 404 otherwise), a row reached by id must belong to the route's scope family. Host first:
+  the whole script of the scope is rendered from the rows as they would be after the change (`renderSieve`, enabled rows
+  in `position` order, `require` only for the extensions used) and written; the rows change afterwards. An emptied scope
+  calls `vmail.sieve.remove`. Grammar (`normalizeRules`): 1–10 conditions (`from|to|subject|body|any_header|custom`+`name`,
+  `contains|is|matches|not_contains`, single-line values ≤ 998 chars, escaped as `\\` and `\"` inside quoted strings),
+  1–5 actions (`fileinto :create` with a folder name free of quotes, slashes and leading/trailing/doubled dots; `redirect`
+  to a plain address, ≤ 4 per rule; `discard`; `stop`). Audit `panel.email.filter.*`. Table `panel_mail_filters`
+  (migration `034c`, `mailbox_id` cascades from `mail_accounts`; `001`'s `mail_filters` is the admin Email ACL table,
+  unrelated). Setting `panel.mail.max_filters_per_scope` (100).
+
+## 47. Customer panel: the `.htaccess` family (`ctx.panelHtaccess`, agent `files.htaccess.*` / `files.htpasswd.*` / `files.errorpages.*`)
+Directory privacy, Indexes, the IP blocker and Error pages share one panel-managed block per directory; nothing is stored in SQLite.
+- **Agent** (`agent/src/ops/htaccess.js`, every command as the account through `as-user.js`):
+  `files.htaccess.get { username, path }` → `{ path, rel, exists, managed, spec, foreign, size }`;
+  `files.htaccess.set { username, path, block: spec | null, probe?: { url, ip = 127.0.0.1 } }` renders the block from the
+  structured spec (`denyIps: [ip|cidr] ≤ 500`, `errorDocuments: { 400|401|403|404|500|503: '/errors/<name>.html' }`,
+  `indexes: inherit|off|on`, `auth: { realm, userFile } | null`) between `# BEGIN Keel` / `# END Keel`, validates every
+  rendered line against the closed grammar (`validateBlock`), merges it into `<path>/.htaccess` keeping everything outside the
+  markers byte for byte (`mergeBlock`; `null` removes the block and the file when nothing else is in it), refuses a symlinked
+  or > 1 MiB file and a `BEGIN` without `END` (`config_invalid`), pins `path` under `<home>/public_html` (`path_not_allowed`)
+  and `auth.userFile` to `<home>/.keel/htpasswd/<16 hex>`; with `probe` it GETs the URL against `ip` (Host header, SNI,
+  certificates unverified, 5 s, no redirects) and on a `500` restores the previous content before throwing `config_invalid`
+  `{ probe }`. `files.htaccess.probe { username, url, ip }` → `{ status | null, location, error }`.
+  `files.htpasswd.set { username, id, entries: [{ user, hash: bcrypt }], group? }` writes `<home>/.keel/htpasswd/<id>` (`.keel`
+  and `.keel/htpasswd` `0711`; the file `0640` handed to `group` by root on an `O_NOFOLLOW` descriptor of a regular file the
+  account owns, `0644` without a group); `files.htpasswd.get` parses it back (`ignored` counts non-bcrypt lines).
+  `files.errorpages.write { username, docroot, code, title, message }` renders the text-only template into
+  `<docroot>/errors/<code>.html`; `files.errorpages.list { username, docroot }` reports every code (`managed` only for pages
+  carrying the `<!-- keel-errorpage {…} -->` comment). None of these ops is destructive; `stagedWrite` is exported from
+  `files.js` for them.
+- **Service** `ctx.panelHtaccess` (`services/panel-htaccess.js`, created by whichever of `routes/panel/{advanced,files,security}.js`
+  loads first): `resolveDir(scope, rel)` pins a client path under the home and under the deepest document root of
+  `ctx.panelDomains.allDomains(scope)` (main/addon/sub; `422` otherwise) and derives the probe URL
+  (`https` when `ctx.ssl.certForDomain(domain).state === 'installed'`); every write is read → patch spec → `files.htaccess.set`
+  with the probe (`config_invalid` surfaces as `422`). `ipBlocker.get/add/remove` (feature `ipblocker`, always
+  `public_html`), `indexes.get/set` (`indexmanager`), `privacy.get/set/addUser/removeUser` (`dirprivacy`; hashes from
+  `ctx.crypto.hashPassword` rewritten to `$2y$`, `htpasswdId(rel)` = sha256 prefix, the password file is created before the
+  block names it, group from `web.detect().apache.runUser`), `errorPages.list/set/remove` (`errpgs`). Audit
+  `panel.ipblocker.*`, `panel.indexes.set`, `panel.dirprivacy.*`, `panel.errorpages.*`.
+- **Routes:** `GET|POST|DELETE /api/panel/security/ip-blocker` (mutations session-only), `GET /files/htaccess`,
+  `POST /files/htaccess/probe`, `GET|PUT /files/indexes`, `GET|PUT /files/privacy`, `POST|DELETE /files/privacy/users`
+  (ahead of the `filemanager` gate; token scope `panel:files`), `GET /advanced/error-pages`, `PUT|DELETE
+  /advanced/error-pages/:code` (no token scope). Features `ipblocker` and `dirprivacy` are new in `DEFAULT_FEATURES`;
+  `indexmanager` and `errpgs` already existed (a feature list without the new keys means enabled).
+- **Host:** `mod_authz_core`, `mod_authz_host`, `mod_auth_basic`, `mod_authn_file` (Debian default set) and
+  `AllowOverride All` on the document root (the vhost template already grants it). Not changed by this unit: `renderVhost`.
+
+## 46. Per-domain mail routing in the account panel and the Exim outbound relay / IPv6 settings (P1-4, A3)
+- **Routing (`ctx.panelEmail.routing`, `server/src/services/panel-email.js`):** `list(scope)` → `{ data: [row…], meta: {
+  hostname, values: ['auto','local','remote'] } }`, `get(scope, domain)` → row, `set(scope, domain, { routing }, req)` → row +
+  `{ applied, reason, hint }`. A row is `{ domain, type, routing ('auto' unless a mail_domains row of this account says
+  otherwise), effective ('remote' | 'local'), mailboxes, canRemote (= mailboxes === 0), mx, delegation, hints }`. Routes
+  (`routes/panel/email.js`, `panelScope`): `GET /api/panel/email/routing`, `GET|PUT /api/panel/email/domains/:domain/routing
+  { routing: 'auto'|'local'|'remote' }` (strict). Rules: the domain must be the account's (§3.2: 404, never 403); `remote` with
+  mailboxes → `409 mailboxes_exist`; `set` runs `ensureMailDomain` (§35: claims the row, never re-points another account's), then
+  `ctx.mail.setRouting(domain, routing, req)` (§ Email) — a `routing_not_applied` from there becomes `applied:false` with its
+  `reason`/`hint`, every other error propagates; audit `panel.email.routing.set`. The first mailbox still turns an *auto*
+  domain into *local*, but a domain explicitly routed `remote` is refused (`409 routing_remote`, checked right after
+  `ensureMailDomain`, before any host write) instead of being flipped back.
+- **MX seam (`ctx.mail.mxStatus(domain)`, `server/src/services/email.js`):** `{ ok, error, records: [{ exchange, priority }]
+  (sorted), exchanges, pointsHere }` using the category's resolver (`deliverability.useResolver` in tests) and
+  `serverAddresses()`; `pointsHere` is null without resolvable exchangers. No port-25 banner probe, no audit, no `exim -bt`
+  (the admin `troubleshoot` keeps those).
+- **Page:** `client/src/pages/panel/email/routing.jsx` (nav `Email › Email routing`, slug `routing`, no feature gate):
+  one row per domain, `ROUTING_OPTIONS` with *remote* disabled while `canRemote` is false, `mxSummary(mx, hostname)` for the
+  MX column, `PendingPill` on `applied:false`, the `DelegationBanner` (§42) with `mxRecords(row)` = `MX 10 <hostname>` for a
+  locally delivered domain whose MX does not point here.
+- **Exim settings (`service_config.exim`, service-configuration):** `ipv6: 'auto'|'on'|'off'` (default `auto`) and
+  `smarthost: null | { host, port (587), requireTls (true), auth: null | { user, passwordEnc } }`. The route schema takes
+  `smarthost.auth.password` (plain, optional on a re-save: the stored `passwordEnc` is kept for the same `user`; a new login
+  without a password → 422) and tolerates the echoed `passwordSet`; `publicEximSettings(s)` is what leaves the service
+  (`auth: { user, passwordSet }`), so `GET /api/service-config/exim` / the `PUT` answer never carry the secret and the audit
+  row is redacted by key. `renderEximMain(s, layout, support, vm, host)` renders `disable_ipv6 = true` when
+  `eximIpv6Disabled(s, host)` (`off`, or `auto` with `host.ipv6Global === false` from `hostHasGlobalIpv6(sys.info)`: a
+  non-loopback, non-fe80::/10, non-fc00::/7 IPv6 address on any interface; null = unknown = not rendered) and, on Debian with
+  a relay, the `.ifndef`-guarded `REMOTE_SMTP_SMARTHOST_HOSTS_REQUIRE_TLS = *` when `requireTls`. `exim.get()` adds
+  `ipv6: { setting, hostGlobal, disabled }` and `smarthost` (= `exim.smarthostStatus()`: the saved setting next to
+  `mail.smarthost.status`). `exim.apply()` runs `mail.smarthost.write` (reload deferred to the main-slot write) before the
+  slots when `next.smarthost` is set, `mail.smarthost.remove` when the previous settings had one and the next do not, and
+  reports `smarthost: { …, applied: hooked && precedes !== false, hints }`; a written-but-not-loaded router makes the
+  apply not ok (`live:false`) and its hint joins `hints`. `exim.outboundProbe({ fresh })` → `{ installed, smarthost: { host,
+  port }|null, port25: { host, port, ok, error, ms }|null }` through `mail.outbound.probe` against
+  `gmail-smtp-in.l.google.com` then `alt1.…` (first success wins, memoised 10 min); Security Advisor probe `mail.outbound`
+  adds `mail.outbound.port25` (ok with a relay or a reachable MX, info "Outbound port 25 appears to be blocked" otherwise).
+- **Agent (`agent/src/ops/mail.js`):** `mail.outbound.probe { host (hostname|IP), port=25, timeoutMs≤5000 }` → `{ host, port,
+  ok, error, ms }` (`tcpProbe`: connect only, nothing sent). `mail.smarthost.status {}` → `{ configured, host, port, auth,
+  routerFile, passwdFile, transportFile, authFile, hookable, hooked, precedes, hints }`. `mail.smarthost.write { host, port=587,
+  user?, password? (both or neither), requireTls=true, reload=true }` → `{ …, hookable, validated, hooked, precedes, hints,
+  reloaded, unit }`: `smarthostLayout(layout)` puts the `whm_smarthost` router (`renderSmarthostRouter`: `manualroute`,
+  `domains = ! +local_domains : ! +relay_to_domains` on Debian / `! +local_domains` elsewhere, `route_list = * host::port
+  byname`, `host_find_failed = defer`, `no_more`) in `conf.d/router/150_whm_smarthost` (split Debian, live by itself),
+  `<whm>/router_whm_smarthost.conf` (unsplit Debian / RHEL: one manual `.include_if_exists` directly after `begin routers`,
+  reported in `hints`); Debian reuses the template's unconditional `remote_smtp_smarthost` transport and `plain`/`login`
+  authenticators, so the credential is a managed block in `/etc/exim4/passwd.client` (`mergeSmarthostPasswd`, 0640
+  root:Debian-exim, the distro comments kept; `user`/`password` are `/^[^\0\r\n:]+$/` because that file and Debian's
+  `${extract{2}{:}…}` authenticators split on `:`); non-Debian layouts get `transport_whm_smarthost.conf`
+  (`renderSmarthostTransport`: `hosts_require_tls`/`hosts_require_auth`), `auth_whm_smarthost.conf` (`renderSmarthostAuth`:
+  PLAIN/LOGIN client authenticators keyed by `$host`, carets doubled) and `<whm>/smarthost.passwd` (0640 root:exim). Every
+  write is followed by `update-exim4.conf` (Debian) + `exim -bV` with a full rollback on rejection, then `-bP router_list`
+  decides `hooked` and `precedes` (no `dnslookup`/`dnslookup_relay_to_domains`/`lookuphost`/`smarthost` before it).
+  `mail.smarthost.remove { reload }` (destructive) removes the files/block the same way. Verified on nova (unsplit Debian,
+  Exim 4.99.1): generated from a temp copy of `/etc/exim4`, `exim -bV` clean, `disable_ipv6` true,
+  `REMOTE_SMTP_SMARTHOST_HOSTS_REQUIRE_TLS=*`, `whm_smarthost` first in `router_list` (dnslookup tenth), `exim -bt
+  someone@example.org` → `router = whm_smarthost, transport = remote_smtp_smarthost, host smtp.gmail.com port=587`, local
+  addresses still take `system_aliases`/`userforward`.
+- **`mergeEximBlock` (`agent/src/ops/web.js`):** when the block being merged sets `disable_ipv6`, every `disable_ipv6 = …`
+  line outside the block is dropped (Exim: "option set for the second time" is fatal — reproduced on nova); without it in the
+  block the operator's line is left alone. `validateExim` also recognises that message.
+- **Not done here:** the installer does not add the unsplit `.include_if_exists` line (same rule as the virtual-mail slots,
+  CLAUDE.md 2026-11-05); `DCconfig_smarthost`/`DCsmarthost` cannot switch an unsplit `internet` template through localmacros
+  alone (`DCconfig_internet=1` is defined after localmacros and `dnslookup` precedes the template's own smarthost router),
+  hence the Keel router.
+
+## 48. Customer panel: Visitors — GoAccess web statistics (`ctx.panelLogs.stats`, agent `stats.goaccess.*`) (P1-5)
+Reports are the account's own files, rendered and read back as the account; nothing is stored in SQLite.
+- **Agent** (`agent/src/ops/stats.js`, the AWStats family's file): `stats.goaccess.detect` → `{ installed, bin, version,
+  packages: { apt: ['goaccess'], dnf: ['goaccess'] }, statsDir: '.keel/stats', nice, ionice }`.
+  `stats.goaccess.run { username, domain, logFiles? }` (`timeoutMs` 180 s): `goaccess` must exist (`capability_missing`
+  otherwise), the user must be a managed account (`as-user.js assertManaged`), every log — `domainLogFiles(username, domain)`
+  by default, i.e. `/var/log/whm/domlogs/<user>/<domain>-access.log` and `-ssl-access.log` — must sit directly in
+  `/var/log/whm/domlogs/<user>/` and be named `<domain>-…` (`path_not_allowed`); missing or empty logs are dropped and an
+  empty set answers `{ skipped: true, reason: 'no_log' }` without running anything. Output goes to
+  `<home>/.keel/stats/` (`accountPath` pins it under the home through symlinks; `.keel` `0711`, `stats` `0750`, both
+  `mkdir -p` **as the account**); goaccess runs as the account through `asUserArgv` + `nice -n 10` wrapped in
+  `ionice -c 2 -n 7` (`ioniceArgv`, skipped when absent), 120 s, `--no-global-config --log-format=COMBINED
+  --output=<html>.tmp --output=json <logs…>` (`goaccessArgv`): the HTML is renamed into `<domain>.html` only when the run
+  succeeded, the JSON report arrives on stdout (256 MiB cap) and only its summary (`summarizeGoaccess`: `version 1`,
+  `period`, `totals { requests, validRequests, failedRequests, visitors, files, notFound, referrers, bandwidth, logBytes }`,
+  `days` ≤ 31 newest, and the top ten `pages`, `staticFiles`, `notFound`, `referrers`, `countries`, `statusCodes`,
+  `browsers`, `os` as `{ label, hits, visitors, bytes }`; never the hosts panel) is written as
+  `<domain>.summary.json` (`0640`, `stagedWrite`). Returns `{ domain, username, skipped: false, logFiles, html, summary,
+  generatedAt, totals }`. Not destructive. No new allowed root (`/home*`, `/var/log/whm`).
+- **Service** `ctx.panelLogs.stats` (`services/panel-logs.js`): `summary(scope)` (feature `webstats`; `501` through
+  `CapabilityError('goaccess')` when `detect` says not installed) reads each web domain's summary with `files.read` as the
+  account (`main` first, then `addon`/`sub` alphabetically; parked aliases have no log of their own), strips `logFiles`, and
+  reports `{ goaccess, cooldownSeconds, schedule, domains: [{ domain, type, available, generatedAt, running: { id, status } |
+  null, cooldownUntil, error, summary }] }`. `generate(scope, domain, req)`: own domain (`404` otherwise), `409 busy` while any
+  `panel.stats.generate` job of the account is queued/running, `429 generate_cooldown` (`fields.retryAfterSeconds`) within
+  setting `panel.stats.generate_cooldown_s` (600) of the last request for that domain (derived from the jobs table), then
+  enqueues `panel.stats.generate { username, accountId, domain, actor }` and audits `panel.stats.generate`. `run(job)`:
+  with `username` one account/domain; without, every `suspended = 0` account whose `plan_snapshot_json.features.webstats`
+  is not `false`, over `accounts.domain` + `account_domains` of type main/addon/sub, logging per domain, counting
+  `{ accounts, generated, skipped, failed }`; the scheduled run first answers `skipped: 'panel_disabled'` when the
+  panel is off and `skipped: 'goaccess_missing'` when `stats.goaccess.detect` says not installed (no account walked,
+  one `warn` line, no error — the schedule exists on every host); a `capability_missing`/`binary_not_found` from a
+  run stops it with `skipped: 'goaccess_missing'` as well, any other failure is logged and the run continues. `report(scope, domain, req, res)` streams `<domain>.html` through `files.chunk_read`
+  (2 MiB pieces, `Content-Length` from the first) with `Content-Type: text/html; charset=utf-8`,
+  `Content-Security-Policy: sandbox allow-scripts; frame-ancestors 'self'` (overrides helmet's `frame-ancestors 'none'`
+  for this response only), `X-Frame-Options: SAMEORIGIN`, `X-Content-Type-Options: nosniff`, `Cache-Control: private,
+  no-store`; `404` when no report exists.
+- **Routes** (`routes/panel/logs.js`, token scope `panel:logs`): `GET /api/panel/logs/stats`, `POST
+  /api/panel/logs/stats/:domain/generate` (202), `GET /api/panel/logs/stats/:domain/report`. The router registers the job
+  and `ctx.scheduler.ensure('panel-stats-generate', '50 1 * * *', 'panel.stats.generate')`.
+- **Client:** `pages/panel/logs/visitors.jsx` (nav `Logs › Visitors`, key `panel:logs/visitors`, feature `webstats`): the
+  full report is embedded only as `<iframe sandbox="allow-scripts" referrerPolicy="no-referrer" src="/api/panel/logs/stats/
+  <domain>/report">`, never inlined; the page polls `/logs/stats` every 5 s while a job runs. Feature `webstats` is new in
+  `DEFAULT_FEATURES` (`seed.js`) and the Feature Manager labels (a list without the key means enabled).
+- **Host:** `goaccess` (`apt install goaccess`; INSTALL.md), `setpriv` or `runuser`; `nice`/`ionice` optional. The domlog
+  directory is `root:<account> 0750` with `0644` files, so the account can read its own logs. GeoIP is a system-wide
+  GoAccess setting; the countries panel appears only when it is configured.
+
+## 49. Customer panel: WordPress installs (`ctx.panelSoftware`, agent `web.wp.fetch/configure/webinstall/remove/requirements`) (P1-7)
+- **Agent** (`agent/src/ops/wp-install.js`, a second file for the `web.wp.*` family so `web.js` is not pulled into an import
+  cycle through `as-user.js`/`files.js`; the WP-CLI ops in `web.js` are unchanged and reused): every path goes through
+  `accountPath()` (home from `/etc/passwd`, lexical + real containment, allowed roots), every file action runs as the account
+  through `asUser()`; root only downloads into `/tmp/whm` and `lstat`s inside the tree.
+  `web.wp.requirements {}` → `{ wpcli, php, phpMysql (php -m: mysqli|pdo_mysql, null without php), unzip, asUser }`.
+  `web.wp.fetch { username, path, timeoutMs ≤ 120000, maxBytes ≤ 96 MiB }` (destructive): refuses a tree that already holds
+  `wp-config.php`/`wp-settings.php` (`exists`) and the home itself; downloads `WP_DOWNLOAD_URL` (`https://wordpress.org/latest.zip`,
+  https-only redirects ≤ 5, Content-Length and streamed size bounded, zip magic checked) onto a `0600` root scratch descriptor,
+  compares the streamed SHA-1 with `WP_CHECKSUM_URL` (`checksum_mismatch` → 422), shares the copy `root:<gid> 0640` by descriptor
+  (never by path), lists it as the account (`unzip -Z /dev/fd/0`), `checkWordPressMembers` (only `wordpress/…` members, files and
+  directories only, then `files.js` `checkArchiveMembers` for traversal/links/.ssh; the release must carry `wp-settings.php` and
+  `wp-includes`), refuses when a top-level name already exists in the target, `mkdir -p`, `unzip -o -q /dev/fd/0 -d <target>`,
+  `mv -t <target> -- <target>/wordpress/<name>…`, `rmdir`; on any failure what this run created is removed as the account
+  (`details.cleanup`, "left in place" when that failed too). Returns `{ path, bytes, sha1, members, version }`.
+  `web.wp.configure { username, path, dbName, dbUser, dbPassword, dbHost='localhost', tablePrefix='wp_' }` (destructive):
+  requires an unpacked tree, refuses an existing `wp-config.php`, renders `renderWpConfig()` (PHP single-quoted strings escaped,
+  eight 64-char salts from the CSPRNG — `WP_SALT_KEYS` —, `utf8mb4`, `WP_DEBUG false`, `FS_METHOD direct`), writes it through
+  `files.js` `stagedWrite` as the account `0600`, lints with `php -l` as the account when php exists (the file is removed on a
+  failed lint).
+  `web.wp.webinstall { username, path, url, title, adminUser, adminEmail, adminPassword, locale='en_US', ip='127.0.0.1',
+  timeoutMs ≤ 300000 }` (destructive): requires `wp-config.php` + `wp-admin/install.php`, POSTs the step-2 form
+  (`weblog_title, user_name, admin_password(2), pw_weak, admin_email, language`) to `<url>/wp-admin/install.php?step=2` against `ip`
+  with the URL's `Host` (SNI, certificates unverified; the scheme of `url` decides `is_ssl()` and so the `siteurl` WordPress
+  stores); `parseInstallResponse` → success on "Success!"/"has been installed", `exists` on "already installed", otherwise
+  `command_failed` with the installer's own message. The password travels in the request body only.
+  `web.wp.remove { username, path, mode: 'tree' | 'entries' }` (destructive): requires a WordPress tree (`wp-settings.php` +
+  `wp-includes`), never the home; `tree` = `rm -rf --one-file-system -- <path>`, `entries` = only the release's own top-level
+  names (`WP_TOP_LEVEL`) that exist, for a site that shares a document root.
+- **Service** `ctx.panelSoftware` (`services/panel-software.js`, created by `routes/panel/software.js`): `list(scope, req)` runs
+  `web.wp.requirements` and `web.wp.discover { usernames: [account] }` and keeps the installs under one of
+  `ctx.panelDomains.allDomains(scope)`'s main/addon/sub docroots (deepest wins; `id` = `installIdOf(abs)` = sha256 prefix,
+  `databaseOwned` = the `DB_NAME` of `wp-config.php` is a `databases` row of this account); `install(scope, body, req)` →
+  `resolveSite` (404 foreign domain, 422 bad folder, 409 already a WordPress tree), `requirements.canInstall` (= `asUser && (wpcli
+  || php && phpMysql && unzip)`, else `CapabilityError('wordpress')` → 501 with `INSTALL_HINT`), then
+  `ctx.panelDatabases.createForApp(scope, { base: 'wp' })` (first free `<user>_wp[N]` for both database and user; quota via
+  `create`, `409 limit_reached` before anything exists; a failed user drops the database), then job `panel.wp.install` with
+  `adminPasswordEnc`/`dbPasswordEnc` (`ctx.crypto.encrypt`), `method: 'wpcli' | 'web'`. The job runs as the owner principal
+  read back at run time (`jobScope`, as the dump job): `web.wp.install` on a WP-CLI host, else `fetch → configure → webinstall`;
+  on failure `compensate()` removes the unpacked files (`web.wp.remove`, `entries` when the site is the docroot itself, unless the
+  agent already reported `details.cleanup`) and drops user then database through `ctx.panelDatabases.dropUser/drop`; audit
+  `panel.wp.install` / `.done` / `.failed`. `update(scope, id, req)` needs `requirements.wpcli` (else `CapabilityError('wpcli')`),
+  job `panel.wp.update` → `web.wp.update { kind: 'core' }`. `remove(scope, id, { database }, req)` → `web.wp.remove` then, only
+  with `database:true` and `databaseOwned`, the user of the same name (if the account's) and the database. `getJob/streamJob`
+  as in panel-databases, restricted to `JOB_TYPES` with `params.accountId === scope.accountId`; `shapeJob` strips the
+  `*Enc` fields, `ownerId` and `accountId`. The generated admin password is in the 202 body once (`generatedPassword: true`),
+  never in the job or the audit.
+- **Routes** (`/api/panel/software`, `panelRouter(ctx, 'software')` — no `panel:software` token scope exists, so mutations are
+  session-only and the list needs `panel:read`): `GET /wordpress`, `POST /wordpress` (202), `GET /wordpress/jobs/:id[/stream]`,
+  `POST /wordpress/:id/update` (202), `DELETE /wordpress/:id?confirm=true&database=true|false` (422 without `confirm=true`).
+- **Shared edits:** `panel-databases.createForApp(scope, { base, password? }, req)` → `{ database, user, password, hosts }`;
+  `DEFAULT_FEATURES.wordpress = true` (+ FeatureManager label); nav group *Software* (icon `Package`, colour `software`),
+  `panel-category.software` / `panel.software/wordpress.*` in `en.json`.
+- **Host:** `php-mysql` (`php8.5-mysql` on nova — present), `unzip` (present), outbound HTTPS to wordpress.org, `setpriv`;
+  WP-CLI optional (`wp` in `PATH`; absent on nova, so installs take the web path and *Update* answers 501). Not changed by this
+  unit: the WP-CLI ops in `web.js` (`runuser`-based, reviewed: every command and the chmod/rm already run as the account).
+
+## 50. Customer panel: preferences, the 2FA policy seam and mailbox folders (`ctx.panel.preferences`, `ctx.panel.assertTwoFactor`, `vmail.mailbox.*`) (P1-8, P1-9, P1-12)
+- **Preferences** (`services/panel.js`, migration `034d_panel-preferences.sql`: `users.locale` + `panel_account_prefs
+  (account_id PK → accounts, email2, notify_quota, notify_bandwidth, notify_password_change, updated_at)`):
+  `ctx.panel.preferences.get(scope)` → `{ email, email2, notify: { quota, bandwidth, passwordChange }, locale, locales:
+  [{ code, name }] (enabled rows of ctx.locales.list()), defaultLocale }`, also under `GET /api/panel/me` as `preferences`
+  (and `user.locale`). `setContact(scope, { email, email2?, notify?, currentPassword? }, req)` (async) first verifies
+  `currentPassword` against the linked login's bcrypt hash unless `scope.mode === 'acting'` (`422` with
+  `fields.currentPassword` when missing, `401` when wrong, `403` when the login is not the account's: the address is the
+  recovery address, so a hijacked session alone cannot move it), then writes `accounts.contact_email` (the same
+  column the console and the forgot-password lookup use), mirrors it to the linked login's `users.email`, upserts the
+  prefs row (unmentioned switches keep their value), audits `panel.me.contact` (`email`, `email2`, `notify`,
+  `previousEmail`; never the password) and, when the address changed, mails the **previous** address a detached notice
+  through `ctx.contacts.sendMail` (`[<company>] Contact address changed for <username>`); route
+  `PUT /api/panel/me/contact` is session-only and takes `currentPassword` (1–256 chars, optional in the schema, required
+  by the service unless acting). `setLocale(scope, { locale }, req)` refuses while
+  acting (`403 not_while_impersonating`: the row is the administrator's), accepts `null`/`''` to clear and only codes in
+  `ctx.locales.enabledCodes()` (`422` with `fields.locale`), audits `panel.me.locale`; route `PUT /api/panel/me/locale`.
+  The SPA adopts `user.locale` once per load (`adoptUserLocale` in `i18n/useT.js`, called by `usePanelMeLoader` outside
+  "Log in as") by setting the browser preference, so the stored language follows the login across browsers.
+- **Seam for notifiers:** `ctx.panel.preferences.notifyFor(username)` → `{ to: [contact_email, email2].filter(Boolean),
+  notify: { quota, bandwidth, passwordChange } }` or `null` for an unknown account. Whoever mails a customer about disk
+  quota or bandwidth (account-information / account-functions today send nothing to customers) must consult it. The panel
+  itself honours `passwordChange`: after every successful `changePassword` (panel page, forced change through the core
+  route, mailed reset) a plain notice goes to each address through `ctx.contacts.sendMail`, detached and best effort.
+- **One 2FA policy check:** `ctx.panel.assertTwoFactor(user, path = null)` throws `403 two_factor_required` when
+  `panel.require_2fa_for_users` is on, `user.role === 'user'` and `totp_enabled` is 0, unless `path` is `/me` or starts
+  with `/security/two-factor`. `panelScope` (routes/categories/panel.js) calls it with `req.path` for `mode === 'user'`;
+  `changePasswordForUser` (the `/api/auth/password` seam) calls it without a path on the non-forced branch. No other code
+  reads the setting for enforcement. `ctx.panel.settings.get()` adds `linkedUsers` and `usersWithoutTotp` (role-`user`
+  logins joined to `account_users`, with `totp_enabled = 0`), shown under the toggle in *Panel › Customization › Account
+  panel* and reported by Security Advisor as `panel.2fa.policy` (`ok` when required, `info` when optional; `fix` →
+  `/cpanel/customization`).
+- **Mailbox folders** (agent `vmail.js`, root `doveadm`, no path involved): `vmail.mailbox.status { user: <local@domain> }`
+  → `{ user, folders: [{ name, messages, bytes (vsize), unseen }] }` from `doveadm -f tab mailbox status -u <user>
+  'messages vsize unseen' '*'` (INBOX first; `not_found` on "User doesn't exist", `capability_missing` without doveadm).
+  `vmail.mailbox.expunge { user, folder, olderThanDays? }` (destructive, 300 s): `folder` matches `FOLDER`
+  (`/^(?!\.)(?!.*\.\.)(?!.*\.$)[^\0-\x1f\x7f"\*%]{1,200}$/`), `olderThanDays` is an integer 7–3650 and is **required unless
+  the folder is `Trash` or `Junk`** (schema refine); the op checks the folder exists (`not_found`), runs `doveadm expunge -u
+  <user> mailbox <folder> [savedbefore <N>d] all` with every word a separate argv element, and answers `{ before, after,
+  removed }` from a status call on either side. `services/panel-email.js` mirrors the constants (`EMPTIABLE_FOLDERS`,
+  `EXPUNGE_MIN_DAYS`, `EXPUNGE_MAX_DAYS`, `FOLDER_NAME`) and exposes `folders.list(scope, id)` /
+  `folders.empty(scope, id, folder, { olderThanDays }, req)` (`loadMailbox` ownership, `capabilities.require('dovecot')`,
+  audit `panel.email.folder.empty`), routes `GET /api/panel/email/accounts/:id/folders` and `POST
+  …/accounts/:id/folders/:folder/empty`. Dovecot 2.4 prints the tab header in its own column order
+  (`mailbox messages unseen vsize` on nova); the parser keys by header name.
+- **Delivery tracking:** `ctx.panelEmail.usageMessages(scope, { sinceHours, q, status, page, pageSize })` → `{ data:
+  [{ id, key, arrivedAt, sender, recipient, status, subject, size, detail, deliveredAt, remoteHost }], meta: { page,
+  pageSize, total, hours, q, status, log } }`: `ctx.mail.reports.delivery({ hours, page: 1, pageSize: 20000 })`
+  post-filtered to the account's domains and authenticated mailboxes (as `usage()`), then `status` (one of
+  `MESSAGE_STATUSES`) and a case-insensitive `q` over sender/recipient/subject/detail/id, then paged (`pageSize` ≤ 100,
+  default 25). Route `GET /api/panel/email/usage/messages`. `GET /email/usage` keeps its `recent` (100 rows) for
+  compatibility.

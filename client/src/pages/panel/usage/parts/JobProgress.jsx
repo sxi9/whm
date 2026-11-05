@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { Clock } from 'lucide-react';
 import { ProgressLog } from '../../../../components/ProgressLog.jsx';
+import { useT } from '../../../../i18n/useT.js';
 import { usePanelMe } from '../../../../panel/hooks/usePanel.js';
 
 // The job stream (/api/system/jobs/:id/stream) answers 403 for role `user`, so a
@@ -10,7 +11,8 @@ export function canStreamJobs(me) {
   return role === 'root' || role === 'reseller';
 }
 
-export function JobProgress({ jobId, onFinished, message = 'Started; this screen updates in a minute.', pollMs = 5000, polls = 12 }) {
+export function JobProgress({ jobId, onFinished, message, pollMs = 5000, polls = 12 }) {
+  const { t } = useT();
   const { me } = usePanelMe();
   const streaming = canStreamJobs(me);
   const finishedRef = useRef(onFinished);
@@ -31,8 +33,8 @@ export function JobProgress({ jobId, onFinished, message = 'Started; this screen
     <div className="banner banner-info" data-job={jobId}>
       <Clock size={18} />
       <div>
-        <strong>{message}</strong>
-        <p className="muted">The server is working on it in the background; there is nothing else to do here.</p>
+        <strong>{message ?? t('panel.usage.job_started', 'Started; this screen updates in a minute.')}</strong>
+        <p className="muted">{t('panel.usage.job_background', 'The server is working on it in the background; there is nothing else to do here.')}</p>
       </div>
     </div>
   );

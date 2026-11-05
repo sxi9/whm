@@ -5,6 +5,8 @@ import { ErrorBanner } from '../../../../components/Form.jsx';
 import { ProgressLog } from '../../../../components/ProgressLog.jsx';
 import { PanelCapabilityState, FeatureDisabledState, PendingPill } from '../../../../panel/PanelPage.jsx';
 import { usePanelMe } from '../../../../panel/hooks/usePanel.js';
+import { useT } from '../../../../i18n/useT.js';
+import { fill } from '../../../../i18n/fill.js';
 
 export function isCapabilityError(error) {
   return Boolean(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
@@ -33,7 +35,8 @@ export function canStreamJobs(me) {
   return role === 'root' || role === 'reseller';
 }
 
-export function JobProgress({ jobId, onFinished, message = 'Started; this screen updates in a minute.', pollMs = 5000, polls = 12 }) {
+export function JobProgress({ jobId, onFinished, message, pollMs = 5000, polls = 12 }) {
+  const { t } = useT();
   const { me } = usePanelMe();
   const streaming = canStreamJobs(me);
   const finishedRef = useRef(onFinished);
@@ -54,8 +57,8 @@ export function JobProgress({ jobId, onFinished, message = 'Started; this screen
     <div className="banner banner-info" data-job={jobId}>
       <Clock size={18} />
       <div>
-        <strong>{message}</strong>
-        <p className="muted">The server is working on it in the background; there is nothing else to do here.</p>
+        <strong>{message ?? t('panel.ssl.job_started', 'Started; this screen updates in a minute.')}</strong>
+        <p className="muted">{t('panel.ssl.job_background', 'The server is working on it in the background; there is nothing else to do here.')}</p>
       </div>
     </div>
   );
@@ -78,27 +81,31 @@ export function webResult(web, detail) {
 }
 
 export function WebStatus({ web, detail }) {
+  const { t } = useT();
   const r = webResult(web, detail);
-  if (r.applied) return <StatusPill status="ok">applied</StatusPill>;
+  if (r.applied) return <StatusPill status="ok">{t('panel.ssl.web_applied', 'applied')}</StatusPill>;
   return <PendingPill result={r} />;
 }
 
 export function ExpiryPill({ notAfter, daysRemaining }) {
+  const { t } = useT();
   if (!notAfter) return <span className="muted">—</span>;
   const days = daysRemaining ?? Math.floor((new Date(notAfter).getTime() - Date.now()) / 86_400_000);
   const status = days < 0 ? 'failed' : days <= 7 ? 'failed' : days <= 30 ? 'warning' : 'ok';
   const date = formatDate(notAfter).split(',')[0];
-  return <StatusPill status={status}>{days < 0 ? `expired ${-days} days ago` : `${days} days · ${date}`}</StatusPill>;
+  return <StatusPill status={status}>{days < 0 ? fill(t('panel.ssl.expired_ago', 'expired {days} days ago'), { days: -days }) : fill(t('panel.ssl.days_left', '{days} days · {date}'), { days, date })}</StatusPill>;
 }
 
 export function StatePill({ state }) {
+  const { t } = useT();
   const map = { installed: 'ok', pending: 'pending', stored: 'unknown', unmanaged: 'unknown' };
-  const label = { installed: 'installed', pending: 'files written, web server pending', stored: 'stored', unmanaged: 'files only' };
+  const label = { installed: t('panel.ssl.state_installed', 'installed'), pending: t('panel.ssl.state_pending', 'files written, web server pending'), stored: t('panel.ssl.state_stored', 'stored'), unmanaged: t('panel.ssl.state_unmanaged', 'files only') };
   return <StatusPill status={map[state] || 'unknown'}>{label[state] || state}</StatusPill>;
 }
 
 export function TypePill({ type }) {
-  const label = { main: 'main', addon: 'addon', sub: 'subdomain', parked: 'parked', alias: 'alias' };
+  const { t } = useT();
+  const label = { main: t('panel.ssl.type_main', 'main'), addon: t('panel.ssl.type_addon', 'addon'), sub: t('panel.ssl.type_sub', 'subdomain'), parked: t('panel.ssl.type_parked', 'parked'), alias: t('panel.ssl.type_alias', 'alias') };
   return <StatusPill status="unknown">{label[type] || type}</StatusPill>;
 }
 
@@ -116,6 +123,7 @@ export function downloadText(filename, content) {
 
 // Read-only PEM block with copy and save buttons (used for generated CSRs and keys).
 export function PemView({ label, value, filename, rows = 8, help }) {
+  const { t } = useT();
   const [copied, setCopied] = useState(false);
   if (!value) return null;
   const copy = async () => {
@@ -128,8 +136,8 @@ export function PemView({ label, value, filename, rows = 8, help }) {
         <textarea className="input textarea mono" rows={rows} readOnly value={value} spellCheck={false} />
         {help && <div className="field-help">{help}</div>}
         <div className="form-actions" style={{ marginTop: 8 }}>
-          <button type="button" className="btn btn-sm" onClick={copy}><Copy size={14} /> {copied ? 'Copied' : 'Copy'}</button>
-          {filename && <button type="button" className="btn btn-sm" onClick={() => downloadText(filename, value)}><Download size={14} /> Save as {filename}</button>}
+          <button type="button" className="btn btn-sm" onClick={copy}><Copy size={14} /> {copied ? t('panel.ssl.copied', 'Copied') : t('panel.ssl.copy', 'Copy')}</button>
+          {filename && <button type="button" className="btn btn-sm" onClick={() => downloadText(filename, value)}><Download size={14} /> {fill(t('panel.ssl.save_as', 'Save as {filename}'), { filename })}</button>}
         </div>
       </div>
     </div>
@@ -137,18 +145,19 @@ export function PemView({ label, value, filename, rows = 8, help }) {
 }
 
 export function CertificateSummary({ certificate, chain }) {
+  const { t } = useT();
   if (!certificate) return null;
   const c = certificate;
   return (
     <KeyValue items={[
-      ['Issued to', c.commonName || c.subjectText],
-      c.sans?.length > 0 && ['Also covers', c.sans.join(', ')],
-      ['Issued by', c.selfSigned ? 'Self-signed' : c.issuerCommonName || c.issuerText],
-      ['Valid from', c.notBefore && formatDate(c.notBefore)],
-      ['Expires', <ExpiryPill key="e" notAfter={c.notAfter} daysRemaining={c.daysRemaining} />],
-      c.keyAlgorithm && ['Key', `${c.keyAlgorithm}${c.keyBits ? ` ${c.keyBits}-bit` : ''}${c.curve ? ` (${c.curve})` : ''}`],
-      c.fingerprintSha256 && ['Fingerprint (SHA-256)', <code key="f" className="small">{c.fingerprintSha256}</code>],
-      chain && ['Chain', chain.ok ? <StatusPill key="c" status="ok">verified</StatusPill> : <StatusPill key="c" status="warning">{chain.error || 'not verified'}</StatusPill>],
+      [t('panel.ssl.issued_to', 'Issued to'), c.commonName || c.subjectText],
+      c.sans?.length > 0 && [t('panel.ssl.also_covers', 'Also covers'), c.sans.join(', ')],
+      [t('panel.ssl.issued_by', 'Issued by'), c.selfSigned ? t('panel.ssl.self_signed', 'Self-signed') : c.issuerCommonName || c.issuerText],
+      [t('panel.ssl.valid_from', 'Valid from'), c.notBefore && formatDate(c.notBefore)],
+      [t('panel.ssl.expires', 'Expires'), <ExpiryPill key="e" notAfter={c.notAfter} daysRemaining={c.daysRemaining} />],
+      c.keyAlgorithm && [t('panel.ssl.key', 'Key'), `${c.keyAlgorithm}${c.keyBits ? ` ${c.keyBits}-bit` : ''}${c.curve ? ` (${c.curve})` : ''}`],
+      c.fingerprintSha256 && [t('panel.ssl.fingerprint', 'Fingerprint (SHA-256)'), <code key="f" className="small">{c.fingerprintSha256}</code>],
+      chain && [t('panel.ssl.chain', 'Chain'), chain.ok ? <StatusPill key="c" status="ok">{t('panel.ssl.chain_verified', 'verified')}</StatusPill> : <StatusPill key="c" status="warning">{chain.error || t('panel.ssl.chain_not_verified', 'not verified')}</StatusPill>],
     ]} />
   );
 }

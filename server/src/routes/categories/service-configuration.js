@@ -51,6 +51,13 @@ const eximBody = z.object({
   requireTlsForAuth: z.boolean().optional(), submissionPorts: z.boolean().optional(), logSelector: z.array(z.string().regex(/^[+-][a-z_]{1,40}$/, 'log_selector item such as +subject')).max(40).optional(),
   // Normally handed over by SSL/TLS Configuration (ctx.web.applyEximTls); null drops the TLS options from the rendered file.
   tls: z.object({ minProtocol: z.enum(TLS_VERSIONS).optional(), protocols: z.array(z.enum(TLS_VERSIONS)).min(1).max(4).optional(), cipherList: cipherList.optional(), cipherSuites: cipherSuites.optional(), preferServerCiphers: z.boolean().optional() }).strict().nullable().optional(),
+  // 'auto' disables IPv6 in Exim only on a host without a global IPv6 address; the relay password is optional on a re-save (the stored one is kept for the same login).
+  ipv6: z.enum(['auto', 'on', 'off']).optional(),
+  smarthost: z.object({
+    host: fields.hostname, port: int(1, 65535).default(587), requireTls: z.boolean().default(true),
+    // passwordSet is what GET answers (the form echoes it back); it carries nothing.
+    auth: z.object({ user: z.string().min(1).max(254).regex(/^[^\0\r\n:]+$/, 'Login without ":" or line breaks'), password: z.string().min(1).max(256).regex(/^[^\0\r\n:]+$/, 'Password without ":" or line breaks').optional(), passwordSet: z.boolean().optional() }).strict().nullable().default(null),
+  }).strict().nullable().optional(),
 }).strict();
 
 const mailserverBody = z.object({

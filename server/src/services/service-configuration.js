@@ -1,6 +1,9 @@
 import { isIP } from 'node:net';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { json } from '../db/index.js';
 import { notFound, conflict, badRequest, unprocessable, CapabilityError } from '../lib/errors.js';
+import { ssoEndpoint } from '../lib/sso-endpoint.js';
 
 // Service Configuration. Attached as ctx.web (ctx.ftp aliases ctx.web.ftp);
 // other categories may call:
@@ -42,7 +45,10 @@ export const DEFAULTS = {
   webdisk: { enabled: true, port: 2077, sslPort: 2078, requireSsl: true, allowDigestAuth: true, allowAnonymousDiscovery: false, maxUploadMb: 2048, idleTimeoutMinutes: 30, allowedAccounts: 'all' },
   webservices: { apiEnabled: true, tokenLifetimeMinutes: 1440, sessionTimeoutMinutes: 60, maxConcurrentRequests: 200, rateLimitPerMinute: 600, allowedOrigins: [], enableCompression: true, requestLogRetentionDays: 30, exposeVersion: false, ipv6Listen: true },
   // `tls` is null until SSL/TLS Configuration hands a preset over (applyEximTls); nothing TLS-related is rendered before that.
-  exim: { rblEnabled: true, rbls: ['zen.spamhaus.org', 'bl.spamcop.net'], domainRblEnabled: false, domainRbls: ['dbl.spamhaus.org'], spfVerify: true, spfReject: false, dkimVerify: true, dkimReject: false, reverseDnsRequired: false, verifySender: true, requireHelo: true, maxMessageSizeMb: 50, smtpAcceptMax: 100, smtpAcceptMaxPerHost: 10, smtpAcceptQueuePerConnection: 10, ratelimitEnabled: true, ratelimitMailThreshold: 10, ratelimitMailDelay: 1, ratelimitRcptThreshold: 50, ratelimitRcptDelay: 1, dictionaryAttackProtection: true, maxUnknownCommands: 3, rcptFailLimit: 4, rcptFailDelay: 10, recipientsMax: 100, recipientsMaxReject: true, requireTlsForAuth: true, submissionPorts: false, logSelector: ['+smtp_connection', '+subject', '+tls_cipher'], tls: null },
+  exim: { rblEnabled: true, rbls: ['zen.spamhaus.org', 'bl.spamcop.net'], domainRblEnabled: false, domainRbls: ['dbl.spamhaus.org'], spfVerify: true, spfReject: false, dkimVerify: true, dkimReject: false, reverseDnsRequired: false, verifySender: true, requireHelo: true, maxMessageSizeMb: 50, smtpAcceptMax: 100, smtpAcceptMaxPerHost: 10, smtpAcceptQueuePerConnection: 10, ratelimitEnabled: true, ratelimitMailThreshold: 10, ratelimitMailDelay: 1, ratelimitRcptThreshold: 50, ratelimitRcptDelay: 1, dictionaryAttackProtection: true, maxUnknownCommands: 3, rcptFailLimit: 4, rcptFailDelay: 10, recipientsMax: 100, recipientsMaxReject: true, requireTlsForAuth: true, submissionPorts: false, logSelector: ['+smtp_connection', '+subject', '+tls_cipher'], tls: null,
+    // ipv6 'auto' renders disable_ipv6 only on a host without a global IPv6 address (Exim would try AAAA MX targets first and fail);
+    // smarthost { host, port, auth: { user, passwordEnc }|null, requireTls } routes every non-local domain through one relay (clouds that block port 25).
+    ipv6: 'auto', smarthost: null },
   mailserver: { protocols: ['imap', 'pop3', 'lmtp'], maxUserIpConnections: 20, processLimit: 1000, clientLimit: 1000, ssl: 'required', sslMinProtocol: 'TLSv1.2', sslCipherList: '', sslCipherSuites: '', sslPreferServerCiphers: false, disablePlaintextAuth: true, loginGreeting: '', imapIdleNotifyIntervalMinutes: 2, pop3UidlFormat: '%08Xu%08Xv', mailLocation: 'maildir:~/mail', mailboxFormat: 'maildir' },
   ftp: { passivePortMin: 49152, passivePortMax: 65534, passiveAddress: '', tls: 'optional', maxClients: 50, maxPerIp: 8, anonymous: false, idleTimeoutMinutes: 15, chroot: true, virtualUsers: false },
   nameserver: { server: 'bind', role: 'master' },
@@ -139,7 +145,24 @@ const SENTINEL = 'WHM_SERVICE_CONFIG';
 // both are the main section, read before the distribution's own options.
 // The sentinel macro lets the agent prove the slot is part of the generated
 // configuration (`exim -bP macro WHM_SERVICE_CONFIG`).
-export function renderEximMain(s, layout, support = eximSupport(layout), vm = DEFAULTS.virtual_mail) {
+// A "global" IPv6 address: anything an interface holds that is not loopback,
+// link-local (fe80::/10) or unique-local (fc00::/7); null when the agent gave
+// no interface list.
+export function hostHasGlobalIpv6(info) {
+  const addrs = (info?.interfaces || []).flatMap((i) => i.addresses || []).filter((a) => a.family === 'IPv6' || a.family === 6).map((a) => String(a.address || '').toLowerCase());
+  if (!info?.interfaces) return null;
+  return addrs.some((a) => a && a !== '::1' && !/^fe[89ab]/.test(a) && !/^f[cd]/.test(a));
+}
+
+export const eximIpv6Disabled = (s, host = {}) => s.ipv6 === 'off' || (s.ipv6 !== 'on' && host.ipv6Global === false);
+
+// What leaves the service about the relay: never the stored secret.
+export function publicEximSettings(s) {
+  const sh = s?.smarthost;
+  return { ...s, smarthost: sh ? { host: sh.host, port: sh.port, requireTls: sh.requireTls !== false, auth: sh.auth ? { user: sh.auth.user, passwordSet: Boolean(sh.auth.passwordEnc) } : null } : null };
+}
+
+export function renderEximMain(s, layout, support = eximSupport(layout), vm = DEFAULTS.virtual_mail, host = {}) {
   const debian = layout?.flavor === 'debian';
   const spam = Boolean(vm?.enabled && support.contentScan);
   const lines = [`${MANAGED} (Exim Configuration Manager: main options). Edit through the panel; manual changes are overwritten.`, `${layout?.sentinel || SENTINEL} = 1`];
@@ -176,6 +199,10 @@ export function renderEximMain(s, layout, support = eximSupport(layout), vm = DE
   if (s.submissionPorts && s.tls) lines.push('# Submission ports for mail clients (Exim Configuration Manager): 587 with STARTTLS, 465 with TLS on connect.', 'daemon_smtp_ports = 25 : 465 : 587', 'tls_on_connect_ports = 465');
   else if (s.submissionPorts) lines.push('# Submission port for mail clients (Exim Configuration Manager): 587 with STARTTLS; 465 is added once SSL/TLS Configuration applies a TLS preset to Exim.', 'daemon_smtp_ports = 25 : 587');
   if (spam) lines.push('# SpamAssassin for the account panel\'s mailboxes (DATA ACL); only built-in to content-scanning Exim builds.', `spamd_address = ${vm.spamdAddress || DEFAULTS.virtual_mail.spamdAddress}`);
+  // Without a global IPv6 route Exim still tries AAAA MX targets first and logs a failure per message.
+  if (eximIpv6Disabled(s, host)) lines.push(`# IPv6 is ${s.ipv6 === 'off' ? 'switched off in the panel' : 'switched off automatically: this host has no global IPv6 address'}; a hand-written disable_ipv6 outside this block is dropped (Exim takes the option once).`, 'disable_ipv6 = true');
+  // The relay router itself is a driver fragment (mail.smarthost.write); Debian's remote_smtp_smarthost transport takes its TLS policy from this macro.
+  if (debian && s.smarthost) lines.push(`# Outbound relay ${s.smarthost.host}:${s.smarthost.port} (whm_smarthost router, Exim Configuration Manager): ${s.smarthost.requireTls !== false ? 'TLS required' : 'TLS optional'}${s.smarthost.auth ? ', authenticated through passwd.client' : ''}.`, ...(s.smarthost.requireTls !== false ? macro('REMOTE_SMTP_SMARTHOST_HOSTS_REQUIRE_TLS', '*') : []));
   return `${lines.join('\n')}\n`;
 }
 
@@ -273,7 +300,82 @@ export function dovecotIsV24(version) {
 // (SMTP AUTH) and the lmtp socket (delivery), both opened to the Exim user.
 // Quota limits come from the passwd file (userdb_quota_rule on 2.3,
 // userdb_quota_storage_size on 2.4), so system users stay unlimited.
-export function renderDovecotVirtualAuth({ passwdDir = '/etc/dovecot/whm/passwd', eximUser = null, eximGroup = null, version = null } = {}) {
+// Sieve (Pigeonhole) for the account panel's mail filters: the personal script
+// of a mailbox under its maildir (written and activated by vmail.sieve.write
+// as the account), the account-wide script as sieve_before. Pigeonhole skips
+// a script that does not exist, so mailboxes without filters cost nothing;
+// the plugin is loaded for LMTP only (Exim delivers through it), and only
+// when Pigeonhole is installed (`sieve` capability: sievec present): Dovecot
+// validates a missing plugin at delivery time, not in doveconf, so an
+// unconditional line would stop every LMTP delivery on a host without it.
+// Dovecot 2.4 replaced the plugin { sieve = … } settings with named
+// sieve_script sections.
+export const SIEVE_PATHS = { mailboxDir: 'sieve', active: '.dovecot.sieve', globalScript: 'mail/sieve-global/keel.sieve' };
+export function renderDovecotSieve(v24) {
+  const header = '# Account panel mail filters (Sieve): the personal script of a mailbox under its maildir, the account-wide script before it.';
+  if (v24) {
+    return [
+      header,
+      'sieve_script personal {',
+      '  type = personal',
+      `  path = ~/mail/%{user | domain}/%{user | username}/${SIEVE_PATHS.mailboxDir}`,
+      `  active_path = ~/mail/%{user | domain}/%{user | username}/${SIEVE_PATHS.active}`,
+      '}',
+      'sieve_script keel_account {',
+      '  type = before',
+      `  path = ~/${SIEVE_PATHS.globalScript}`,
+      '}',
+    ];
+  }
+  return [
+    header,
+    'plugin {',
+    `  sieve = file:~/mail/%d/%n/${SIEVE_PATHS.mailboxDir};active=~/mail/%d/%n/${SIEVE_PATHS.active}`,
+    `  sieve_before = ~/${SIEVE_PATHS.globalScript}`,
+    '}',
+  ];
+}
+
+// Webmail single sign-on (contract §44): Dovecot master users. The Roundcube
+// plugin logs in as `<mailbox>*<masterUser>` with the master password; Dovecot
+// checks master passdbs in their own chain before the regular one, and
+// `result_success = continue` then verifies the mailbox itself exists (and is
+// not disabled) in the virtual passdb. The master file is written by
+// vmail.master.write, the password lives encrypted in panel.webmail.master_enc.
+export const WEBMAIL_SSO = Object.freeze({
+  masterUser: 'keel-master',
+  masterFile: '/etc/dovecot/whm/master-users',
+  separator: '*',
+  plugin: 'keel_sso',
+  settingEnabled: 'panel.webmail.sso',
+  settingMaster: 'panel.webmail.master_enc',
+  settingLoginAs: 'panel.login_as_webmail',
+});
+
+export function renderDovecotMasterPassdb(v24, masterFile) {
+  return [
+    `# Webmail single sign-on: the master user in ${masterFile} (root:dovecot 0640) may log in as any mailbox as <mailbox>${WEBMAIL_SSO.separator}<master>;`,
+    '# the mailbox is still looked up in the passwd files below (result_success = continue).',
+    `auth_master_user_separator = ${WEBMAIL_SSO.separator}`,
+    ...(v24 ? [
+      'passdb master-users {',
+      '  driver = passwd-file',
+      '  master = yes',
+      `  passwd_file_path = ${masterFile}`,
+      '  result_success = continue',
+      '}',
+    ] : [
+      'passdb {',
+      '  driver = passwd-file',
+      `  args = ${masterFile}`,
+      '  master = yes',
+      '  result_success = continue',
+      '}',
+    ]),
+  ];
+}
+
+export function renderDovecotVirtualAuth({ passwdDir = '/etc/dovecot/whm/passwd', eximUser = null, eximGroup = null, version = null, masterFile = null, sieve = false } = {}) {
   const v24 = dovecotIsV24(version);
   const lines = [
     `${MANAGED} (Customer panel: virtual mailboxes). Rendered by Service Configuration for the account panel; manual changes are overwritten.`,
@@ -281,6 +383,7 @@ export function renderDovecotVirtualAuth({ passwdDir = '/etc/dovecot/whm/passwd'
     `# account's uid/gid/home and the ${v24 ? 'userdb_mail_driver / userdb_mail_path / userdb_quota_storage_size' : 'userdb_mail / userdb_quota_rule'} fields. The system passdb/userdb from 10-auth.conf`,
     '# run first (conf.d order) and continue on failure; only logins with a domain part reach the passwd files below.',
     'auth_mechanisms = plain login',
+    ...(masterFile ? renderDovecotMasterPassdb(v24, masterFile) : []),
     ...(v24 ? [
       'passdb passwd-file {',
       `  passwd_file_path = ${passwdDir}/%{user | domain}`,
@@ -311,7 +414,9 @@ export function renderDovecotVirtualAuth({ passwdDir = '/etc/dovecot/whm/passwd'
       '# which would never reach the per-domain passwd files; deliveries keep the full address.',
       'protocol lmtp {',
       '  auth_username_format = %{user | lower}',
+      ...(sieve ? ['  mail_plugins {', '    sieve = yes', '  }'] : []),
       '}',
+      ...(sieve ? renderDovecotSieve(true) : []),
     ] : [
       'passdb {',
       '  driver = passwd-file',
@@ -335,6 +440,7 @@ export function renderDovecotVirtualAuth({ passwdDir = '/etc/dovecot/whm/passwd'
       'protocol imap {',
       '  mail_plugins = $mail_plugins imap_quota',
       '}',
+      ...(sieve ? ['protocol lmtp {', '  mail_plugins = $mail_plugins sieve', '}', ...renderDovecotSieve(false)] : []),
     ]),
   ];
   if (eximUser) {
@@ -1078,14 +1184,27 @@ export function createServiceConfigService(ctx) {
 
   // --------------------------------------------------------------- exim ---
 
+  let eximHostMemo = { at: 0, value: null };
+  let outboundMemo = { at: 0, value: null };
+  // Mail exchangers every host should reach on 25; the first that answers settles it.
+  const OUTBOUND_PROBE_HOSTS = ['gmail-smtp-in.l.google.com', 'alt1.gmail-smtp-in.l.google.com'];
   const exim = {
     settings: () => getConf('exim'),
     async layout() { return op('web.exim.detect').catch((err) => ({ installed: false, error: err.message })); },
-    preview(s = getConf('exim'), layout = null) {
+    // Whether the host holds a global IPv6 address (sys.info interfaces); null
+    // when the agent cannot say, which renders nothing for ipv6 'auto'.
+    async hostIpv6() {
+      if (eximHostMemo.value && Date.now() - eximHostMemo.at < 60_000) return eximHostMemo.value;
+      let ipv6Global = null;
+      try { ipv6Global = hostHasGlobalIpv6(await op('sys.info')); } catch { ipv6Global = null; }
+      eximHostMemo = { at: Date.now(), value: { ipv6Global } };
+      return eximHostMemo.value;
+    },
+    preview(s = getConf('exim'), layout = null, host = {}) {
       const l = layout?.slots ? layout : { flavor: 'rhel', splitConfig: false, emailAclFile: '/etc/exim/whm/acl-email-filters.conf', slots: { main: { path: '/etc/exim/whm/service_config.conf' }, acl_rcpt: { path: '/etc/exim/whm/acl-rcpt-local.conf', includes: '/etc/exim/whm/acl-email-filters.conf' }, acl_data: { path: '/etc/exim/whm/acl_data_whm.conf' } } };
       const support = eximSupport(layout);
       const vm = getConf('virtual_mail');
-      const out = { main: renderEximMain(s, l, support, vm), acl_rcpt: renderEximRcptAcl(s, support, l), acl_data: renderEximDataAcl(s, support, vm, l) };
+      const out = { main: renderEximMain(s, l, support, vm, host), acl_rcpt: renderEximRcptAcl(s, support, l), acl_data: renderEximDataAcl(s, support, vm, l) };
       if (vm.enabled) out.auth = renderEximVirtualAuths(l, { requireTls: s.requireTlsForAuth });
       return out;
     },
@@ -1115,39 +1234,89 @@ export function createServiceConfigService(ctx) {
       if (typeof ctx.mail?.status === 'function') { try { const st = await ctx.mail.status(); mailStatus = { installed: st.installed, queue: st.queue, filters: st.filters }; } catch { mailStatus = null; } }
       const installed = capabilities.has('exim') && layout.installed !== false;
       const rcpt = layout.slots?.acl_rcpt;
-      return { installed, layout, settings: s, preview: exim.preview(s, layout.slots ? layout : null), support: { ...eximSupport(layout), tls: installed ? eximTlsLibrary(layout) : null }, warnings: installed ? exim.warnings(s, layout) : [], inactive: installed ? exim.inactive(s, layout.slots, layout) : [], lastApply: lastApply('exim'), mail: mailStatus, emailCategory: Boolean(ctx.mail), chain: rcpt ? { path: rcpt.path, emailAclFile: layout.emailAclFile ?? rcpt.includes ?? null, includesEmailFilters: rcpt.includesEmailFilters ?? null, hooked: rcpt.hooked ?? null, claimedBy: rcpt.claimedBy ?? null } : null };
+      const host = await exim.hostIpv6();
+      const smarthost = installed ? await exim.smarthostStatus() : null;
+      return { installed, layout, settings: publicEximSettings(s), preview: exim.preview(s, layout.slots ? layout : null, host), support: { ...eximSupport(layout), tls: installed ? eximTlsLibrary(layout) : null }, warnings: installed ? exim.warnings(s, layout) : [], inactive: installed ? exim.inactive(s, layout.slots, layout) : [], lastApply: lastApply('exim'), mail: mailStatus, emailCategory: Boolean(ctx.mail), chain: rcpt ? { path: rcpt.path, emailAclFile: layout.emailAclFile ?? rcpt.includes ?? null, includesEmailFilters: rcpt.includesEmailFilters ?? null, hooked: rcpt.hooked ?? null, claimedBy: rcpt.claimedBy ?? null } : null,
+        ipv6: { setting: s.ipv6 || 'auto', hostGlobal: host.ipv6Global, disabled: eximIpv6Disabled(s, host) }, smarthost };
+    },
+    // The relay router as the host has it (mail.smarthost.status), next to the saved setting.
+    async smarthostStatus() {
+      const s = getConf('exim');
+      let st = {};
+      try { st = (await op('mail.smarthost.status')) || {}; } catch (err) { st = { error: err.message }; }
+      return { setting: publicEximSettings(s).smarthost, configured: Boolean(st.configured), host: st.host ?? null, port: st.port ?? null, auth: st.auth ?? null, hooked: st.hooked ?? null, precedes: st.precedes ?? null, hookable: st.hookable ?? null, routerFile: st.routerFile ?? null, passwdFile: st.passwdFile ?? null, hints: st.hints || [], error: st.error ?? null };
+    },
+    // Security Advisor: can this host reach a mail exchanger on port 25 at
+    // all, and is a relay set for when it cannot? Probed at most every 10 min.
+    async outboundProbe({ fresh = false } = {}) {
+      const s = getConf('exim');
+      const smarthost = s.smarthost ? { host: s.smarthost.host, port: s.smarthost.port } : null;
+      if (!capabilities.has('exim')) return { installed: false, smarthost, port25: null };
+      if (!fresh && outboundMemo.value && Date.now() - outboundMemo.at < 600_000) return { installed: true, smarthost, port25: outboundMemo.value };
+      let port25 = null;
+      for (const host of OUTBOUND_PROBE_HOSTS) {
+        try { port25 = await op('mail.outbound.probe', { host, port: 25 }); } catch (err) { port25 = { host, port: 25, ok: null, error: err.message }; }
+        if (port25.ok) break;
+      }
+      outboundMemo = { at: Date.now(), value: port25 };
+      return { installed: true, smarthost, port25 };
     },
     requireInstalled(layout) {
       if (!capabilities.has('exim') || layout.installed === false) { recordApply('exim', false, null, 'Exim is not installed'); throw new CapabilityError('exim', 'Exim is not installed on this server. The settings were saved and are rendered into Exim once exim4/exim is installed.'); }
     },
     // Writes the three slots (macros last, so the files they point at exist
     // when the generated configuration is validated) and records the apply.
-    async apply(next, layout, req) {
-      const rendered = exim.preview(next, layout);
+    async apply(next, layout, req, { previous = null } = {}) {
+      const rendered = exim.preview(next, layout, await exim.hostIpv6());
       const applied = {};
       let inactive = [];
+      let smarthost = null;
       try {
+        // The relay router goes in before the main block (whose smarthost TLS
+        // macro the Debian transport reads) and is reloaded with it.
+        if (next.smarthost) {
+          const sh = next.smarthost;
+          smarthost = await op('mail.smarthost.write', { host: sh.host, port: sh.port, user: sh.auth?.user ?? null, password: sh.auth?.passwordEnc ? ctx.crypto.decrypt(sh.auth.passwordEnc) : null, requireTls: sh.requireTls !== false, reload: false }, req);
+        } else if (previous?.smarthost) smarthost = await op('mail.smarthost.remove', { reload: false }, req);
         const slots = ['acl_data', 'acl_rcpt', ...(rendered.auth ? ['auth'] : []), 'main'];
         for (const [i, slot] of slots.entries()) applied[slot] = await op('web.exim.include.write', { slot, content: rendered[slot], reload: i === slots.length - 1 }, req);
         inactive = exim.inactive(next, applied, layout, { written: true });
         for (const slot of slots) applied[slot].applied = !inactive.includes(slot);
-        const summary = { slots: Object.fromEntries(Object.entries(applied).map(([k, v]) => [k, { path: v.path, hooked: v.hooked }])), version: applied.main.version, inactive };
-        const error = inactive.length ? `written, but Exim does not include ${inactive.map((k) => applied[k].path).join(', ')}${applied.acl_rcpt.claimedBy ? ` (CHECK_RCPT_LOCAL_ACL_FILE is used by ${applied.acl_rcpt.claimedBy})` : ''}; the rules in there are not in force` : null;
-        recordApply('exim', inactive.length === 0, summary, error);
+        if (smarthost && next.smarthost) smarthost.applied = smarthost.hooked === true && smarthost.precedes !== false;
+        const summary = { slots: Object.fromEntries(Object.entries(applied).map(([k, v]) => [k, { path: v.path, hooked: v.hooked }])), version: applied.main.version, inactive, smarthost: smarthost ? { routerFile: smarthost.routerFile, hooked: smarthost.hooked ?? null, precedes: smarthost.precedes ?? null, removed: smarthost.removed ?? null } : null };
+        const errors = [];
+        if (inactive.length) errors.push(`written, but Exim does not include ${inactive.map((k) => applied[k].path).join(', ')}${applied.acl_rcpt.claimedBy ? ` (CHECK_RCPT_LOCAL_ACL_FILE is used by ${applied.acl_rcpt.claimedBy})` : ''}; the rules in there are not in force`);
+        if (smarthost && next.smarthost && smarthost.applied === false) errors.push(`the relay router ${smarthost.routerFile} is written but ${smarthost.hooked ? 'loaded after dnslookup' : 'not loaded by Exim'}; mail still leaves directly`);
+        recordApply('exim', errors.length === 0, summary, errors.length ? errors.join('; ') : null);
       } catch (err) { recordApply('exim', false, null, err.message); throw err; }
-      return { applied, live: inactive.length === 0, inactive };
+      return { applied, live: inactive.length === 0 && smarthost?.applied !== false, inactive, smarthost: smarthost ? { ...smarthost, hints: smarthost.hints || [] } : null };
+    },
+    // The relay setting from the admin form: a password is only sent when the
+    // operator typed one, so an omitted password keeps the stored secret for
+    // the same login; the secret is stored encrypted and never leaves the service.
+    smarthostFrom(input, current) {
+      if (input == null) return null;
+      const requireTls = input.requireTls !== false;
+      if (!input.auth) return { host: input.host, port: input.port ?? 587, auth: null, requireTls };
+      let passwordEnc = null;
+      if (input.auth.password) passwordEnc = ctx.crypto.encrypt(input.auth.password);
+      else if (current?.auth?.passwordEnc && current.auth.user === input.auth.user) passwordEnc = current.auth.passwordEnc;
+      if (!passwordEnc) throw unprocessable('A password is required for the relay login', { 'smarthost.auth.password': ['Required'] });
+      return { host: input.host, port: input.port ?? 587, auth: { user: input.auth.user, passwordEnc }, requireTls };
     },
     async update(input, req) {
-      const next = { ...getConf('exim'), ...input };
+      const previous = getConf('exim');
+      const next = { ...previous, ...input };
       if (input.tls !== undefined) next.tls = tlsPolicyFrom(input.tls);
+      if (input.smarthost !== undefined) next.smarthost = exim.smarthostFrom(input.smarthost, previous.smarthost);
       if (next.rblEnabled && !next.rbls.length) throw unprocessable('Add at least one RBL or disable RBL checks', { rbls: ['Required when RBL checks are enabled'] });
       if (next.ratelimitEnabled && next.ratelimitRcptThreshold < next.ratelimitMailThreshold) throw unprocessable('The recipient threshold should be at least the message threshold', { ratelimitRcptThreshold: ['Lower than the message threshold'] });
       setConf('exim', next);
       audit(req, { action: 'exim.config.update', args: input });
       const layout = await exim.layout();
       exim.requireInstalled(layout);
-      const result = await exim.apply(next, layout, req);
-      return { settings: next, ...result, warnings: exim.warnings(next, layout), hints: layout.hints || [], lastApply: lastApply('exim') };
+      const result = await exim.apply(next, layout, req, { previous });
+      return { settings: publicEximSettings(next), ...result, warnings: exim.warnings(next, layout), hints: [...(layout.hints || []), ...(result.smarthost?.hints || [])], lastApply: lastApply('exim') };
     },
     // Email's hook: before it writes acl-email-filters.conf it makes sure the
     // chain file (which ends with an include of that file) and the macro that
@@ -1220,7 +1389,7 @@ export function createServiceConfigService(ctx) {
   const virtualMail = {
     settings: () => getConf('virtual_mail'),
     renderDovecot(layout, dovecot) {
-      return renderDovecotVirtualAuth({ passwdDir: dovecot?.passwdDir || VMAIL_PATHS(layout).passwdDir, eximUser: layout?.installed === false ? null : layout?.user || null, eximGroup: layout?.group || null, version: dovecot?.version || null });
+      return renderDovecotVirtualAuth({ passwdDir: dovecot?.passwdDir || VMAIL_PATHS(layout).passwdDir, eximUser: layout?.installed === false ? null : layout?.user || null, eximGroup: layout?.group || null, version: dovecot?.version || null, masterFile: settings.get(WEBMAIL_SSO.settingEnabled) === true && settings.get(WEBMAIL_SSO.settingMaster) ? WEBMAIL_SSO.masterFile : null, sieve: capabilities.has('sieve') });
     },
     // The persisted outcome of the last apply (boot job, mailbox trigger or the
     // admin route): `ok` is whether Exim and Dovecot actually serve the mailboxes.
@@ -1577,6 +1746,21 @@ export function createServiceConfigService(ctx) {
       const r = await op('web.host.app.list');
       return { installed: true, hostname: host, appsDir: r.appsDir ?? null, vhostPresent: Boolean(r.vhostPresent), apps: (r.apps || []).map(shapeHostApp(host)) };
     },
+    // What the published alias really answers over loopback with the site's
+    // name (contract §41.1): a drop-in Apache accepted can still be a 500.
+    // Never throws; { status: null, ok: null } when the probe itself failed.
+    async probe(alias) {
+      try {
+        const r = await op('web.host.app.probe', { alias });
+        return { status: r.status ?? null, ok: r.status == null ? null : Boolean(r.ok), url: r.url ?? null, error: r.error ?? null, phpFatal: r.phpFatal ?? null };
+      } catch (err) { return { status: null, ok: null, url: null, error: err.message, phpFatal: null }; }
+    },
+    // The one line an admin card shows for a published application that does not answer.
+    warning(http, label = 'The application') {
+      if (!http || http.ok !== false) return null;
+      if (http.status == null) return `${label} is published but could not be probed: ${http.error || 'no answer'}`;
+      return `Published but answering ${http.status}${http.status >= 500 ? `: ${http.phpFatal || 'the server log has no PHP fatal error; check the hostname site\'s error log'}` : http.status === 404 ? ': the alias is not served (hostname site missing or not reloaded?)' : ''}`;
+    },
   };
 
   // ------------------------------------------------------------- webmail ---
@@ -1596,10 +1780,98 @@ export function createServiceConfigService(ctx) {
     return name || 'Keel';
   };
   const webmailHostUri = (scheme, host, port) => (scheme === 'plain' ? `${host}:${port}` : `${scheme}://${host}:${port}`);
-  const webmailExpected = (host) => (host ? { imapHost: webmailHostUri(WEBMAIL_MAIL.imapScheme, host, WEBMAIL_MAIL.imapPort), smtpHost: webmailHostUri(WEBMAIL_MAIL.smtpScheme, host, WEBMAIL_MAIL.smtpPort), productName: webmailProductName() } : null);
+  const ssoEnabled = () => settings.get(WEBMAIL_SSO.settingEnabled) === true;
+  const webmailPlugins = () => (ssoEnabled() ? [WEBMAIL_SSO.plugin] : []);
+  // The plugin exchanges tokens on the panel's own loopback listener; the block carries that address so a changed port never strands it.
+  const webmailSsoEndpoint = (plugins) => (plugins.includes(WEBMAIL_SSO.plugin) ? ssoEndpoint(ctx.config || {}, 'webmail') : null);
+  const webmailExpected = (host) => { if (!host) return null; const plugins = webmailPlugins(); return { imapHost: webmailHostUri(WEBMAIL_MAIL.imapScheme, host, WEBMAIL_MAIL.imapPort), smtpHost: webmailHostUri(WEBMAIL_MAIL.smtpScheme, host, WEBMAIL_MAIL.smtpPort), productName: webmailProductName(), plugins, ssoEndpoint: webmailSsoEndpoint(plugins) }; };
+  // The plugin ships in the deployed tree (install.sh rsyncs deploy/ into /opt/whm).
+  const webmailPluginSource = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'deploy', 'roundcube', WEBMAIL_SSO.plugin);
+
+  // Rewrites the Keel block (hosts, product name, plugins) and, with SSO on,
+  // copies the plugin into the install first; a plugin install that fails
+  // leaves the block without the plugin so Roundcube never loads a missing one.
+  async function writeWebmailConfig(d, req) {
+    let plugin = null;
+    let plugins = webmailPlugins();
+    if (plugins.length) {
+      try {
+        const r = await op('web.webmail.plugin.install', { source: webmailPluginSource }, req);
+        plugin = { name: r.name, path: r.path, files: r.files, installed: true };
+      } catch (err) {
+        plugin = { name: WEBMAIL_SSO.plugin, installed: false, error: err.message };
+        plugins = [];
+      }
+    }
+    const endpoint = webmailSsoEndpoint(plugins);
+    const r = await op('web.webmail.config.write', { hostname: serverHostname(), ...WEBMAIL_MAIL, productName: webmailProductName(), plugins, ...(endpoint ? { ssoEndpoint: endpoint } : {}) }, req);
+    return { path: r.path, changed: Boolean(r.changed), validated: r.validated ?? null, values: r.values ?? null, plugin };
+  }
 
   const webmail = {
     detect: (lint = false) => op('web.webmail.detect', lint ? { lint: true } : {}),
+    // Single sign-on from the account panel (contract §44): the switch, the
+    // master credential the exchange hands to the Roundcube plugin, and the
+    // host pieces (master passdb, plugin, config block) it needs.
+    sso: {
+      enabled: ssoEnabled,
+      loginAs: () => settings.get(WEBMAIL_SSO.settingLoginAs) === true,
+      masterUser: () => WEBMAIL_SSO.masterUser,
+      // Only the loopback exchange handler may call this.
+      credentials() {
+        const enc = settings.get(WEBMAIL_SSO.settingMaster);
+        if (!ssoEnabled() || !enc) throw conflict('Webmail single sign-on is not enabled on this server');
+        return { user: WEBMAIL_SSO.masterUser, password: ctx.crypto.decrypt(enc), host: webmailHostUri(WEBMAIL_MAIL.imapScheme, serverHostname() || rawHostname(), WEBMAIL_MAIL.imapPort) };
+      },
+      shape(d, dovecot) {
+        const include = dovecot?.includes?.virtualAuth ?? null;
+        return {
+          enabled: ssoEnabled(), loginAs: settings.get(WEBMAIL_SSO.settingLoginAs) === true, masterUser: WEBMAIL_SSO.masterUser, masterFile: WEBMAIL_SSO.masterFile,
+          masterConfigured: Boolean(settings.get(WEBMAIL_SSO.settingMaster)),
+          plugin: { name: WEBMAIL_SSO.plugin, installed: Boolean(d?.plugins?.keel?.includes(WEBMAIL_SSO.plugin)), loaded: Boolean(d?.config?.managed?.plugins?.includes(WEBMAIL_SSO.plugin)) },
+          dovecot: include ? { rendered: Boolean(include.exists && String(include.content || '').includes(`passwd_file_path = ${WEBMAIL_SSO.masterFile}`) || String(include.content || '').includes(`args = ${WEBMAIL_SSO.masterFile}`)), path: include.path } : null,
+          lastApply: lastApply('webmail_sso'),
+        };
+      },
+      async status() {
+        const d = await webmail.detect().catch((err) => ({ installed: false, error: err.message }));
+        const dovecot = capabilities.has('dovecot') ? await op('web.dovecot.detect').catch(() => null) : null;
+        return webmail.sso.shape(d, dovecot);
+      },
+      // Host first: the master file (and, when the wiring is live, the Dovecot
+      // include) and the plugin exist before the switch is saved, so a token
+      // is never minted for a login Dovecot would refuse.
+      async set({ enabled, loginAs } = {}, req) {
+        const out = { enabled: ssoEnabled(), loginAs: settings.get(WEBMAIL_SSO.settingLoginAs) === true, master: null, virtualMail: null, config: null };
+        if (loginAs !== undefined) { settings.set(WEBMAIL_SSO.settingLoginAs, Boolean(loginAs)); out.loginAs = Boolean(loginAs); }
+        if (enabled !== undefined) {
+          const on = Boolean(enabled);
+          try {
+            if (on) {
+              capabilities.require('dovecot', 'Dovecot is not installed on this server; webmail single sign-on needs the virtual-mail wiring.');
+              let enc = settings.get(WEBMAIL_SSO.settingMaster);
+              const password = enc ? ctx.crypto.decrypt(enc) : ctx.crypto.randomPassword(32);
+              const hashed = await op('vmail.hash', { password }, req);
+              out.master = await op('vmail.master.write', { user: WEBMAIL_SSO.masterUser, hash: hashed.hash }, req);
+              if (!enc) { enc = ctx.crypto.encrypt(password); settings.set(WEBMAIL_SSO.settingMaster, enc); }
+              settings.set(WEBMAIL_SSO.settingEnabled, true);
+            } else {
+              settings.set(WEBMAIL_SSO.settingEnabled, false);
+              if (capabilities.has('dovecot')) out.master = await op('vmail.master.remove', {}, req).catch((err) => ({ removed: false, error: err.message }));
+            }
+            out.enabled = on;
+            if (getConf('virtual_mail').enabled && capabilities.has('exim') && capabilities.has('dovecot')) {
+              out.virtualMail = await virtualMail.apply({ enabled: true }, req).then((r) => ({ applied: true, live: r.live, dovecot: r.dovecot?.path ?? null })).catch((err) => ({ applied: false, error: err.message }));
+            }
+            const d = await webmail.detect().catch(() => null);
+            if (d?.flavor === 'roundcube' && d.config?.exists && (d.published?.managed || d.config?.managed)) out.config = await writeWebmailConfig(d, req).catch((err) => ({ changed: false, error: err.message }));
+            recordApply('webmail_sso', true, { enabled: on, virtualMail: out.virtualMail, plugin: out.config?.plugin ?? null }, out.virtualMail?.error || out.config?.error || out.config?.plugin?.error || null);
+          } catch (err) { recordApply('webmail_sso', false, { enabled: on }, err.message); throw err; }
+        }
+        audit(req, { action: 'webmail.sso.set', target: WEBMAIL_SSO.plugin, args: { enabled: out.enabled, loginAs: out.loginAs, master: out.master ? { path: out.master.path, changed: out.master.changed ?? null, removed: out.master.removed ?? null } : null, virtualMail: out.virtualMail, config: out.config ? { changed: out.config.changed, plugin: out.config.plugin } : null } });
+        return { ...out, status: await webmail.sso.status() };
+      },
+    },
     async status() {
       await capabilities.ensureFresh();
       const host = serverHostname();
@@ -1609,12 +1881,16 @@ export function createServiceConfigService(ctx) {
       const published = d.published ? { alias: d.published.alias, file: d.published.file, managed: Boolean(d.published.managed), source: d.published.source, url: host ? `https://${host}${d.published.alias}/` : null } : null;
       const expected = webmailExpected(host);
       const managed = d.config?.managed ?? null;
-      const config = d.config ? { path: d.config.path, exists: Boolean(d.config.exists), ok: d.config.ok ?? null, managed, expected, inSync: Boolean(managed && expected && managed.imapHost === expected.imapHost && managed.smtpHost === expected.smtpHost && managed.productName === expected.productName) } : null;
+      const config = d.config ? { path: d.config.path, exists: Boolean(d.config.exists), ok: d.config.ok ?? null, managed, expected, inSync: Boolean(managed && expected && managed.imapHost === expected.imapHost && managed.smtpHost === expected.smtpHost && managed.productName === expected.productName && [...(managed.plugins || [])].sort().join(',') === [...expected.plugins].sort().join(',') && (managed.ssoEndpoint ?? null) === expected.ssoEndpoint) } : null;
+      const dovecot = capabilities.has('dovecot') ? await op('web.dovecot.detect').catch(() => null) : null;
+      const http = published?.managed && site?.exists && site.enabled ? await hostApps.probe(published.alias) : null;
       return {
         installed: Boolean(d.installed), flavor: d.flavor ?? null, version: d.version ?? null, path: d.path ?? null, root: d.root ?? null,
         hostname: rawHostname() || null, fqdn: Boolean(host), apache,
         site: site ? { exists: site.exists, enabled: site.enabled, ssl: site.ssl, inSync: site.inSync, url: site.url } : null,
         published, url: published?.url ?? null, globalAlias: d.globalAlias ?? null, config,
+        sso: webmail.sso.shape(d, dovecot),
+        http, warning: hostApps.warning(http, 'Webmail'),
         lastApply: lastApply('webmail'), error: d.error ?? null,
       };
     },
@@ -1625,13 +1901,13 @@ export function createServiceConfigService(ctx) {
       try {
         const app = await hostApps.publish({ ...WEBMAIL_APP, root: d.root, reload }, req);
         let config = null;
-        if (d.flavor === 'roundcube' && d.config?.exists) {
-          const r = await op('web.webmail.config.write', { hostname: serverHostname(), ...WEBMAIL_MAIL, productName: webmailProductName() }, req);
-          config = { path: r.path, changed: Boolean(r.changed), validated: r.validated ?? null, values: r.values ?? null };
-        }
-        recordApply('webmail', true, { flavor: d.flavor, alias: app.alias, root: app.root, url: app.url, changed: app.changed, config: config ? { changed: config.changed } : null, warnings: (app.warnings || []).map((w) => w.code) });
-        audit(req, { action: 'webmail.publish', target: app.url, args: { flavor: d.flavor, version: d.version, root: app.root, alias: app.alias, path: app.path, changed: app.changed, reloaded: app.reloaded, config: config ? { path: config.path, changed: config.changed, validated: config.validated } : null } });
-        return { installed: true, flavor: d.flavor, version: d.version, root: app.root, alias: app.alias, url: app.url, path: app.path, changed: app.changed, reloaded: app.reloaded, validated: app.validated, config, warnings: app.warnings };
+        if (d.flavor === 'roundcube' && d.config?.exists) config = await writeWebmailConfig(d, req);
+        // Apache accepting the drop-in is not the webmail working: the published URL is asked (unless the reload was deferred to the caller).
+        const http = reload ? await hostApps.probe(app.alias) : null;
+        const warning = hostApps.warning(http, 'Webmail');
+        recordApply('webmail', http?.ok !== false, { flavor: d.flavor, alias: app.alias, root: app.root, url: app.url, changed: app.changed, config: config ? { changed: config.changed, plugin: config.plugin } : null, warnings: (app.warnings || []).map((w) => w.code), http: http ? { status: http.status, ok: http.ok } : null }, warning);
+        audit(req, { action: 'webmail.publish', target: app.url, args: { flavor: d.flavor, version: d.version, root: app.root, alias: app.alias, path: app.path, changed: app.changed, reloaded: app.reloaded, config: config ? { path: config.path, changed: config.changed, validated: config.validated, plugin: config.plugin } : null, http: http ? { status: http.status, ok: http.ok } : null } });
+        return { installed: true, flavor: d.flavor, version: d.version, root: app.root, alias: app.alias, url: app.url, path: app.path, changed: app.changed, reloaded: app.reloaded, validated: app.validated, config, http, warning, warnings: app.warnings };
       } catch (err) {
         recordApply('webmail', false, { flavor: d.flavor, root: d.root }, err.message);
         throw err;

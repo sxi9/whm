@@ -1,8 +1,10 @@
 import net from 'node:net';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, forbidden, badRequest, unprocessable, HttpError, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
+import { ssoEndpoint } from '../lib/sso-endpoint.js';
 
 // Database Services. Attached as ctx.databases; other categories may call:
 //   databases.activeProfile()                       -> the active db_instances row (no secret)
@@ -58,6 +60,29 @@ export const KNOWN_TUNABLES = [
 
 const SYSTEM_DATABASES = new Set(['mysql', 'information_schema', 'performance_schema', 'sys', 'postgres', 'template0', 'template1']);
 const SYSTEM_USERS = new Set(['root', 'postgres', 'mysql.sys', 'mysql.session', 'mysql.infoschema', 'mariadb.sys', 'debian-sys-maint', 'mysqlxsys', 'phpmyadmin', 'pma']);
+
+// phpMyAdmin single sign-on from the account panel (contract §44, phpMyAdmin
+// kind): a hidden per-account MySQL user `<account>_pma` at localhost,
+// recreated for every sign-on with `GRANT ALL` on exactly the databases the
+// account owns at that moment (never a `<account>\_%` pattern: usernames may
+// contain "_", so `bob\_%` would also cover every database of `bob_shop`),
+// handed to the Keel signon script (served as /keel under the hostname site)
+// through a one-time token; phpMyAdmin reads it from the KeelPmaSignon
+// session via the conf.d drop-in the agent writes.
+// MySQL caps user names at 32 characters, MariaDB at 80.
+const SIGNON_NAME_MAX = { mysql: 32, mariadb: 80 };
+export const PHPMYADMIN_SSO = Object.freeze({
+  suffix: '_pma',
+  settingEnabled: 'panel.phpmyadmin.sso',
+  sessionName: 'KeelPmaSignon',
+  script: 'pma-signon.php',
+  app: Object.freeze({ name: 'keel-signon', alias: '/keel' }),
+  confPath: '/etc/phpmyadmin/conf.d/keel-signon.php',
+  hosts: Object.freeze(['localhost']),
+});
+export const signonUserFor = (username) => `${username}${PHPMYADMIN_SSO.suffix}`;
+// The script ships in the deployed tree (install.sh rsyncs deploy/ into /opt/whm).
+export const PHPMYADMIN_SIGNON_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'deploy', 'phpmyadmin');
 
 export function createDatabaseServicesService(ctx) {
   const { db, agent, capabilities, settings, crypto, logger } = ctx;
@@ -380,16 +405,17 @@ export function createDatabaseServicesService(ctx) {
       for (const u of serverUsers) { const g = grouped.get(u.user) || { name: u.user, hosts: [], system: u.system }; if (u.host) g.hosts.push(u.host); grouped.set(u.user, g); }
       for (const g of grouped.values()) {
         const row = byName.get(g.name);
-        rows.push(row ? { ...shapeUserRow(row, g.hosts), owner_id: row.owner_id, system: false, onServer: true } : { name: g.name, account: null, owner_id: null, hosts: g.hosts, grants: [], mapped: false, system: g.system, onServer: true });
+        rows.push(row ? { ...shapeUserRow(row, g.hosts), owner_id: row.owner_id, system: false, hidden: isSignonRow(row), onServer: true } : { name: g.name, account: null, owner_id: null, hosts: g.hosts, grants: [], mapped: false, system: g.system, hidden: false, onServer: true });
       }
-      for (const r of mapped) if (!grouped.has(r.name)) rows.push({ ...shapeUserRow(r), owner_id: r.owner_id, system: false, onServer: false });
+      for (const r of mapped) if (!grouped.has(r.name)) rows.push({ ...shapeUserRow(r), owner_id: r.owner_id, system: false, hidden: isSignonRow(r), onServer: false });
     } else {
-      for (const r of mapped) rows.push({ ...shapeUserRow(r), owner_id: r.owner_id, system: false, onServer: null });
+      for (const r of mapped) rows.push({ ...shapeUserRow(r), owner_id: r.owner_id, system: false, hidden: isSignonRow(r), onServer: null });
     }
     let out = isRoot(user) ? rows : rows.filter((r) => r.owner_id === user.id);
     if (query.account) out = out.filter((r) => r.account === query.account);
     if (query.q) { const needle = query.q.toLowerCase(); out = out.filter((r) => r.name.toLowerCase().includes(needle) || (r.account || '').toLowerCase().includes(needle)); }
-    if (!query.system) out = out.filter((r) => !r.system);
+    // The panel's own phpMyAdmin signon users are listed with the system users only.
+    if (!query.system) out = out.filter((r) => !r.system && !r.hidden);
     out.sort((a, b) => String(a[query.sort || 'name'] ?? '').localeCompare(String(b[query.sort || 'name'] ?? '')) * (query.dir === 'desc' ? -1 : 1));
     const page = query.page || 1; const pageSize = query.pageSize || 50;
     return { data: out.slice((page - 1) * pageSize, page * pageSize).map(({ owner_id, ...r }) => r), meta: { page, pageSize, total: out.length, engineError } };
@@ -417,6 +443,7 @@ export function createDatabaseServicesService(ctx) {
       hosts = hosts?.length ? hosts : ['localhost'];
     }
     if (SYSTEM_USERS.has(name)) throw badRequest(`"${name}" is a reserved database user name`);
+    if (account && name === signonUserFor(account.username)) throw badRequest(`"${name}" is reserved for phpMyAdmin single sign-on`, { name: [`The "${PHPMYADMIN_SSO.suffix.slice(1)}" suffix is reserved`] });
     if (stmts.userByName.get(name)) throw conflict(`Database user "${name}" already exists`);
     await checkPasswordPolicy(input.password);
     // Grant targets are checked before the user exists so a refused database
@@ -445,12 +472,20 @@ export function createDatabaseServicesService(ctx) {
     return { ...created, name, account: account?.username ?? null, hosts: isPg(profile) ? [] : hosts, grants, id: userId };
   }
 
+  // The signon user of an account is the panel's: it is rotated, granted and
+  // dropped by the sign-on and the account cleanup only.
+  const isSignonRow = (row) => Boolean(row?.account) && row.name === signonUserFor(row.account);
+  function assertNotSignon(row, what) {
+    if (isSignonRow(row)) throw badRequest(`"${row.name}" is the phpMyAdmin single sign-on user of ${row.account}; ${what} is managed by the panel`);
+  }
+
   async function dropUser(name, user, req) {
     const profile = requireProfile();
     const row = stmts.userByName.get(name);
     if (row) assertVisible(row, user, 'Database user');
     else assertRoot(user, 'Dropping a database user that is not mapped to an account');
     if (SYSTEM_USERS.has(name)) throw badRequest(`"${name}" is a system user and cannot be dropped`);
+    assertNotSignon(row, 'dropping it');
     const result = await run('user.drop', { user: name }, req, profile);
     stmts.deleteUser.run(name);
     req?.audit?.({ action: 'db.user.drop', target: name, args: { account: row?.account ?? null } });
@@ -463,6 +498,7 @@ export function createDatabaseServicesService(ctx) {
     if (row) assertVisible(row, user, 'Database user');
     else assertRoot(user, 'Changing the password of an unmapped database user');
     if (name === 'root' || name === 'postgres') throw badRequest('Use Change Database Root Password for the superuser');
+    assertNotSignon(row, 'its password');
     await checkPasswordPolicy(password);
     const result = await run('user.set_password', { user: name, password }, req, profile);
     req?.audit?.({ action: 'db.user.password', target: name, args: { account: row?.account ?? null } });
@@ -525,6 +561,7 @@ export function createDatabaseServicesService(ctx) {
     const row = stmts.userByName.get(name);
     if (row) assertVisible(row, user, 'Database user');
     else assertRoot(user, 'Reading grants of an unmapped database user');
+    assertNotSignon(row, 'its grant');
     const hosts = isPg(profile) ? [] : await resolveHosts(name, row, profile, null);
     const live = await liveGrants(name, hosts, profile, null);
     const grants = live.grants.map((g) => ({ database: g.database, privileges: g.privileges, ...(isPg(profile) ? {} : { hosts: g.hosts, mixed: g.mixed }) }));
@@ -553,6 +590,7 @@ export function createDatabaseServicesService(ctx) {
     const row = stmts.userByName.get(name);
     if (row) assertVisible(row, user, 'Database user');
     else assertRoot(user, 'Granting privileges to an unmapped database user');
+    assertNotSignon(row, 'its grant');
     const target = assertGrantTargets(wanted, row, user, profile, name);
     const hosts = isPg(profile) ? [] : await resolveHosts(name, row, profile, req);
     // The diff is computed against the union of every host's grants, so a
@@ -1046,11 +1084,125 @@ export function createDatabaseServicesService(ctx) {
     const hostname = ctx.web?.hostname?.hostname?.() ?? null;
     const site = detect.installed && !override && !detect.published?.managed ? await hostnameSite() : null;
     const url = phpMyAdminUrl({ detect, override, hostname, site });
-    const common = { installed: Boolean(detect.installed), version: detect.version ?? null, url, php: Boolean(detect.php), featureEnabled: Boolean(settings.get('db.phpmyadmin.enabled', true)) };
+    const common = { installed: Boolean(detect.installed), version: detect.version ?? null, url, php: Boolean(detect.php), featureEnabled: Boolean(settings.get('db.phpmyadmin.enabled', true)), sso: ssoAvailable(detect, override, url) };
     // Install directories, config files and web-server files are root's business.
     if (user && !isRoot(user)) return common;
     return { ...detect, ...common, urlOverride: override, hostname: settings.get('basic.hostname', '') || '', fqdn: Boolean(hostname), published: detect.published ?? null, globalAlias: detect.globalAlias ?? null };
   }
+
+  // ------------------------------------------------ phpMyAdmin signon ---
+
+  const ssoEnabled = () => settings.get(PHPMYADMIN_SSO.settingEnabled) === true;
+  const signonUrlPath = `${PHPMYADMIN_SSO.app.alias}/${PHPMYADMIN_SSO.script}`;
+  // Single sign-on only into the publication the panel made itself (never an
+  // operator URL override) and only once the conf.d drop-in is in place —
+  // it is written after the signon script is published, so its presence
+  // means the whole chain exists.
+  function ssoAvailable(detect, override, url) {
+    const p = activeRow();
+    return Boolean(ssoEnabled() && p && !isPg(p) && detect.installed && detect.published?.managed && !override && url && detect.signon?.managed && settings.get('db.phpmyadmin.enabled', true));
+  }
+
+  // The address the panel sends the browser to: the script under the same
+  // origin as the published phpMyAdmin.
+  function signonUrlFor(url) {
+    return `${new URL(url).origin}${signonUrlPath}`;
+  }
+
+  async function applySignon(req) {
+    requireHostApps();
+    const app = await ctx.web.hostApps.publish({ ...PHPMYADMIN_SSO.app, root: PHPMYADMIN_SIGNON_DIR, php: true, options: ['-Indexes', '-FollowSymLinks'], directoryIndex: [PHPMYADMIN_SSO.script] }, req);
+    const conf = await agent.op('db.phpmyadmin.signon.write', { signonUrl: signonUrlPath, logoutUrl: `${PMA_APP.alias}/`, sessionName: PHPMYADMIN_SSO.sessionName, endpoint: ssoEndpoint(ctx.config || {}, 'phpmyadmin') }, { req });
+    return { app: { url: app.url, path: app.path, changed: Boolean(app.changed), reloaded: Boolean(app.reloaded), warnings: app.warnings || [] }, conf: { path: conf.path, changed: Boolean(conf.changed), validated: conf.validated ?? null } };
+  }
+
+  async function removeSignon(req) {
+    const out = { conf: null, app: null, errors: [] };
+    try { const r = await agent.op('db.phpmyadmin.signon.remove', {}, { req }); out.conf = { path: r.path, removed: Boolean(r.removed) }; } catch (err) { out.errors.push(`drop-in: ${err.message}`); }
+    if (typeof ctx.web?.hostApps?.unpublish === 'function') {
+      try { const r = await ctx.web.hostApps.unpublish(PHPMYADMIN_SSO.app.name, req); out.app = { path: r.path, removed: Boolean(r.removed), reloaded: Boolean(r.reloaded) }; } catch (err) { out.errors.push(`script: ${err.message}`); }
+    }
+    return out;
+  }
+
+  const phpmyadminSso = {
+    enabled: ssoEnabled,
+    userFor: signonUserFor,
+    signonUrl: signonUrlFor,
+    async status(user) {
+      assertRoot(user, 'Inspecting phpMyAdmin single sign-on');
+      const r = await phpMyAdmin(user);
+      let app = null;
+      if (typeof ctx.web?.hostApps?.list === 'function') { try { app = (await ctx.web.hostApps.list()).apps.find((a) => a.name === PHPMYADMIN_SSO.app.name) ?? null; } catch { app = null; } }
+      const p = activeRow();
+      const hints = [];
+      if (p && isPg(p)) hints.push({ code: 'postgres', message: 'The active database profile is PostgreSQL; phpMyAdmin single sign-on needs MySQL/MariaDB.' });
+      if (r.installed && !r.published?.managed) hints.push({ code: 'not_published', message: 'Publish phpMyAdmin under the hostname site first; single sign-on only works for that publication.' });
+      if (r.urlOverride) hints.push({ code: 'url_override', message: 'A phpMyAdmin URL override is set; single sign-on only works for the publication under the hostname site.' });
+      if (ssoEnabled() && r.published?.managed && !r.signon?.managed) hints.push({ code: 'dropin_missing', message: `${PHPMYADMIN_SSO.confPath} is missing; switch single sign-on off and on again (or publish phpMyAdmin again) to rewrite it.` });
+      return {
+        enabled: ssoEnabled(), available: r.sso, installed: r.installed, published: Boolean(r.published?.managed), url: r.url, signonUrl: r.url && r.published?.managed && !r.urlOverride ? signonUrlFor(r.url) : null,
+        userSuffix: PHPMYADMIN_SSO.suffix, sessionName: PHPMYADMIN_SSO.sessionName, conf: r.signon ?? null,
+        script: { source: PHPMYADMIN_SIGNON_DIR, alias: PHPMYADMIN_SSO.app.alias, published: Boolean(app), path: app?.path ?? app?.file ?? null },
+        hints,
+      };
+    },
+    // Host first: the script is published and the drop-in written before the
+    // switch is saved, so the panel never mints a token phpMyAdmin would not
+    // honour. Off removes both (the hidden users stay until the account goes).
+    async set({ enabled }, user, req) {
+      assertRoot(user, 'Configuring phpMyAdmin single sign-on');
+      const on = Boolean(enabled);
+      let applied = null;
+      if (on) {
+        const profile = requireProfile();
+        if (isPg(profile)) throw new HttpError(422, 'unsupported', 'phpMyAdmin single sign-on needs a MySQL/MariaDB profile');
+        const detect = await agent.op('db.phpmyadmin.detect');
+        requirePhpMyAdmin(detect);
+        if (!detect.published?.managed) throw conflict('Publish phpMyAdmin under the hostname site before switching single sign-on on');
+        applied = await applySignon(req);
+        settings.set(PHPMYADMIN_SSO.settingEnabled, true);
+      } else {
+        settings.set(PHPMYADMIN_SSO.settingEnabled, false);
+        applied = await removeSignon(req);
+      }
+      req?.audit?.({ action: 'phpmyadmin.sso.set', target: PHPMYADMIN_SSO.app.alias, args: { enabled: on, applied } });
+      return { enabled: on, applied, status: await phpmyadminSso.status(user) };
+    },
+    // One sign-on for an account: the hidden user is dropped and created again
+    // at localhost with a fresh password, so it holds exactly the grants issued
+    // here (one per database the account owns now; a database created later is
+    // covered by the next sign-on, tokens live 60 s) and never a stale one.
+    // Called by the panel service only.
+    async signon(username, req) {
+      const profile = requireProfile();
+      if (isPg(profile)) throw new HttpError(422, 'unsupported', 'phpMyAdmin single sign-on needs a MySQL/MariaDB profile');
+      if (!ssoEnabled()) throw conflict('phpMyAdmin single sign-on is not enabled on this server');
+      const account = stmts.accountByUsername.get(username);
+      if (!account) throw notFound(`Account "${username}"`);
+      if (account.suspended) throw conflict(`Account "${username}" is suspended`);
+      const name = signonUserFor(username);
+      const max = SIGNON_NAME_MAX[profile.engine] ?? SIGNON_NAME_MAX.mysql;
+      if (name.length > max) throw new HttpError(409, 'sso_unavailable', `The account name "${username}" is too long for a phpMyAdmin sign-on user on this server (${max} characters at most for "${name}")`);
+      const hosts = [...PHPMYADMIN_SSO.hosts];
+      const password = crypto.randomPassword(32);
+      const existing = (await run('users.list', {}, req, profile)).some((u) => u.user === name && hosts.includes(u.host));
+      if (existing) await run('user.drop', { user: name, hosts }, req, profile);
+      await run('user.create', { user: name, password, hosts }, req, profile);
+      const databases = stmts.dbsForAccount.all(account.id).map((d) => d.name);
+      for (const database of databases) await run('grant', { user: name, database, privileges: ['ALL PRIVILEGES'], hosts }, req, profile);
+      const row = stmts.userByName.get(name);
+      if (row && row.account_id !== account.id) stmts.assignUser.run({ account_id: account.id, name, instance_id: profile.id });
+      if (!row) {
+        db.transaction(() => {
+          const { lastInsertRowid } = stmts.insertUser.run(account.id, name, profile.id);
+          for (const h of hosts) stmts.addUserHost.run(lastInsertRowid, h);
+        })();
+      }
+      req?.audit?.({ action: 'db.phpmyadmin.signon', target: name, args: { account: username, created: !existing, hosts, databases } });
+      return { user: name, password, host: hosts[0] };
+    },
+  };
 
   function requirePhpMyAdmin(detect) {
     if (!detect.installed) throw new CapabilityError('phpmyadmin', `phpMyAdmin is not installed on this server${detect.packageHint ? ` (${detect.packageHint})` : ''}`);
@@ -1071,7 +1223,10 @@ export function createDatabaseServicesService(ctx) {
       if (r.installed && !published && site && site.fqdn && !site.exists) hints.push({ code: 'hostname_site_missing', message: `No site answers for ${site.url}; publishing writes it first (it needs the Apache service certificate for a trusted address).` });
       if (r.globalAlias?.enabled) hints.push({ code: 'global_alias', message: `${r.globalAlias.path} serves ${r.globalAlias.urlPath} on every customer web site; publishing disables it.` });
       if (r.installed && !r.dbConfigured) hints.push({ code: 'db_not_configured', message: 'No /etc/phpmyadmin/config-db.php (dbconfig-common): bookmarks and relations are unavailable until "dpkg-reconfigure phpmyadmin" runs.' });
-      return { ...r, published, site: site ? { hostname: site.hostname, fqdn: site.fqdn, url: site.url, exists: site.exists, enabled: site.enabled, inSync: site.inSync, ssl: site.ssl, certificate: site.certificate } : null, hints };
+      // Published is what Apache loads; answering is what the probe over loopback says (contract §41.1).
+      const http = published && site?.exists && site.enabled && typeof ctx.web?.hostApps?.probe === 'function' ? await ctx.web.hostApps.probe(r.published.alias || PMA_APP.alias) : null;
+      const warning = http && typeof ctx.web.hostApps.warning === 'function' ? ctx.web.hostApps.warning(http, 'phpMyAdmin') : null;
+      return { ...r, published, site: site ? { hostname: site.hostname, fqdn: site.fqdn, url: site.url, exists: site.exists, enabled: site.enabled, inSync: site.inSync, ssl: site.ssl, certificate: site.certificate } : null, http, warning, hints };
     },
     async publish(user, req, { disableGlobal = true } = {}) {
       assertRoot(user, 'Publishing phpMyAdmin');
@@ -1093,16 +1248,24 @@ export function createDatabaseServicesService(ctx) {
           }
         } else warnings.push({ code: 'global_alias_kept', message: `${detect.globalAlias.path} is a distribution file outside Debian's a2disconf; disable it by hand so /phpmyadmin stops answering on customer sites.` });
       }
-      req?.audit?.({ action: 'db.phpmyadmin.publish', target: app.url, args: { root: detect.dir, path: app.path, changed: app.changed, reloaded: app.reloaded, globalAlias, warnings: warnings.map((w) => w.code) } });
-      return { published: true, url: app.url, path: app.path, alias: app.alias, root: app.root, changed: Boolean(app.changed), reloaded: Boolean(app.reloaded), validated: app.validated ?? null, globalAlias, warnings };
+      // With single sign-on on, the signon script and the conf.d drop-in follow the publication.
+      let sso = null;
+      if (ssoEnabled()) {
+        try { sso = await applySignon(req); } catch (err) { sso = { error: err.message }; warnings.push({ code: 'sso_not_applied', message: `Single sign-on could not be applied: ${err.message}` }); }
+      }
+      req?.audit?.({ action: 'db.phpmyadmin.publish', target: app.url, args: { root: detect.dir, path: app.path, changed: app.changed, reloaded: app.reloaded, globalAlias, sso: sso ? { applied: !sso.error, error: sso.error ?? null } : null, warnings: warnings.map((w) => w.code) } });
+      return { published: true, url: app.url, path: app.path, alias: app.alias, root: app.root, changed: Boolean(app.changed), reloaded: Boolean(app.reloaded), validated: app.validated ?? null, globalAlias, sso, warnings };
     },
     async unpublish(user, req) {
       assertRoot(user, 'Unpublishing phpMyAdmin');
       requireHostApps();
       const r = await ctx.web.hostApps.unpublish(PMA_APP.name, req);
-      req?.audit?.({ action: 'db.phpmyadmin.unpublish', target: PMA_APP.alias, args: { path: r.path, removed: r.removed, reloaded: r.reloaded } });
-      return { published: false, removed: Boolean(r.removed), reloaded: Boolean(r.reloaded), path: r.path };
+      // The signon pieces only make sense for the publication; the switch itself stays as set.
+      const sso = await removeSignon(req);
+      req?.audit?.({ action: 'db.phpmyadmin.unpublish', target: PMA_APP.alias, args: { path: r.path, removed: r.removed, reloaded: r.reloaded, sso: { conf: sso.conf?.removed ?? false, app: sso.app?.removed ?? false, errors: sso.errors } } });
+      return { published: false, removed: Boolean(r.removed), reloaded: Boolean(r.reloaded), path: r.path, sso };
     },
+    sso: phpmyadminSso,
   };
 
   function setPhpMyAdminUrl(url, user, req) {
@@ -1119,7 +1282,7 @@ export function createDatabaseServicesService(ctx) {
     return {
       account: { username: account.username, id: account.id },
       databases: stmts.dbsForAccount.all(account.id).map((d) => ({ name: d.name, users: stmts.grantsForDb.all(d.id).map((g) => g.user), created_at: d.created_at })),
-      users: stmts.usersForAccount.all(account.id).map((u) => ({ name: u.name, hosts: stmts.userHosts.all(u.id).map((h) => h.host), grants: stmts.grantsForUser.all(u.id).map((g) => ({ database: g.database, privileges: g.privileges.split(',').map((p) => p.trim()) })) })),
+      users: stmts.usersForAccount.all(account.id).filter((u) => u.name !== signonUserFor(account.username)).map((u) => ({ name: u.name, hosts: stmts.userHosts.all(u.id).map((h) => h.host), grants: stmts.grantsForUser.all(u.id).map((g) => ({ database: g.database, privileges: g.privileges.split(',').map((p) => p.trim()) })) })),
       accessHosts: hostsFor(account.id).filter((h) => h !== 'localhost'),
       quota: quotaFor(account),
       prefix: prefixing() ? `${account.username}_` : '',

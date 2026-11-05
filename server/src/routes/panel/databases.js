@@ -33,7 +33,10 @@ async function scopeOf(ctx, req) {
 export function register(ctx) {
   ctx.panelDatabases = createPanelDatabasesService(ctx);
   ctx.jobs.register('panel.db.dump', (job) => ctx.panelDatabases.runDump(job));
+  ctx.panelDatabases.registerSso();
   const svc = () => ctx.panelDatabases;
+  // A sign-on link is a browser hand-off: never minted for an API token.
+  const sessionOnly = (req, _res, next) => (req.auth?.via === 'token' ? next(new HttpError(403, 'session_required', 'phpMyAdmin single sign-on is only available from a browser session')) : next());
 
   const r = Router();
   const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(scopeOf(ctx, req).then((scope) => fn(scope, req, res))).then((d) => { if (!res.headersSent) res.status(status).json(d?.meta ? d : { data: d }); }).catch(next);
@@ -51,6 +54,7 @@ export function register(ctx) {
   r.post('/access-hosts', validate({ body: hostBody }), wrap((scope, req) => svc().addAccessHost(scope, req.body.host, req), 201));
   r.delete('/access-hosts/:id', validate({ params: idParam }), wrap((scope, req) => svc().removeAccessHost(scope, req.params.id, req)));
   r.get('/phpmyadmin', wrap((scope) => svc().phpMyAdmin(scope)));
+  r.post('/phpmyadmin/sso', sessionOnly, validate({ body: z.object({}).strict() }), wrap((scope, req) => svc().phpMyAdminSso(scope, req)));
   // The account's check/repair/optimize and dump jobs (/api/system/jobs is
   // reseller-only). The stream writes SSE itself, so it stays outside wrap().
   r.get('/jobs/:id', validate({ params: idParam }), wrap((scope, req) => svc().getJob(scope, req.params.id)));

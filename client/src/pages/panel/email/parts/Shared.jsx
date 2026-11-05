@@ -1,8 +1,23 @@
+import { useCallback } from 'react';
 import { AlertTriangle, Info } from 'lucide-react';
 import { ErrorBanner, Field, Select, TextInput } from '../../../../components/Form.jsx';
 import { formatBytes } from '../../../../components/Common.jsx';
 import { PanelCapabilityState, FeatureDisabledState } from '../../../../panel/PanelPage.jsx';
 import { usePanelMe } from '../../../../panel/hooks/usePanel.js';
+import { useT, translate } from '../../../../i18n/useT.js';
+
+// Placeholders are filled after the lookup so a translation can reorder them.
+export const fill = (text, params) => (params ? String(text).replace(/\{(\w+)\}/g, (m, k) => (params[k] == null ? m : String(params[k]))) : text);
+
+// For helpers that run outside a component (status labels, toasts built from
+// data): the module-level catalogue, same fallback rule as useT().
+export const tr = (key, fallback, params) => fill(translate(key, fallback), params);
+
+export function useEmailT() {
+  const base = useT();
+  const t = useCallback((key, fallback, params) => fill(base.t(key, fallback), params), [base.t]);
+  return { ...base, t };
+}
 
 export const isCapabilityError = (error) => Boolean(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
 export const isFeatureDisabled = (error) => Boolean(error) && error.status === 403 && error.code === 'feature_disabled';
@@ -18,15 +33,16 @@ export function PanelRequestError({ error, fn, onRetry }) {
 
 // A mutation that failed: 501 is a banner (the form stays), the rest a plain error banner.
 export function MutationError({ error }) {
+  const { t } = useEmailT();
   if (!error) return null;
   if (isCapabilityError(error)) {
     return (
       <div className="banner banner-warning" role="alert">
         <AlertTriangle size={18} />
         <div>
-          <strong>Not available on this server</strong>
+          <strong>{t('panel.email.common.not_available', 'Not available on this server')}</strong>
           <p>{error.message}</p>
-          <p className="muted">Ask your hosting provider to enable it.</p>
+          <p className="muted">{t('panel.email.common.ask_provider_enable', 'Ask your hosting provider to enable it.')}</p>
         </div>
       </div>
     );
@@ -35,7 +51,7 @@ export function MutationError({ error }) {
     return (
       <div className="banner banner-warning" role="alert">
         <AlertTriangle size={18} />
-        <div><strong>Plan limit reached</strong><p>{error.message}</p><p className="muted">Ask your hosting provider about a larger plan.</p></div>
+        <div><strong>{t('panel.email.common.plan_limit_reached', 'Plan limit reached')}</strong><p>{error.message}</p><p className="muted">{t('panel.email.common.ask_provider_plan', 'Ask your hosting provider about a larger plan.')}</p></div>
       </div>
     );
   }
@@ -58,29 +74,32 @@ export function useAccountDomains(metaDomains) {
   return [...new Set([main, ...rows].filter(Boolean))];
 }
 
-export function DomainSelect({ value, onChange, domains, label = 'Domain', help, error, allowAll = false, ...rest }) {
-  const options = [...(allowAll ? [{ value: '', label: 'All domains' }] : []), ...domains.map((d) => ({ value: d, label: d }))];
+export function DomainSelect({ value, onChange, domains, label, help, error, allowAll = false, ...rest }) {
+  const { t } = useEmailT();
+  const text = label || t('panel.email.common.domain', 'Domain');
+  const options = [...(allowAll ? [{ value: '', label: t('panel.email.common.all_domains', 'All domains') }] : []), ...domains.map((d) => ({ value: d, label: d }))];
   return (
-    <Field label={label} help={help} error={error}>
-      <Select value={value} onChange={onChange} options={options} aria-label={label} {...rest} />
+    <Field label={text} help={help} error={error}>
+      <Select value={value} onChange={onChange} options={options} aria-label={text} {...rest} />
     </Field>
   );
 }
 
 export function AddressInput({ localPart, domain, domains, onLocalPart, onDomain, error, help, disabled = false, autoFocus = false }) {
+  const { t } = useEmailT();
   return (
-    <Field label="Address" required error={error} help={help}>
+    <Field label={t('panel.email.common.address', 'Address')} required error={error} help={help}>
       <div className="input-group">
-        <TextInput value={localPart} onChange={(v) => onLocalPart(v.toLowerCase())} placeholder="name" autoCapitalize="none" autoCorrect="off" spellCheck={false} aria-label="Local part" disabled={disabled} autoFocus={autoFocus} />
+        <TextInput value={localPart} onChange={(v) => onLocalPart(v.toLowerCase())} placeholder={t('panel.email.common.local_part_placeholder', 'name')} autoCapitalize="none" autoCorrect="off" spellCheck={false} aria-label={t('panel.email.common.local_part', 'Local part')} disabled={disabled} autoFocus={autoFocus} />
         <span className="muted" style={{ alignSelf: 'center' }}>@</span>
-        <Select value={domain} onChange={onDomain} options={domains.map((d) => ({ value: d, label: d }))} aria-label="Domain" disabled={disabled} style={{ flex: 1 }} />
+        <Select value={domain} onChange={onDomain} options={domains.map((d) => ({ value: d, label: d }))} aria-label={t('panel.email.common.domain', 'Domain')} disabled={disabled} style={{ flex: 1 }} />
       </div>
     </Field>
   );
 }
 
 export function quotaText(quotaMb) {
-  if (quotaMb == null || quotaMb === 0) return 'Unlimited';
+  if (quotaMb == null || quotaMb === 0) return tr('panel.email.common.unlimited', 'Unlimited');
   return formatBytes(quotaMb * 1024 * 1024);
 }
 
@@ -100,6 +119,8 @@ export function fromLocalInput(value) {
 }
 
 export function PendingNote({ result }) {
+  const { t } = useEmailT();
   if (!result || result.applied !== false) return null;
-  return <p className="muted">Saved. The change on the mail server is pending{result.reason ? ` (${result.reason.replace(/_/g, ' ')})` : ''}; it is applied once the service is available.</p>;
+  const reason = result.reason ? ` (${result.reason.replace(/_/g, ' ')})` : '';
+  return <p className="muted">{t('panel.email.common.pending_note', 'Saved. The change on the mail server is pending{reason}; it is applied once the service is available.', { reason })}</p>;
 }

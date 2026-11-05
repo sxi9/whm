@@ -1,6 +1,10 @@
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { catalog, runOp, listOps, OpError } from './ops/index.js';
 import { exec, hasBinary, resolveBinary, ExecError } from './exec.js';
+
+// <tree>/deploy/<app> of the tree this agent runs from (agent/src/lib.js → ../../deploy).
+const deployDirOf = (app) => path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'deploy', app);
 
 // Paths the agent may read or write. Everything the panel manages lives under one
 // of these; anything else is refused even for root. Operators can extend the list
@@ -41,6 +45,13 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/usr/share/roundcube', '/var/lib/roundcube', '/etc/roundcube', '/usr/share/phpmyadmin', '/var/lib/phpmyadmin', '/etc/phpmyadmin',
   '/usr/share/roundcubemail', '/etc/roundcubemail', '/usr/share/phpMyAdmin', '/etc/phpMyAdmin', '/opt/phpmyadmin', '/srv/phpmyadmin',
   '/usr/share/nginx/html/roundcube', '/usr/share/rainloop', '/usr/share/snappymail',
+  // Keel-shipped application plugins copied into the published apps (web.webmail.plugin.install).
+  '/opt/whm/deploy/roundcube',
+  // The phpMyAdmin signon script, served as /keel under the hostname site (web.host.app.write reads the root).
+  '/opt/whm/deploy/phpmyadmin',
+  // The same two directories of the tree this agent runs from: the server resolves them from its own
+  // location, so an APP_DIR other than /opt/whm (or a dev checkout) must agree with the agent.
+  ...['roundcube', 'phpmyadmin'].map(deployDirOf).filter((p) => !p.startsWith('/opt/whm/')),
 ];
 
 export function createContext({ allowedRoots = DEFAULT_ALLOWED_ROOTS, principal = null, log = () => {} } = {}) {

@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Loading } from '../../../../components/Common.jsx';
 import { Button } from '../../../../components/Form.jsx';
 import { Modal } from '../../../../components/Modal.jsx';
+import { useT } from '../../../../i18n/useT.js';
+import { fill } from '../../../../i18n/fill.js';
 import { PanelCapabilityState } from '../../../../panel/PanelPage.jsx';
 import { usePanelApi, panelApi } from '../../../../panel/hooks/usePanel.js';
 import { PRIVILEGES, PG_PRIVILEGES, RequestError, joinCodes } from './shared.jsx';
@@ -32,28 +34,29 @@ export function toPayload(matrix) {
 // Checkbox grid: one column per database, one row per privilege; the first row
 // grants everything on that database and greys out the rest.
 export function PrivilegeGrid({ matrix, privileges, onChange, disabled }) {
+  const { t } = useT();
   const databases = [...matrix.keys()];
-  if (!databases.length) return <p className="muted">This account has no databases yet, so there is nothing to grant. Create one under Databases first.</p>;
+  if (!databases.length) return <p className="muted">{t('panel.databases.grid_no_databases', 'This account has no databases yet, so there is nothing to grant. Create one under Databases first.')}</p>;
   return (
     <div className="table-wrap">
       <table className="dense">
         <thead>
           <tr>
-            <th>Privilege</th>
+            <th>{t('panel.databases.col_privilege', 'Privilege')}</th>
             {databases.map((d) => <th key={d} className="align-right"><code>{d}</code></th>)}
           </tr>
         </thead>
         <tbody>
           {privileges.map((p) => (
             <tr key={p}>
-              <td>{p === 'ALL PRIVILEGES' ? <strong>All privileges</strong> : p}</td>
+              <td>{p === 'ALL PRIVILEGES' ? <strong>{t('panel.databases.all_privileges', 'All privileges')}</strong> : p}</td>
               {databases.map((d) => {
                 const set = matrix.get(d);
                 const all = set.has('ALL PRIVILEGES');
                 const checked = all || set.has(p);
                 return (
                   <td key={d} className="align-right">
-                    <input type="checkbox" aria-label={`${p} on ${d}`} checked={checked} disabled={disabled || (all && p !== 'ALL PRIVILEGES')} onChange={() => onChange(d, togglePrivilege(set, p, privileges))} />
+                    <input type="checkbox" aria-label={fill(t('panel.databases.privilege_on', '{privilege} on {database}'), { privilege: p, database: d })} checked={checked} disabled={disabled || (all && p !== 'ALL PRIVILEGES')} onChange={() => onChange(d, togglePrivilege(set, p, privileges))} />
                   </td>
                 );
               })}
@@ -66,6 +69,7 @@ export function PrivilegeGrid({ matrix, privileges, onChange, disabled }) {
 }
 
 export function GrantsModal({ user, databases, engine, onClose, onSaved }) {
+  const { t } = useT();
   const path = user ? `/databases/users/${encodeURIComponent(user.name)}/grants` : null;
   const { data: current, loading, error } = usePanelApi(path, { enabled: Boolean(user) });
   const [matrix, setMatrix] = useState(() => new Map());
@@ -86,16 +90,16 @@ export function GrantsModal({ user, databases, engine, onClose, onSaved }) {
   };
 
   return (
-    <Modal open={Boolean(user)} title={user ? `Privileges of ${user.name}` : ''} onClose={onClose} size="lg"
-      footer={<><Button onClick={onClose}>Cancel</Button><Button variant="ghost" onClick={clearAll} disabled={loading || busy}>Remove all access</Button><Button variant="primary" loading={busy} onClick={save} disabled={loading || Boolean(error)}>Save privileges</Button></>}>
-      {loading && !current && <Loading text="Loading privileges…" />}
+    <Modal open={Boolean(user)} title={user ? fill(t('panel.databases.privileges_of', 'Privileges of {name}'), { name: user.name }) : ''} onClose={onClose} size="lg"
+      footer={<><Button onClick={onClose}>{t('common.cancel', 'Cancel')}</Button><Button variant="ghost" onClick={clearAll} disabled={loading || busy}>{t('panel.databases.remove_all_access', 'Remove all access')}</Button><Button variant="primary" loading={busy} onClick={save} disabled={loading || Boolean(error)}>{t('panel.databases.save_privileges', 'Save privileges')}</Button></>}>
+      {loading && !current && <Loading text={t('panel.databases.loading_privileges', 'Loading privileges…')} />}
       <PanelCapabilityState error={error} />
       <RequestError error={error} />
       <PanelCapabilityState error={saveError} />
       <RequestError error={saveError} />
       {current && (
         <>
-          <p className="muted">Tick what <code>{user.name}</code> may do on each database. A database with nothing ticked is not accessible to this user.{current.hosts?.length > 0 && <> Applied at {joinCodes(current.hosts)}.</>}</p>
+          <p className="muted">{t('panel.databases.grid_help_before', 'Tick what')} <code>{user.name}</code> {t('panel.databases.grid_help_after', 'may do on each database. A database with nothing ticked is not accessible to this user.')}{current.hosts?.length > 0 && <> {t('panel.databases.applied_at', 'Applied at')} {joinCodes(current.hosts)}.</>}</p>
           <PrivilegeGrid matrix={matrix} privileges={privileges} onChange={change} disabled={busy} />
         </>
       )}

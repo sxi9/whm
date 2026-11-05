@@ -4,15 +4,16 @@ import { Field, TextInput, Select, Button } from '../../../../components/Form.js
 import { Modal } from '../../../../components/Modal.jsx';
 import { PanelCapabilityState } from '../../../../panel/PanelPage.jsx';
 import { panelApi } from '../../../../panel/hooks/usePanel.js';
+import { useT } from '../../../../i18n/useT.js';
+import { fill, plural } from '../../../../i18n/fill.js';
 import { RequestError } from './common.jsx';
 import { JobProgress } from './JobProgress.jsx';
 import { joinRel, normalizeRel, archiveNameFor, parentOf } from './paths.js';
 
-const FORMATS = [{ value: 'zip', label: 'Zip (.zip)' }, { value: 'tar.gz', label: 'Gzipped tar (.tar.gz)' }];
-
 // Both dialogs enqueue a 202 job and follow it on the panel's own job stream;
 // the caller refreshes the listing when the job finishes.
 export function CompressModal({ paths, dir, onClose, onFinished }) {
+  const { t } = useT();
   const open = Boolean(paths?.length);
   const [format, setFormat] = useState('zip');
   const [name, setName] = useState('');
@@ -21,6 +22,7 @@ export function CompressModal({ paths, dir, onClose, onFinished }) {
   const [job, setJob] = useState(null);
   useEffect(() => { if (open) { setFormat('zip'); setName(archiveNameFor(paths, 'zip')); setError(null); setJob(null); } }, [open, paths]);
   const changeFormat = (f) => { setFormat(f); setName((n) => n.replace(/\.(zip|tar\.gz|tgz)$/i, '') + `.${f}`); };
+  const formats = [{ value: 'zip', label: t('panel.files.format_zip', 'Zip (.zip)') }, { value: 'tar.gz', label: t('panel.files.format_targz', 'Gzipped tar (.tar.gz)') }];
 
   const start = async () => {
     setBusy(true); setError(null);
@@ -31,17 +33,17 @@ export function CompressModal({ paths, dir, onClose, onFinished }) {
   };
 
   return (
-    <Modal open={open} title={paths?.length === 1 ? `Compress ${paths[0].split('/').pop()}` : `Compress ${paths?.length || 0} items`} onClose={onClose} size="md"
-      footer={<><Button onClick={onClose}>{job ? 'Close' : 'Cancel'}</Button>{!job && <Button variant="primary" icon={Archive} loading={busy} disabled={!name.trim()} onClick={start}>Create archive</Button>}</>}>
+    <Modal open={open} title={paths?.length === 1 ? fill(t('panel.files.compress_name', 'Compress {name}'), { name: paths[0].split('/').pop() }) : fill(t('panel.files.compress_n_items', 'Compress {count} items'), { count: paths?.length || 0 })} onClose={onClose} size="md"
+      footer={<><Button onClick={onClose}>{job ? t('panel.files.close', 'Close') : t('panel.files.cancel', 'Cancel')}</Button>{!job && <Button variant="primary" icon={Archive} loading={busy} disabled={!name.trim()} onClick={start}>{t('panel.files.create_archive', 'Create archive')}</Button>}</>}>
       <PanelCapabilityState error={error} />
       <RequestError error={error} />
       {!job && (
         <>
-          <Field label="Format" htmlFor="archive-format"><Select id="archive-format" value={format} onChange={changeFormat} options={FORMATS} /></Field>
-          <Field label="Archive name" required help={<>Created in <code>{dir ? `~/${dir}` : '~'}</code>; it must end in .{format}</>} error={error?.fields?.dest} htmlFor="archive-name">
+          <Field label={t('panel.files.format', 'Format')} htmlFor="archive-format"><Select id="archive-format" value={format} onChange={changeFormat} options={formats} /></Field>
+          <Field label={t('panel.files.archive_name', 'Archive name')} required help={<>{t('panel.files.created_in', 'Created in')} <code>{dir ? `~/${dir}` : '~'}</code>{fill(t('panel.files.must_end_in', '; it must end in .{format}'), { format })}</>} error={error?.fields?.dest} htmlFor="archive-name">
             <TextInput id="archive-name" value={name} onChange={setName} spellCheck={false} />
           </Field>
-          <p className="muted small">{paths?.length} item{paths?.length === 1 ? '' : 's'} will be included. Existing archives are never overwritten.</p>
+          <p className="muted small">{plural(t, 'panel.files.items_included', paths?.length, '{count} item will be included.', '{count} items will be included.')} {t('panel.files.archives_never_overwritten', 'Existing archives are never overwritten.')}</p>
         </>
       )}
       {job && <JobProgress jobId={job.id} onFinished={(ev) => onFinished?.(ev)} />}
@@ -50,6 +52,7 @@ export function CompressModal({ paths, dir, onClose, onFinished }) {
 }
 
 export function ExtractModal({ archive, onClose, onFinished }) {
+  const { t } = useT();
   const open = Boolean(archive);
   const [dest, setDest] = useState('');
   const [busy, setBusy] = useState(false);
@@ -59,7 +62,7 @@ export function ExtractModal({ archive, onClose, onFinished }) {
 
   const start = async () => {
     const clean = normalizeRel(dest);
-    if (clean == null) { setError({ message: 'Choose a folder inside your home directory', fields: { dest: ['".." is not allowed'] } }); return; }
+    if (clean == null) { setError({ message: t('panel.files.choose_folder_in_home', 'Choose a folder inside your home directory'), fields: { dest: [t('panel.files.dotdot_not_allowed', '".." is not allowed')] } }); return; }
     setBusy(true); setError(null);
     try {
       const { data } = await panelApi.post('/files/extract', { archive, dest: clean });
@@ -68,12 +71,12 @@ export function ExtractModal({ archive, onClose, onFinished }) {
   };
 
   return (
-    <Modal open={open} title={archive ? `Extract ${archive.split('/').pop()}` : ''} onClose={onClose} size="md"
-      footer={<><Button onClick={onClose}>{job ? 'Close' : 'Cancel'}</Button>{!job && <Button variant="primary" icon={PackageOpen} loading={busy} onClick={start}>Extract</Button>}</>}>
+    <Modal open={open} title={archive ? fill(t('panel.files.extract_name', 'Extract {name}'), { name: archive.split('/').pop() }) : ''} onClose={onClose} size="md"
+      footer={<><Button onClick={onClose}>{job ? t('panel.files.close', 'Close') : t('panel.files.cancel', 'Cancel')}</Button>{!job && <Button variant="primary" icon={PackageOpen} loading={busy} onClick={start}>{t('panel.files.extract', 'Extract')}</Button>}</>}>
       <PanelCapabilityState error={error} />
       <RequestError error={error} />
       {!job && (
-        <Field label="Extract into" help="A folder relative to your home directory; leave empty for the home directory itself. It is created if missing." error={error?.fields?.dest || error?.fields?.archive} htmlFor="extract-dest">
+        <Field label={t('panel.files.extract_into', 'Extract into')} help={t('panel.files.extract_into_help', 'A folder relative to your home directory; leave empty for the home directory itself. It is created if missing.')} error={error?.fields?.dest || error?.fields?.archive} htmlFor="extract-dest">
           <div className="input-group" style={{ alignItems: 'center' }}>
             <span className="muted" aria-hidden="true"><code>~/</code></span>
             <TextInput id="extract-dest" value={dest} onChange={setDest} placeholder="public_html" spellCheck={false} />

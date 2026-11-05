@@ -5,6 +5,8 @@ import { Card, StatusPill, formatDate } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { PanelPage, PanelCapabilityState } from '../../../panel/PanelPage.jsx';
 import { usePanelMe } from '../../../panel/hooks/usePanel.js';
+import { useT } from '../../../i18n/useT.js';
+import { fill } from '../../../i18n/fill.js';
 import { useDomains, typeLabel, isParked, allowedText, VhostPill, SslPill, DocrootCode } from './parts/shared.jsx';
 
 const FILTERS = [['all', 'All'], ['main', 'Main'], ['addon', 'Addon'], ['sub', 'Subdomains'], ['parked', 'Parked']];
@@ -18,6 +20,7 @@ export function filterDomains(rows, filter, q) {
 }
 
 export default function Domains({ fn }) {
+  const { t } = useT();
   const { me, hasFeature } = usePanelMe();
   const navigate = useNavigate();
   const { rows, counts, limits, error, loading, refetch } = useDomains();
@@ -26,48 +29,49 @@ export default function Domains({ fn }) {
   const homeDir = me?.account?.homeDir;
   const visible = useMemo(() => filterDomains(rows, filter, q), [rows, filter, q]);
   const can = (key) => !hasFeature || hasFeature(key);
+  const manageLabel = { addon: t('panel.domains.manage_addons', 'Manage addon domains'), sub: t('panel.domains.manage_subdomains', 'Manage subdomains'), parked: t('panel.domains.manage_parked', 'Manage parked domains'), alias: t('panel.domains.manage_parked', 'Manage parked domains') };
 
   const columns = [
-    { key: 'domain', label: 'Domain', render: (r) => <><strong>{r.domain}</strong>{isParked(r) && <div className="muted" style={{ fontSize: 12.5 }}>Shows {me?.account?.domain}</div>}</> },
-    { key: 'type', label: 'Type', render: (r) => <StatusPill status={r.type === 'main' ? 'ok' : 'info'}>{typeLabel(r.type)}</StatusPill> },
-    { key: 'docroot', label: 'Document root', render: (r) => <DocrootCode docroot={r.docroot} homeDir={homeDir} /> },
-    { key: 'vhost', label: 'Web server', render: (r) => <VhostPill vhost={r.vhost} /> },
-    { key: 'ssl', label: 'SSL', render: (r) => <SslPill ssl={r.ssl} /> },
-    { key: 'phpVersion', label: 'PHP', render: (r) => r.phpVersion || <span className="muted">Default</span> },
-    { key: 'createdAt', label: 'Added', render: (r) => formatDate(r.createdAt) },
+    { key: 'domain', label: t('panel.domains.col_domain', 'Domain'), render: (r) => <><strong>{r.domain}</strong>{isParked(r) && <div className="muted" style={{ fontSize: 12.5 }}>{fill(t('panel.domains.shows_target', 'Shows {domain}'), { domain: me?.account?.domain })}</div>}</> },
+    { key: 'type', label: t('panel.domains.col_type', 'Type'), render: (r) => <StatusPill status={r.type === 'main' ? 'ok' : 'info'}>{typeLabel(r.type)}</StatusPill> },
+    { key: 'docroot', label: t('panel.domains.col_docroot', 'Document root'), render: (r) => <DocrootCode docroot={r.docroot} homeDir={homeDir} /> },
+    { key: 'vhost', label: t('panel.domains.col_web_server', 'Web server'), render: (r) => <VhostPill vhost={r.vhost} /> },
+    { key: 'ssl', label: t('panel.domains.col_ssl', 'SSL'), render: (r) => <SslPill ssl={r.ssl} /> },
+    { key: 'phpVersion', label: t('panel.domains.col_php', 'PHP'), render: (r) => r.phpVersion || <span className="muted">{t('panel.domains.php_default', 'Default')}</span> },
+    { key: 'createdAt', label: t('panel.domains.col_added', 'Added'), render: (r) => formatDate(r.createdAt) },
   ];
 
   return (
     <PanelPage fn={fn} actions={(
       <>
-        {can('addondomains') && <Link className="btn" to="/panel/domains/addon-domains"><Plus size={16} /> Addon domain</Link>}
-        {can('subdomains') && <Link className="btn" to="/panel/domains/subdomains"><Plus size={16} /> Subdomain</Link>}
-        {can('parkeddomains') && <Link className="btn" to="/panel/domains/parked-domains"><Plus size={16} /> Parked domain</Link>}
+        {can('addondomains') && <Link className="btn" to="/panel/domains/addon-domains"><Plus size={16} /> {t('panel.domains.addon_domain', 'Addon domain')}</Link>}
+        {can('subdomains') && <Link className="btn" to="/panel/domains/subdomains"><Plus size={16} /> {t('panel.domains.subdomain', 'Subdomain')}</Link>}
+        {can('parkeddomains') && <Link className="btn" to="/panel/domains/parked-domains"><Plus size={16} /> {t('panel.domains.parked_domain', 'Parked domain')}</Link>}
       </>
     )}>
       {counts && (
         <div className="stat-grid" style={{ marginBottom: 16 }}>
-          <div className="stat"><div className="label">Addon domains</div><div className="value">{counts.addon}</div><div className="muted">{allowedText(limits?.max_addons)}</div></div>
-          <div className="stat"><div className="label">Subdomains</div><div className="value">{counts.sub}</div><div className="muted">{allowedText(limits?.max_subdomains)}</div></div>
-          <div className="stat"><div className="label">Parked domains</div><div className="value">{counts.parked}</div><div className="muted">{allowedText(limits?.max_parked)}</div></div>
+          <div className="stat"><div className="label">{t('panel.domains.addon_domains', 'Addon domains')}</div><div className="value">{counts.addon}</div><div className="muted">{allowedText(limits?.max_addons)}</div></div>
+          <div className="stat"><div className="label">{t('panel.domains.subdomains', 'Subdomains')}</div><div className="value">{counts.sub}</div><div className="muted">{allowedText(limits?.max_subdomains)}</div></div>
+          <div className="stat"><div className="label">{t('panel.domains.parked_domains', 'Parked domains')}</div><div className="value">{counts.parked}</div><div className="muted">{allowedText(limits?.max_parked)}</div></div>
         </div>
       )}
-      <Card title="Domains on this account" subtitle={`${me?.account?.domain ? `${me.account.domain} is the main domain. ` : ''}Where each name is served from, and whether the web server and SSL are in place.`} padded={false}>
+      <Card title={t('panel.domains.list_title', 'Domains on this account')} subtitle={`${me?.account?.domain ? `${fill(t('panel.domains.is_main', '{domain} is the main domain.'), { domain: me.account.domain })} ` : ''}${t('panel.domains.list_help', 'Where each name is served from, and whether the web server and SSL are in place.')}`} padded={false}>
         <PanelCapabilityState error={error} onRetry={refetch} />
         <DataTable
           columns={columns} rows={visible} loading={loading} error={error && error.status !== 501 ? error : null}
-          emptyText={q || filter !== 'all' ? 'No domains match this filter' : 'Your main domain appears here once the account is provisioned'}
-          searchable q={q} onSearch={setQ} searchPlaceholder="Search domains…"
+          emptyText={q || filter !== 'all' ? t('panel.domains.empty_filter', 'No domains match this filter') : t('panel.domains.empty', 'Your main domain appears here once the account is provisioned')}
+          searchable q={q} onSearch={setQ} searchPlaceholder={t('panel.domains.search', 'Search domains…')}
           toolbar={(
             <div className="segmented" role="tablist">
-              {FILTERS.map(([key, label]) => <button key={key} type="button" role="tab" aria-selected={filter === key} className={filter === key ? 'active' : ''} onClick={() => setFilter(key)}>{label}</button>)}
+              {FILTERS.map(([key, label]) => <button key={key} type="button" role="tab" aria-selected={filter === key} className={filter === key ? 'active' : ''} onClick={() => setFilter(key)}>{t(`panel.domains.filter_${key}`, label)}</button>)}
             </div>
           )}
           rowKey={(r) => r.domain}
           rowActions={(r) => [
-            { label: 'DNS records', primary: true, onClick: () => navigate(`/panel/dns/zone-editor?zone=${encodeURIComponent(r.domain)}`) },
-            can('redirects') && { label: 'Redirect', onClick: () => navigate(`/panel/domains/redirects?domain=${encodeURIComponent(r.domain)}`) },
-            PAGE_OF[r.type] && { label: `Manage ${typeLabel(r.type).toLowerCase()}s`, onClick: () => navigate(PAGE_OF[r.type]) },
+            { label: t('panel.domains.dns_records', 'DNS records'), primary: true, onClick: () => navigate(`/panel/dns/zone-editor?zone=${encodeURIComponent(r.domain)}`) },
+            can('redirects') && { label: t('panel.domains.redirect', 'Redirect'), onClick: () => navigate(`/panel/domains/redirects?domain=${encodeURIComponent(r.domain)}`) },
+            PAGE_OF[r.type] && { label: manageLabel[r.type], onClick: () => navigate(PAGE_OF[r.type]) },
           ]}
         />
       </Card>

@@ -1,0 +1,22 @@
+{
+    "name": "keel/keel_sso",
+    "type": "roundcube-plugin",
+    "description": "Single sign-on from the Keel account panel: exchanges a one-time panel token over loopback for a Dovecot master login and opens the mailbox without a login form.",
+    "license": "GPL-3.0-or-later",
+    "version": "1.0.0",
+    "authors": [
+        {
+            "name": "Keel",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": ">=7.3.0",
+        "roundcube/plugin-installer": ">=0.1.3"
+    },
+    "extra": {
+        "roundcube": {
+            "min-version": "1.4.0"
+        }
+    }
+}

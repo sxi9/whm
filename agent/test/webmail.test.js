@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { roundcubeVersion, aliasFor, aliasesIn, renderRoundcubeBlock, mergeConfigBlock, stripConfigBlock, readConfigBlock, CONFIG_BLOCK, ROUNDCUBE_CONFIG, WEBMAIL_CANDIDATES } from '../src/ops/webmail.js';
+import { roundcubeVersion, aliasFor, aliasesIn, renderRoundcubeBlock, mergeConfigBlock, stripConfigBlock, readConfigBlock, CONFIG_BLOCK, ROUNDCUBE_CONFIG, WEBMAIL_CANDIDATES, PLUGIN_SOURCE_ROOT, PLUGIN_NAME, SSO_ENDPOINT_RE } from '../src/ops/webmail.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
@@ -31,9 +31,9 @@ describe('web.webmail.detect', () => {
     exec.mockClear();
     const r = await runOp('web.webmail.detect', {}, ctx);
     expect(exec).not.toHaveBeenCalled();
-    expect(Object.keys(r).sort()).toEqual(['apacheAlias', 'config', 'configured', 'flavor', 'globalAlias', 'installed', 'path', 'published', 'root', 'version']);
+    expect(Object.keys(r).sort()).toEqual(['apacheAlias', 'config', 'configured', 'flavor', 'globalAlias', 'installed', 'path', 'plugins', 'published', 'root', 'version']);
     expect(typeof r.installed).toBe('boolean');
-    if (!r.installed) expect(r).toEqual({ installed: false, flavor: null, path: null, root: null, version: null, configured: null, apacheAlias: null, published: null, globalAlias: null, config: null });
+    if (!r.installed) expect(r).toEqual({ installed: false, flavor: null, path: null, root: null, version: null, configured: null, apacheAlias: null, published: null, globalAlias: null, config: null, plugins: null });
     else {
       expect(WEBMAIL_CANDIDATES.map((c) => c.path)).toContain(r.path);
       expect(r.root.startsWith(r.path)).toBe(true);
@@ -91,7 +91,7 @@ describe('Roundcube config block', () => {
     expect(block.split('\n')).toEqual(["$config['imap_host'] = 'ssl://nova.example.com:993';", "$config['smtp_host'] = 'tls://nova.example.com:587';", "$config['product_name'] = 'Keel';"]);
     expect(renderRoundcubeBlock({ ...args, imapScheme: 'plain', imapPort: 143 })).toContain("'nova.example.com:143'");
     expect(renderRoundcubeBlock({ ...args, productName: "O'Brien \\ Co" })).toContain("'O\\'Brien \\\\ Co'");
-    expect(readConfigBlock(mergeConfigBlock('<?php\n', renderRoundcubeBlock({ ...args, productName: "O'Brien \\ Co" })))).toEqual({ imapHost: 'ssl://nova.example.com:993', smtpHost: 'tls://nova.example.com:587', productName: "O'Brien \\ Co" });
+    expect(readConfigBlock(mergeConfigBlock('<?php\n', renderRoundcubeBlock({ ...args, productName: "O'Brien \\ Co" })))).toEqual({ imapHost: 'ssl://nova.example.com:993', smtpHost: 'tls://nova.example.com:587', productName: "O'Brien \\ Co", plugins: [], ssoEndpoint: null });
   });
 
   it('appends the block once, replaces it in place, keeps a closing ?> last, and strips cleanly', () => {
@@ -112,7 +112,7 @@ describe('Roundcube config block', () => {
     const merged = mergeConfigBlock(closed, renderRoundcubeBlock(args));
     expect(merged.endsWith(`${CONFIG_BLOCK.end}\n?>\n`)).toBe(true);
     expect(merged.indexOf('?>')).toBeGreaterThan(merged.indexOf(CONFIG_BLOCK.end));
-    expect(readConfigBlock(merged)).toEqual({ imapHost: 'ssl://nova.example.com:993', smtpHost: 'tls://nova.example.com:587', productName: 'Keel' });
+    expect(readConfigBlock(merged)).toEqual({ imapHost: 'ssl://nova.example.com:993', smtpHost: 'tls://nova.example.com:587', productName: 'Keel', plugins: [], ssoEndpoint: null });
     expect(readConfigBlock(debian)).toBe(null);
   });
 });
@@ -159,5 +159,108 @@ describe('web.webmail.config.write / remove', () => {
     try { await runOp('web.webmail.config.write', { hostname: 'nova.example.com', productName: 'Keel' }, ctx); } catch (e) { err = e; }
     expect(err?.code).toBe('not_found');
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('Roundcube plugins in the Keel block (single sign-on, contract §44)', () => {
+  const base = { hostname: 'nova.example.com', imapScheme: 'ssl', imapPort: 993, smtpScheme: 'tls', smtpPort: 587, productName: 'Keel' };
+
+  it('appends $config[\'plugins\'][] lines after the hosts, reads them back, and renders none by default', () => {
+    expect(renderRoundcubeBlock(base).split('\n')).toHaveLength(3);
+    const block = renderRoundcubeBlock({ ...base, plugins: ['keel_sso'] });
+    expect(block.split('\n')).toEqual(["$config['imap_host'] = 'ssl://nova.example.com:993';", "$config['smtp_host'] = 'tls://nova.example.com:587';", "$config['product_name'] = 'Keel';", "$config['plugins'][] = 'keel_sso';"]);
+    const merged = mergeConfigBlock("<?php\n$config['plugins'] = [\n    // 'archive',\n];\n", block);
+    expect(readConfigBlock(merged)).toEqual({ imapHost: 'ssl://nova.example.com:993', smtpHost: 'tls://nova.example.com:587', productName: 'Keel', plugins: ['keel_sso'], ssoEndpoint: null });
+    expect(merged.indexOf("$config['plugins'] = [")).toBeLessThan(merged.indexOf(CONFIG_BLOCK.begin));
+    expect(readConfigBlock(mergeConfigBlock('<?php\n', renderRoundcubeBlock(base))).plugins).toEqual([]);
+  });
+
+  it('renders the panel loopback endpoint for the plugin and reads it back', () => {
+    const endpoint = 'http://127.0.0.1:2086/api/panel/sso/webmail/';
+    const block = renderRoundcubeBlock({ ...base, plugins: ['keel_sso'], ssoEndpoint: endpoint });
+    expect(block.split('\n').pop()).toBe("$config['keel_sso_endpoint'] = 'http://127.0.0.1:2086/api/panel/sso/webmail/';");
+    expect(readConfigBlock(mergeConfigBlock('<?php\n', block))).toMatchObject({ plugins: ['keel_sso'], ssoEndpoint: endpoint });
+    expect(renderRoundcubeBlock({ ...base, plugins: ['keel_sso'] })).not.toContain('keel_sso_endpoint');
+  });
+
+  it('config.write pins the endpoint to the panel listener on 127.0.0.1', async () => {
+    for (const ssoEndpoint of ['https://127.0.0.1:2087/api/panel/sso/phpmyadmin/', 'https://nova.example.com:2087/api/panel/sso/webmail/', "https://127.0.0.1:2087/api/panel/sso/webmail/'; system('id", 'http://127.0.0.1:2086/api/panel/sso/webmail', 'ftp://127.0.0.1:21/api/panel/sso/webmail/', '']) {
+      exec.mockClear();
+      let err;
+      try { await runOp('web.webmail.config.write', { ...base, plugins: ['keel_sso'], ssoEndpoint }, ctx); } catch (e) { err = e; }
+      expect(err?.code, ssoEndpoint).toBe('invalid_args');
+      expect(exec).not.toHaveBeenCalled();
+    }
+    expect(SSO_ENDPOINT_RE.test('https://127.0.0.1:2087/api/panel/sso/webmail/')).toBe(true);
+    expect(SSO_ENDPOINT_RE.test('http://127.0.0.1:2086/api/panel/sso/webmail/')).toBe(true);
+  });
+
+  it('config.write only takes plugin names that are plain identifiers (no path, quote or PHP)', async () => {
+    for (const plugins of [['keel_sso', 'x'.repeat(33)], ['Keel_SSO'], ['../keel_sso'], ["a'; system('id"], ['keel sso'], 'keel_sso', new Array(9).fill('a')]) {
+      exec.mockClear();
+      let err;
+      try { await runOp('web.webmail.config.write', { ...base, plugins }, ctx); } catch (e) { err = e; }
+      expect(err?.code, JSON.stringify(plugins)).toBe('invalid_args');
+      expect(exec).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('web.webmail.plugin.install / remove', () => {
+  it('are registered (remove destructive) and refuse unknown arguments', async () => {
+    expect(catalog.has('web.webmail.plugin.install')).toBe(true);
+    expect(catalog.get('web.webmail.plugin.install').destructive).toBe(false);
+    expect(catalog.get('web.webmail.plugin.remove').destructive).toBe(true);
+    for (const args of [{}, { source: `${PLUGIN_SOURCE_ROOT}/keel_sso`, dest: '/tmp' }, { name: 'keel_sso' }]) {
+      let err;
+      try { await runOp('web.webmail.plugin.install', args, ctx); } catch (e) { err = e; }
+      expect(err?.code, JSON.stringify(args)).toBe('invalid_args');
+    }
+    for (const args of [{}, { name: '../x' }, { name: 'keel_sso', path: '/x' }, { name: 'Keel' }]) {
+      let err;
+      try { await runOp('web.webmail.plugin.remove', args, ctx); } catch (e) { err = e; }
+      expect(err?.code, JSON.stringify(args)).toBe('invalid_args');
+    }
+  });
+
+  it('pins the source to <deploy>/roundcube/<name> under an allowed root and never copies from anywhere else', async () => {
+    const shaped = ['/opt/whm/deploy/roundcube/keel_sso/../../../etc', '/etc/roundcube/keel_sso', '/opt/whm/deploy/roundcube/Keel_SSO', '/opt/whm/deploy/roundcube/keel_sso/keel_sso.php', 'deploy/roundcube/keel_sso', '/opt/whm/deploy/roundcube/'];
+    for (const source of shaped) {
+      exec.mockClear();
+      let err;
+      try { await runOp('web.webmail.plugin.install', { source }, ctx); } catch (e) { err = e; }
+      expect(err?.code, source).toBe('invalid_args');
+    }
+    // Well-formed but outside the agent's roots: refused before any file is read.
+    let err;
+    try { await runOp('web.webmail.plugin.install', { source: '/srv/keel/deploy/roundcube/keel_sso' }, ctx); } catch (e) { err = e; }
+    expect(err?.code).toBe('path_not_allowed');
+    expect(ctx.assertAllowedPath(`${PLUGIN_SOURCE_ROOT}/keel_sso`, 'read')).toBe(`${PLUGIN_SOURCE_ROOT}/keel_sso`);
+    expect(PLUGIN_NAME.test('keel_sso')).toBe(true);
+    // A missing deployed tree is not_found (install.sh --upgrade ships it), never a copy from elsewhere.
+    if (!fs.existsSync(`${PLUGIN_SOURCE_ROOT}/keel_sso`)) {
+      let e2;
+      try { await runOp('web.webmail.plugin.install', { source: `${PLUGIN_SOURCE_ROOT}/keel_sso` }, ctx); } catch (e) { e2 = e; }
+      expect(['not_found', 'capability_missing']).toContain(e2?.code);
+    }
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('the shipped plugin exists in the repo with the file the op requires', () => {
+    const dir = new URL('../../deploy/roundcube/keel_sso/', import.meta.url);
+    expect(fs.existsSync(new URL('keel_sso.php', dir))).toBe(true);
+    expect(fs.existsSync(new URL('composer.json', dir))).toBe(true);
+    const php = fs.readFileSync(new URL('keel_sso.php', dir), 'utf8');
+    expect(php).toContain('class keel_sso extends rcube_plugin');
+    expect(php).toContain("'startup'");
+    expect(php).toContain('[A-Za-z0-9_-]{32,128}');
+    expect(php).toContain('CURLOPT_SSL_VERIFYPEER => !$loopback');
+    // One Roundcube user record per mailbox: the mailbox is the login, the master user the SASL authentication identity.
+    for (const key of ['imap_auth_type', 'imap_auth_cid', 'imap_auth_pw', 'smtp_auth_type', 'smtp_auth_cid', 'smtp_auth_pw']) expect(php).toContain(`'${key}'`);
+    expect(php).toContain("$this->rcmail->login($cred['mailbox']");
+    expect(php).not.toContain("'user_create'");
+    expect(php).toContain("$_SESSION['keel_sso']");
+    expect(php).toContain("config->get('keel_sso_endpoint'");
+    expect(JSON.parse(fs.readFileSync(new URL('composer.json', dir), 'utf8')).type).toBe('roundcube-plugin');
   });
 });

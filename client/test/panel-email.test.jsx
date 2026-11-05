@@ -376,8 +376,9 @@ describe('Mail usage', () => {
     recent: [{ id: 'm1', arrivedAt: '2026-11-03T09:00:00Z', sender: 'info@demo.example.com', recipient: 'x@example.org', status: 'delivered', subject: 'Hello', size: 2048, detail: null }, { id: 'm2', arrivedAt: '2026-11-03T09:05:00Z', sender: 'info@demo.example.com', recipient: 'y@example.org', status: 'failed', subject: null, size: null, detail: 'Unrouteable address' }],
     storage: { mailboxes: 2, quotaMb: 2048, limit: 10 }, log: { from: '2026-11-02 00:00:00', truncated: false, exists: true },
   };
-  it('renders totals, per-mailbox, per-domain and recent tables', () => {
-    const html = withFixtures({ '/email/usage': { data: usage } }, () => page(Usage, 'usage'));
+  it('renders totals, per-mailbox, per-domain and message tables', () => {
+    const messages = { data: usage.recent, meta: { page: 1, pageSize: 25, total: 2 } };
+    const html = withFixtures({ '/email/usage': { data: usage }, '/email/usage/messages': messages }, () => page(Usage, 'usage'));
     expect(html).toContain('<h1>Mail usage</h1>');
     expect(html).toContain('aria-label="Time window"');
     expect(html).toContain('Last 7 days');
@@ -387,7 +388,7 @@ describe('Mail usage', () => {
     expect(html).toContain('2.00 GB allotted');
     expect(html).toContain('Per mailbox');
     expect(html).toContain('Per domain');
-    expect(html).toContain('Recent messages');
+    expect(html).toContain('>Messages<');
     expect(html).toContain('Unrouteable address');
     expect(html).toContain('2.00 KB');
     expect(html).toContain('Log entries start');
@@ -396,7 +397,7 @@ describe('Mail usage', () => {
     const html = withFixtures({ '/email/usage': { error: noDaemon } }, () => page(Usage, 'usage'));
     expect(html).toContain('Not available on this server');
     expect(html).toContain('aria-label="Time window"');
-    expect(html).not.toContain('Recent messages');
+    expect(html).not.toContain('>Messages<');
   });
 });
 

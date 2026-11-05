@@ -83,7 +83,7 @@ export function DataTable({
   );
 }
 
-function RowActions({ actions }) {
+export function RowActions({ actions }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState(null);
   // The menu is positioned against the viewport so the card's rounded clipping

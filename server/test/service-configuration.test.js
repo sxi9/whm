@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { renderEximMain, renderEximRcptAcl, renderEximDataAcl, renderEximTls, renderDovecot, dovecotSupportsCipherSuites, tlsPolicyFrom, eximTlsLibrary, phpVersionId, eximSupport, DEFAULTS } from '../src/services/service-configuration.js';
+import * as scA3 from '../src/services/service-configuration.js';
 
 const FULL_BINS = { apache2ctl: true, 'php-fpm': true, php: true, exim4: true, dovecot: true, doveadm: true, 'pure-ftpd': true, named: true, logrotate: true, openssl: true, systemctl: true };
 const unit = (name, active = true) => ({ unit: name, present: true, active, state: active ? 'active' : 'inactive', subState: active ? 'running' : 'dead', enabled: true, pid: 100, restarts: 0 });
@@ -756,6 +757,22 @@ describe('Mailserver Configuration', () => {
     expect(status.body.data.lastApply).toBeNull();
   });
 
+  it('wires Pigeonhole into the virtual-mail Dovecot fragment only while sievec is installed', async () => {
+    // A host without dovecot-sieve: no `sieve` token at all, or LMTP would refuse every delivery after the reload.
+    for (const version of ['2.3.21', '2.4.2']) {
+      const fragment = app.ctx.web.virtualMail.renderDovecot(EXIM_LAYOUT, { version });
+      expect(fragment, version).not.toMatch(/sieve/i);
+      expect(fragment, version).toContain('/etc/dovecot/whm/passwd/');
+    }
+    await provision(true, { sievec: true });
+    try {
+      expect(app.ctx.capabilities.has('sieve')).toBe(true);
+      expect(app.ctx.web.virtualMail.renderDovecot(EXIM_LAYOUT, { version: '2.3.21' })).toContain('mail_plugins = $mail_plugins sieve');
+      expect(app.ctx.web.virtualMail.renderDovecot(EXIM_LAYOUT, { version: '2.4.2' })).toContain('sieve_script keel_account {');
+    } finally { await provision(true); }
+    expect(app.ctx.web.virtualMail.renderDovecot(EXIM_LAYOUT, { version: '2.4.2' })).not.toMatch(/sieve/i);
+  });
+
   it('applyMailserverTls (SSL/TLS Configuration hook) stores the preset here and re-renders the file', async () => {
     const r = await app.ctx.web.applyMailserverTls({ minProtocol: 'TLSv1.3', protocols: ['TLSv1.3'], cipherList: 'ECDHE-ECDSA-AES128-GCM-SHA256', cipherSuites: 'TLS_AES_128_GCM_SHA256', preferServerCiphers: false }, null);
     expect(r).toMatchObject({ path: '/etc/dovecot/conf.d/97-whm-mailserver.conf', validated: true, reload: { reloaded: true, unit: 'dovecot' } });
@@ -1149,10 +1166,10 @@ describe('webmail published under the hostname site (P0-1)', () => {
     app.agent.calls.length = 0;
     const res = await post('/api/service-config/webmail/publish', {}).expect(200);
     expect(res.body.data).toMatchObject({ installed: true, flavor: 'roundcube', root: '/var/lib/roundcube/public_html', alias: '/webmail', url: 'https://panel.example.com/webmail/', path: '/etc/apache2/keel-host.d/webmail.conf', changed: true, reloaded: true, config: { path: '/etc/roundcube/config.inc.php', changed: true, validated: true, values: { imapHost: 'ssl://panel.example.com:993', smtpHost: 'tls://panel.example.com:587', productName: 'Keel' } }, warnings: [] });
-    expect(app.agent.calls.map((c) => c.name).filter((n) => /^web\.(host|webmail)/.test(n))).toEqual(['web.webmail.detect', 'web.host.ensure', 'web.host.app.write', 'web.webmail.config.write']);
+    expect(app.agent.calls.map((c) => c.name).filter((n) => /^web\.(host|webmail)/.test(n))).toEqual(['web.webmail.detect', 'web.host.ensure', 'web.host.app.write', 'web.webmail.config.write', 'web.host.app.probe']);
     // Debian's own fragment relies on Roundcube's .htaccess (AllowOverride All); the source/schema/vendor trees are denied outright as well.
     expect(app.agent.callsTo('web.host.app.write').pop().args).toEqual({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, allowOverride: 'All', denyDirs: ['config', 'temp', 'logs', 'bin', 'SQL', 'vendor', 'installer', 'tests'], reload: true });
-    expect(app.agent.callsTo('web.webmail.config.write').pop().args).toEqual({ hostname: 'panel.example.com', imapScheme: 'ssl', imapPort: 993, smtpScheme: 'tls', smtpPort: 587, productName: 'Keel' });
+    expect(app.agent.callsTo('web.webmail.config.write').pop().args).toEqual({ hostname: 'panel.example.com', imapScheme: 'ssl', imapPort: 993, smtpScheme: 'tls', smtpPort: 587, productName: 'Keel', plugins: [] });
     expect(audits('webmail.publish')).toBe(1);
     expect(audits('host_app.publish')).toBeGreaterThanOrEqual(1);
     app.agent.set('web.webmail.detect', () => PUBLISHED);
@@ -1234,5 +1251,175 @@ describe('helpers', () => {
     expect(phpVersionId('php8.3; id')).toBeNull();
     expect(phpVersionId('System')).toBeNull();
     expect(phpVersionId(null)).toBeNull();
+  });
+});
+
+describe('Exim outbound relay, IPv6 and the published-application probe (A3)', () => {
+  const { hostHasGlobalIpv6, publicEximSettings, eximIpv6Disabled } = scA3;
+  const SMARTHOST_WRITE = ({ host, port, user, requireTls }) => ({ host, port, auth: user != null, requireTls, routerFile: '/etc/exim4/conf.d/router/150_whm_smarthost', passwdFile: user != null ? '/etc/exim4/passwd.client' : null, hookable: true, validated: true, hooked: true, precedes: true, hints: [], reloaded: false, unit: null });
+  const unsplitWrite = (a) => ({ ...SMARTHOST_WRITE(a), routerFile: '/etc/exim4/whm/router_whm_smarthost.conf', hookable: false, hooked: false, precedes: null, hints: ['Add ".include_if_exists /etc/exim4/whm/router_whm_smarthost.conf" directly after "begin routers" (before the dnslookup router) in /etc/exim4/exim4.conf.template once, then run update-exim4.conf (Debian) and reload Exim; the panel never edits that file.'] });
+  let written = [];
+  beforeAll(() => {
+    app.agent.set('mail.smarthost.write', (a) => { written.push(a); return SMARTHOST_WRITE(a); });
+    app.agent.set('mail.smarthost.remove', () => ({ removed: true, routerFile: '/etc/exim4/conf.d/router/150_whm_smarthost', reloaded: false, unit: null }));
+    app.agent.set('mail.smarthost.status', () => ({ configured: written.length > 0, host: written.at(-1)?.host ?? null, port: written.at(-1)?.port ?? null, auth: written.at(-1)?.user != null, hooked: true, precedes: true, hookable: true, routerFile: '/etc/exim4/conf.d/router/150_whm_smarthost', passwdFile: '/etc/exim4/passwd.client', hints: [] }));
+  });
+  afterAll(async () => {
+    for (const name of ['mail.smarthost.write', 'mail.smarthost.remove', 'mail.smarthost.status', 'mail.outbound.probe', 'sys.info', 'web.host.app.probe']) app.agent.reset(name);
+    await put('/api/service-config/exim', { smarthost: null, ipv6: 'auto' });
+  });
+
+  it('renders disable_ipv6 when switched off or when "auto" meets a host without a global IPv6 address, and the smarthost TLS macro on Debian', () => {
+    const s = { ...DEFAULTS.exim };
+    const deb = (settings, host) => renderEximMain(settings, EXIM_LAYOUT, { spf: true, dkim: true, contentScan: false }, DEFAULTS.virtual_mail, host);
+    expect(deb(s, {})).not.toContain('disable_ipv6');
+    expect(deb(s, { ipv6Global: true })).not.toContain('disable_ipv6');
+    expect(deb(s, { ipv6Global: null })).not.toContain('disable_ipv6');
+    expect(deb(s, { ipv6Global: false })).toContain('switched off automatically: this host has no global IPv6 address');
+    expect(deb(s, { ipv6Global: false })).toMatch(/^disable_ipv6 = true$/m);
+    expect(deb({ ...s, ipv6: 'off' }, { ipv6Global: true })).toMatch(/^disable_ipv6 = true$/m);
+    expect(deb({ ...s, ipv6: 'on' }, { ipv6Global: false })).not.toContain('disable_ipv6');
+    expect(eximIpv6Disabled({ ipv6: 'auto' }, { ipv6Global: false })).toBe(true);
+    expect(eximIpv6Disabled({ ipv6: 'auto' }, {})).toBe(false);
+    const relay = { host: 'smtp.relay.example', port: 587, requireTls: true, auth: { user: 'u', passwordEnc: 'x' } };
+    const withRelay = deb({ ...s, smarthost: relay }, {});
+    expect(withRelay).toContain('.ifndef REMOTE_SMTP_SMARTHOST_HOSTS_REQUIRE_TLS\nREMOTE_SMTP_SMARTHOST_HOSTS_REQUIRE_TLS = *\n.endif');
+    expect(withRelay).toContain('Outbound relay smtp.relay.example:587');
+    expect(withRelay).not.toContain('passwordEnc');
+    expect(deb({ ...s, smarthost: { ...relay, requireTls: false } }, {})).not.toContain('REMOTE_SMTP_SMARTHOST_HOSTS_REQUIRE_TLS = *');
+    const rhel = renderEximMain({ ...s, smarthost: relay }, { flavor: 'rhel', slots: { acl_rcpt: { path: '/x' }, acl_data: { path: '/y' } } }, { spf: true, dkim: true, contentScan: false });
+    expect(rhel).not.toContain('REMOTE_SMTP_SMARTHOST');
+  });
+
+  it('tells a global IPv6 address from loopback, link-local and unique-local ones, and strips the stored secret from the public settings', () => {
+    const info = (addresses) => ({ interfaces: [{ name: 'eth0', addresses }] });
+    expect(hostHasGlobalIpv6(info([{ address: '10.0.0.5', family: 'IPv4' }, { address: 'fe80::1', family: 'IPv6' }]))).toBe(false);
+    expect(hostHasGlobalIpv6(info([{ address: 'fd00::5', family: 'IPv6' }]))).toBe(false);
+    expect(hostHasGlobalIpv6(info([{ address: '2a01:4f8::5', family: 'IPv6' }, { address: 'fe80::1', family: 'IPv6' }]))).toBe(true);
+    expect(hostHasGlobalIpv6(info([{ address: '2001:db8::1', family: 6 }]))).toBe(true);
+    expect(hostHasGlobalIpv6({})).toBeNull();
+    expect(hostHasGlobalIpv6(null)).toBeNull();
+    const pub = publicEximSettings({ ...DEFAULTS.exim, smarthost: { host: 'h.example', port: 25, requireTls: true, auth: { user: 'u', passwordEnc: 'enc' } } });
+    expect(pub.smarthost).toEqual({ host: 'h.example', port: 25, requireTls: true, auth: { user: 'u', passwordSet: true } });
+    expect(JSON.stringify(pub)).not.toContain('enc');
+    expect(publicEximSettings({ ...DEFAULTS.exim, smarthost: null }).smarthost).toBeNull();
+  });
+
+  it('PUT /exim with a relay writes the router through the agent with the decrypted password, stores it encrypted and never echoes it; a re-save without password keeps it', async () => {
+    written = [];
+    app.agent.calls.length = 0;
+    const res = await put('/api/service-config/exim', { smarthost: { host: 'smtp.relay.example', port: 587, requireTls: true, auth: { user: 'apikey', password: 'S3cret=^pw' } } }).expect(200);
+    expect(written).toEqual([{ host: 'smtp.relay.example', port: 587, user: 'apikey', password: 'S3cret=^pw', requireTls: true, reload: false }]);
+    expect(res.body.data.settings.smarthost).toEqual({ host: 'smtp.relay.example', port: 587, requireTls: true, auth: { user: 'apikey', passwordSet: true } });
+    expect(JSON.stringify(res.body)).not.toContain('S3cret');
+    expect(res.body.data.smarthost).toMatchObject({ hooked: true, precedes: true, applied: true, routerFile: '/etc/exim4/conf.d/router/150_whm_smarthost' });
+    expect(res.body.data.live).toBe(false);
+    const order = app.agent.calls.map((c) => c.name).filter((n) => /^(mail\.smarthost|web\.exim\.include)/.test(n));
+    expect(order).toEqual(['mail.smarthost.write', 'web.exim.include.write', 'web.exim.include.write', 'web.exim.include.write']);
+    expect(app.agent.callsTo('web.exim.include.write').pop().args.content).toContain('REMOTE_SMTP_SMARTHOST_HOSTS_REQUIRE_TLS = *');
+    const stored = app.ctx.settings.get('service_config.exim').smarthost;
+    expect(stored.auth.passwordEnc).toBeTruthy();
+    expect(stored.auth.passwordEnc).not.toContain('S3cret');
+    expect(app.ctx.crypto.decrypt(stored.auth.passwordEnc)).toBe('S3cret=^pw');
+    expect(JSON.stringify(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'exim.config.update' ORDER BY id DESC LIMIT 1").get())).not.toContain('S3cret');
+    // The form echoes { user, passwordSet } back without a password: the stored secret is kept for the same login.
+    const again = await put('/api/service-config/exim', { smarthost: { host: 'smtp.relay.example', port: 2525, requireTls: false, auth: { user: 'apikey', passwordSet: true } } }).expect(200);
+    expect(written.at(-1)).toMatchObject({ port: 2525, requireTls: false, user: 'apikey', password: 'S3cret=^pw' });
+    expect(again.body.data.settings.smarthost.auth).toEqual({ user: 'apikey', passwordSet: true });
+    // A different login without a password has nothing to reuse.
+    const other = await put('/api/service-config/exim', { smarthost: { host: 'smtp.relay.example', auth: { user: 'someone-else' } } });
+    expect(other.status).toBe(422);
+    expect(other.body.error.fields).toHaveProperty('smarthost.auth.password');
+    const status = (await get('/api/service-config/exim').expect(200)).body.data;
+    expect(status.settings.smarthost).toEqual({ host: 'smtp.relay.example', port: 2525, requireTls: false, auth: { user: 'apikey', passwordSet: true } });
+    expect(status.smarthost).toMatchObject({ configured: true, host: 'smtp.relay.example', port: 2525, auth: true, hooked: true, precedes: true, setting: { host: 'smtp.relay.example' } });
+    expect(status.ipv6).toEqual({ setting: 'auto', hostGlobal: false, disabled: true });
+    expect(JSON.stringify(status)).not.toContain('S3cret');
+  });
+
+  it('an unsplit layout reports the manual include line and a written-but-not-loaded router as not applied; smarthost: null removes it', async () => {
+    app.agent.set('mail.smarthost.write', unsplitWrite);
+    const res = await put('/api/service-config/exim', { smarthost: { host: 'relay.example.net', port: 587, auth: null } }).expect(200);
+    expect(res.body.data.smarthost).toMatchObject({ hooked: false, applied: false, hookable: false });
+    expect(res.body.data.hints.some((h) => /router_whm_smarthost\.conf" directly after "begin routers"/.test(h))).toBe(true);
+    expect(res.body.data.lastApply.ok).toBe(false);
+    expect(res.body.data.lastApply.error).toMatch(/relay router .* not loaded by Exim/);
+    app.agent.set('mail.smarthost.write', (a) => { written.push(a); return SMARTHOST_WRITE(a); });
+    app.agent.calls.length = 0;
+    const off = await put('/api/service-config/exim', { smarthost: null }).expect(200);
+    expect(off.body.data.settings.smarthost).toBeNull();
+    expect(app.agent.callsTo('mail.smarthost.remove')).toHaveLength(1);
+    expect(app.agent.callsTo('mail.smarthost.write')).toHaveLength(0);
+    expect(app.ctx.settings.get('service_config.exim').smarthost).toBeNull();
+    // Saving again without a relay neither writes nor removes anything.
+    app.agent.calls.length = 0;
+    await put('/api/service-config/exim', { ipv6: 'off' }).expect(200);
+    expect(app.agent.callsTo('mail.smarthost.remove')).toHaveLength(0);
+    expect(app.agent.callsTo('web.exim.include.write').pop().args.content).toMatch(/^disable_ipv6 = true$/m);
+  });
+
+  it('validates the relay schema: hostname only, ports 1-65535, login without ":", no stray keys', async () => {
+    for (const smarthost of [{ host: 'not a host' }, { host: 'smtp.relay.example; x' }, { host: 'smtp.relay.example', port: 0 }, { host: 'smtp.relay.example', port: 70000 }, { host: 'smtp.relay.example', auth: { user: 'a:b', password: 'x' } }, { host: 'smtp.relay.example', auth: { user: 'a', password: 'line\nbreak' } }, { host: 'smtp.relay.example', auth: { user: 'a', password: 'p:w' } }, { host: 'smtp.relay.example', auth: { user: '' , password: 'x' } }, { host: 'smtp.relay.example', extra: 1 }, 'smtp.relay.example']) {
+      const res = await put('/api/service-config/exim', { smarthost });
+      expect(res.status, JSON.stringify(smarthost)).toBe(422);
+    }
+    expect((await put('/api/service-config/exim', { ipv6: 'maybe' })).status).toBe(422);
+    expect(app.agent.callsTo('mail.smarthost.write').filter((c) => c.args.host === 'not a host')).toHaveLength(0);
+  });
+
+  it('outboundProbe (Security Advisor) tries the well-known MX list on 25, remembers the answer and reports the relay when one is set', async () => {
+    const probed = [];
+    app.agent.set('mail.outbound.probe', ({ host, port }) => { probed.push(`${host}:${port}`); return { host, port, ok: false, error: 'timeout', ms: 5000 }; });
+    const r = await app.ctx.web.exim.outboundProbe({ fresh: true });
+    expect(r).toMatchObject({ installed: true, smarthost: null, port25: { ok: false, error: 'timeout' } });
+    expect(probed).toEqual(['gmail-smtp-in.l.google.com:25', 'alt1.gmail-smtp-in.l.google.com:25']);
+    probed.length = 0;
+    expect((await app.ctx.web.exim.outboundProbe()).port25.ok).toBe(false);
+    expect(probed).toEqual([]);
+    app.agent.set('mail.outbound.probe', ({ host, port }) => { probed.push(host); return { host, port, ok: true, error: null, ms: 12 }; });
+    expect((await app.ctx.web.exim.outboundProbe({ fresh: true })).port25).toMatchObject({ ok: true, host: 'gmail-smtp-in.l.google.com' });
+    expect(probed).toEqual(['gmail-smtp-in.l.google.com']);
+    await put('/api/service-config/exim', { smarthost: { host: 'smtp.relay.example' } }).expect(200);
+    expect((await app.ctx.web.exim.outboundProbe()).smarthost).toEqual({ host: 'smtp.relay.example', port: 587 });
+    const scan = typeof app.ctx.security?.advisor?.scan === 'function' ? await app.ctx.security.advisor.scan('manual', null).catch(() => null) : null;
+    if (scan) expect(scan.findings.find((f) => f.id === 'mail.outbound.port25')).toMatchObject({ grade: 'ok', title: 'Outbound mail is relayed through smtp.relay.example:587' });
+  });
+
+  it('GET /webmail and the publish answer carry the loopback probe of the published URL and a plain warning for a 500', async () => {
+    app.agent.set('web.webmail.detect', () => ({ installed: true, flavor: 'roundcube', path: '/var/lib/roundcube', root: '/var/lib/roundcube/public_html', version: '1.6.11', configured: true, apacheAlias: '/webmail', published: { alias: '/webmail', file: '/etc/apache2/keel-host.d/webmail.conf', managed: true, source: 'keel-host' }, globalAlias: null, config: { path: '/etc/roundcube/config.inc.php', exists: true, ok: true, managed: null } }));
+    app.agent.set('web.host.app.probe', ({ alias }) => ({ alias, url: `https://panel.example.com${alias}/`, hostname: 'panel.example.com', port: 443, tls: true, status: 500, ok: false, location: null, error: null, phpFatal: 'PHP Fatal error:  Cannot redeclare array_first() in /var/lib/roundcube/program/lib/Roundcube/bootstrap.php on line 70' }));
+    try {
+      const status = (await get('/api/service-config/webmail').expect(200)).body.data;
+      expect(app.agent.callsTo('web.host.app.probe').pop().args).toEqual({ alias: '/webmail' });
+      expect(status.http).toMatchObject({ status: 500, ok: false, phpFatal: expect.stringContaining('array_first') });
+      expect(status.warning).toBe('Published but answering 500: PHP Fatal error:  Cannot redeclare array_first() in /var/lib/roundcube/program/lib/Roundcube/bootstrap.php on line 70');
+      app.agent.set('web.webmail.config.write', () => ({ path: '/etc/roundcube/config.inc.php', changed: false, validated: true, values: {} }));
+      const pub = (await post('/api/service-config/webmail/publish', {}).expect(200)).body.data;
+      expect(pub.http).toMatchObject({ status: 500, ok: false });
+      expect(pub.warning).toMatch(/^Published but answering 500: PHP Fatal error/);
+      expect(pub.url).toBe('https://panel.example.com/webmail/');
+      const last = (await get('/api/service-config/webmail').expect(200)).body.data.lastApply;
+      expect(last.ok).toBe(false);
+      expect(last.error).toMatch(/^Published but answering 500/);
+      app.agent.set('web.host.app.probe', ({ alias }) => ({ alias, url: `https://panel.example.com${alias}/`, status: 200, ok: true, location: null, error: null, phpFatal: null }));
+      const fine = (await get('/api/service-config/webmail').expect(200)).body.data;
+      expect(fine.http).toMatchObject({ status: 200, ok: true });
+      expect(fine.warning).toBeNull();
+      app.agent.set('web.host.app.probe', ({ alias }) => ({ alias, status: 404, ok: false, location: null, error: null, phpFatal: null }));
+      expect((await get('/api/service-config/webmail').expect(200)).body.data.warning).toBe('Published but answering 404: the alias is not served (hostname site missing or not reloaded?)');
+      app.agent.fail('web.host.app.probe', 'not_found', 'keel-host.conf is not a panel-managed hostname site');
+      const unprobed = (await get('/api/service-config/webmail').expect(200)).body.data;
+      expect(unprobed.http).toMatchObject({ status: null, ok: null, error: expect.stringContaining('not a panel-managed') });
+      expect(unprobed.warning).toBeNull();
+      // phpMyAdmin shares the probe (database-services phpmyadmin.status).
+      if (app.ctx.databases?.phpmyadmin?.status) {
+        app.agent.set('db.phpmyadmin.detect', () => ({ installed: true, version: '5.2.3', dir: '/usr/share/phpmyadmin', php: true, dbConfigured: true, published: { alias: '/phpmyadmin', file: '/etc/apache2/keel-host.d/phpmyadmin.conf', managed: true, source: 'keel-host' }, globalAlias: null }));
+        app.agent.set('web.host.app.probe', ({ alias }) => ({ alias, status: 500, ok: false, location: null, error: null, phpFatal: null }));
+        const pma = await app.ctx.databases.phpmyadmin.status({ id: 1, username: 'root', role: 'root' });
+        expect(pma.http).toMatchObject({ status: 500, ok: false });
+        expect(pma.warning).toBe('Published but answering 500: the server log has no PHP fatal error; check the hostname site\'s error log');
+        app.agent.reset('db.phpmyadmin.detect');
+      }
+    } finally { for (const name of ['web.webmail.detect', 'web.webmail.config.write', 'web.host.app.probe']) app.agent.reset(name); }
   });
 });

@@ -71,11 +71,12 @@ ftp     IN  CNAME %domain%.
 
 export const DEFAULT_FEATURES = {
   addondomains: true, subdomains: true, parkeddomains: true, filemanager: true, ftpaccts: true,
-  emailaccts: true, forwarders: true, autoresponders: true, defaultaddress: true, spamassassin: true,
+  emailaccts: true, forwarders: true, autoresponders: true, defaultaddress: true, spamassassin: true, emailfilters: true,
   mysql: true, phpmyadmin: true, postgres: false, cron: true, ssh: false, backup: true, bandwidth: true,
   statselect: true, awstats: true, webalizer: false, errlog: true, rawlog: true, sslmanager: true,
   autossl: true, phpversion: true, multiphp: true, webdisk: true, api: true, passwordchange: true,
   hotlink: true, leechprotect: true, indexmanager: true, errpgs: true, redirects: true, cpanelpro_support: false,
+  ipblocker: true, dirprivacy: true, webstats: true, wordpress: true,
 };
 
 export async function seed({ db, config, crypto, logger }) {

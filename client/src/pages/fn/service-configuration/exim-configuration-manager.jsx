@@ -3,7 +3,7 @@ import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, StatusPill, KeyValue } from '../../../components/Common.jsx';
-import { Field, NumberInput, Toggle, Button } from '../../../components/Form.jsx';
+import { Field, NumberInput, TextInput, Select, Toggle, Button } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useSettingsForm, SaveBar, RequestError, DaemonNotice, LastApply, UnitPill, Tabs, ListEditor, Hints, ToggleList, isCapabilityError } from '../../service-config/Shared.jsx';
@@ -81,6 +81,58 @@ export function VirtualMailCard() {
   );
 }
 
+export const IPV6_OPTIONS = [
+  { value: 'auto', label: 'Automatic — off when this host has no global IPv6 address' },
+  { value: 'on', label: 'On — Exim may try AAAA mail exchangers' },
+  { value: 'off', label: 'Off — disable_ipv6 = true' },
+];
+
+// What the relay card says about the router on the host (GET /service-config/exim → smarthost).
+export function relayState(sh) {
+  if (!sh) return null;
+  if (sh.error) return { status: 'unknown', label: 'Unknown', detail: sh.error };
+  if (!sh.setting && !sh.configured) return { status: 'muted', label: 'Direct delivery', detail: 'Mail leaves this server straight to the recipients\' mail exchangers on port 25.' };
+  if (sh.setting && !sh.configured) return { status: 'pending', label: 'Saved, not written', detail: 'The relay is saved; the router is written on the next save with Exim installed.' };
+  if (sh.hooked === false) return { status: 'warning', label: 'Written, not loaded', detail: sh.hookable ? 'Exim\'s generated configuration does not contain the relay router yet; run update-exim4.conf and reload Exim.' : 'Exim does not load the relay router: add the include line below once.' };
+  if (sh.precedes === false) return { status: 'warning', label: 'Loaded after dnslookup', detail: 'The relay router sits behind the dnslookup router, so mail still leaves directly; move the include line directly after "begin routers".' };
+  if (!sh.setting && sh.configured) return { status: 'warning', label: 'Router left behind', detail: `${sh.routerFile} is still on the host without a relay setting; save once to remove it.` };
+  return { status: 'active', label: `Relaying through ${sh.host || sh.setting.host}:${sh.port || sh.setting.port}`, detail: null };
+}
+
+// The draft the form keeps for `smarthost`: enabled toggles between null and
+// the object; the password field is sent only when typed.
+export function OutboundRelayCard({ data, draft, set }) {
+  const sh = draft.smarthost;
+  const state = relayState(data.smarthost);
+  const update = (patch) => set('smarthost')({ host: '', port: 587, requireTls: true, auth: null, ...(sh || {}), ...patch });
+  const setAuth = (patch) => update({ auth: { user: '', ...(sh?.auth || {}), ...patch } });
+  const passwordSet = Boolean(data.settings?.smarthost?.auth?.passwordSet) && data.settings.smarthost.auth.user === sh?.auth?.user;
+  return (
+    <Card title="Outbound relay" subtitle="Send every message for other domains through one SMTP relay (smarthost) instead of connecting to the recipients' mail exchangers directly. Needed where the provider blocks outbound port 25 (EC2 and most clouds)." actions={state && <StatusPill status={state.status}>{state.label}</StatusPill>}>
+      {state?.detail && <p className="muted">{state.detail}</p>}
+      {data.smarthost?.hints?.map((h) => <div key={h} className="banner banner-info"><AlertTriangle size={18} /><div>{h}</div></div>)}
+      <Field inline><Toggle checked={Boolean(sh)} onChange={(v) => set('smarthost')(v ? { host: '', port: 587, requireTls: true, auth: null } : null)} label="Relay outbound mail through a smarthost" description="Local domains are still delivered here; backup-MX relay domains still go direct." /></Field>
+      {sh && (
+        <>
+          <div className="form-grid">
+            <Field label="Relay host" help="Hostname of the SMTP relay (as the provider gives it; the TLS certificate must match it)"><TextInput value={sh.host} onChange={(v) => update({ host: v.trim().toLowerCase() })} placeholder="smtp.relay.example" maxLength={253} /></Field>
+            <Field label="Port" help="587 (STARTTLS) for nearly every relay; 25 only when the relay is inside the provider's network"><NumberInput value={sh.port} onChange={(v) => update({ port: v })} min={1} max={65535} nullable={false} /></Field>
+          </div>
+          <Field inline><Toggle checked={sh.requireTls !== false} onChange={(v) => update({ requireTls: v })} label="Require TLS to the relay" description="Delivery is deferred rather than sent in clear when the relay offers no STARTTLS; the relay login is only sent over TLS either way" /></Field>
+          <Field inline><Toggle checked={Boolean(sh.auth)} onChange={(v) => update({ auth: v ? { user: '' } : null })} label="Authenticate to the relay" description="SMTP AUTH (PLAIN/LOGIN) with the credentials below; stored encrypted" /></Field>
+          {sh.auth && (
+            <div className="form-grid">
+              <Field label="Login"><TextInput value={sh.auth.user || ''} onChange={(v) => setAuth({ user: v })} maxLength={254} autoComplete="off" /></Field>
+              <Field label="Password" help={passwordSet && !sh.auth.password ? 'A password is stored; leave empty to keep it' : 'Sent once on save and never shown again; may not contain ":"'}><TextInput type="password" value={sh.auth.password || ''} onChange={(v) => setAuth(v ? { password: v } : { password: undefined })} maxLength={256} autoComplete="new-password" placeholder={passwordSet ? '••••••••' : ''} /></Field>
+            </div>
+          )}
+        </>
+      )}
+      {data.smarthost?.configured && <KeyValue items={[['Router', <code key="r">{data.smarthost.routerFile}</code>], ['Loaded by Exim', yesNo(data.smarthost.hooked)], data.smarthost.hooked && ['Before dnslookup', yesNo(data.smarthost.precedes)], data.smarthost.auth && ['Credential', <code key="p">{data.smarthost.passwdFile}</code>]]} />}
+    </Card>
+  );
+}
+
 export default function EximConfigurationManager({ fn }) {
   const [tab, setTab] = useState('filters');
   const form = useSettingsForm('/service-config/exim');
@@ -121,7 +173,17 @@ export default function EximConfigurationManager({ fn }) {
       )}
       {data && draft && (
         <>
-          <Tabs value={tab} onChange={setTab} tabs={[{ value: 'filters', label: 'RBLs and verification' }, { value: 'limits', label: 'Limits and rate limiting' }, { value: 'attack', label: 'Dictionary attack protection' }, { value: 'auth', label: 'Auth, size and logging' }, { value: 'preview', label: 'Generated config' }]} />
+          <Tabs value={tab} onChange={setTab} tabs={[{ value: 'filters', label: 'RBLs and verification' }, { value: 'limits', label: 'Limits and rate limiting' }, { value: 'attack', label: 'Dictionary attack protection' }, { value: 'auth', label: 'Auth, size and logging' }, { value: 'outbound', label: 'Outbound and IPv6' }, { value: 'preview', label: 'Generated config' }]} />
+          {tab === 'outbound' && (
+            <>
+              <OutboundRelayCard data={data} draft={draft} set={set} />
+              <Card title="IPv6" className="config-fields" subtitle="Without a global IPv6 route Exim still tries the AAAA addresses of a mail exchanger first and logs a failure for every message.">
+                <Field label="IPv6 for outgoing mail" help={data.ipv6 ? `This host ${data.ipv6.hostGlobal === true ? 'has' : data.ipv6.hostGlobal === false ? 'has no' : 'may or may not have'} global IPv6 address; disable_ipv6 is ${data.ipv6.disabled ? 'rendered' : 'not rendered'} with the saved setting.` : null}>
+                  <Select value={draft.ipv6 || 'auto'} onChange={set('ipv6')} options={IPV6_OPTIONS} />
+                </Field>
+              </Card>
+            </>
+          )}
           {(tab === 'filters' || tab === 'attack') && data.installed && !rcptLive && (
             <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Rejection rules are not in force.</strong> They live in the RCPT ACL chain, which Exim does not include on this host{slot('acl_rcpt')?.hookable && !slot('acl_rcpt')?.claimedBy ? ' until the next save hooks it in' : slot('acl_rcpt')?.claimedBy ? ' because another definition of its hook macro came first (save the Email filters page once, or see the step above)' : ' (see the manual step above)'}. Saving writes the chain but reports the apply as not ok until Exim includes it; until then the RBL, reverse-DNS, HELO, sender-verification and dictionary-attack settings only tag messages.</div></div>
           )}

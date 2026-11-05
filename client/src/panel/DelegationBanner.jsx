@@ -1,16 +1,19 @@
 import { AlertTriangle } from 'lucide-react';
+import { useT, translate } from '../i18n/useT.js';
 
 // Public DNS for a hostname lives elsewhere (delegation.delegatedHere === false
 // from /panel/dns/zones, /panel/domains or /panel/email/deliverability): what the
 // panel writes into the local zone is not published, so the customer is told
 // where the records must go, with the exact records to copy when the page knows them.
 
-export const managedAt = (delegation) => (delegation?.delegatedNs?.length ? delegation.delegatedNs.join(', ') : 'another DNS provider');
+const fill = (text, params) => String(text).replace(/\{(\w+)\}/g, (m, k) => (params[k] == null ? m : String(params[k])));
+
+export const managedAt = (delegation) => (delegation?.delegatedNs?.length ? delegation.delegatedNs.join(', ') : translate('panel.email.delegation.another_provider', 'another DNS provider'));
 
 export const notDelegatedHere = (delegation) => Boolean(delegation) && delegation.delegatedHere === false;
 
 export function delegationText(domain, delegation) {
-  return `DNS for ${domain} is managed at ${managedAt(delegation)}; records you add here are not published — add them there as well`;
+  return fill(translate('panel.email.delegation.text', 'DNS for {domain} is managed at {at}; records you add here are not published — add them there as well'), { domain, at: managedAt(delegation) });
 }
 
 export function RecordList({ records }) {
@@ -24,14 +27,15 @@ export function RecordList({ records }) {
 }
 
 export function DelegationBanner({ domain, delegation, records, title, children }) {
+  const { t } = useT();
   if (!notDelegatedHere(delegation)) return null;
   return (
     <div className="banner banner-warning" role="status" data-delegation={domain}>
       <AlertTriangle size={18} />
       <div>
-        <strong>{title || 'DNS is managed elsewhere'}</strong>
+        <strong>{title || t('panel.email.delegation.title', 'DNS is managed elsewhere')}</strong>
         <p>{delegationText(domain, delegation)}</p>
-        {records?.length > 0 && <p className="muted">Records to add there:</p>}
+        {records?.length > 0 && <p className="muted">{t('panel.email.delegation.records_to_add', 'Records to add there:')}</p>}
         <RecordList records={records} />
         {children}
       </div>

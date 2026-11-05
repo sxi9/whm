@@ -441,10 +441,34 @@ panel's own data lives in SQLite, so these pages work even when MySQL is down.
 - **Security Advisor:** `phpmyadmin.global_alias` warns while the distribution's global include is enabled (the
   console answers on every customer domain with that domain's certificate), is `ok` once only the hostname site
   serves it, `info` when installed but unpublished.
+- **Single sign-on from the account panel** (*Panel › Customization › Account panel › phpMyAdmin*, or `GET|PUT
+  /phpmyadmin/sso { enabled }`, root; setting `panel.phpmyadmin.sso`): needs a MySQL/MariaDB profile and phpMyAdmin
+  published here first (409 otherwise). Switching on publishes the Keel signon script from the deployed tree
+  (`/opt/whm/deploy/phpmyadmin/pma-signon.php`) as `https://<hostname>/keel/` under the hostname site and writes
+  `/etc/phpmyadmin/conf.d/keel-signon.php` (agent `db.phpmyadmin.signon.write`, `php -l` checked): server **1** becomes
+  a *signon* server (`SignonSession = KeelPmaSignon`, `SignonURL = /keel/pma-signon.php`, `LogoutURL = /phpmyadmin/`)
+  and server **2** is a copy with the plain cookie login, so customers can still sign in with a database user
+  (`/phpmyadmin/index.php?server=2`, linked from the signon page). Each account gets a hidden MySQL user
+  `<account>_pma@localhost`, dropped and created again for every sign-on with a fresh password and one `GRANT ALL`
+  per database the account owns at that moment (never a `<account>\_%` pattern: account names may contain `_`, so
+  `bob\_%` would also cover every database of an account `bob_shop`; a database created later is covered by the next
+  sign-on). The password travels only inside the encrypted one-minute token (contract §44). The user is hidden from
+  *Manage Database Users* unless *Show system users* is on (`hidden: true`), cannot be dropped, re-passworded or
+  re-granted there (`400`), is left out of backups (and so of their grant replay) and is dropped with the account. On a
+  MySQL profile an account name longer than 28 characters cannot have a sign-on user (MySQL caps user names at 32; the
+  panel answers `409 sso_unavailable`); MariaDB allows 80. Off removes the drop-in and the script;
+  *Unpublish* removes them too and keeps the switch. Audit `phpmyadmin.sso.set`, `db.phpmyadmin.signon`,
+  `panel.db.phpmyadmin.sso`, `panel.sso.exchange`. The script talks to the panel's own listener on `127.0.0.1`
+  (HTTPS port with TLS, the plain port without) without peer verification (loopback only); the drop-in carries that
+  address as the `KEEL_SSO_ENDPOINT` constant, so a changed panel port is picked up by switching single sign-on off and
+  on (or publishing phpMyAdmin again). A MySQL 8 server limits user names to 32 characters, so accounts named longer than 28 characters cannot
+  sign on there (MariaDB allows 80).
 - **Gotchas:** a protocol-relative `//host/...` value is refused so resellers cannot be sent to a foreign origin;
   the drop-in uses the distribution's PHP-FPM www pool (Debian's `apache.conf` only sets `open_basedir`/`upload_tmp_dir`
   for mod_php, so neither applies under FPM — phpMyAdmin's `TempDir` stays `/var/lib/phpmyadmin/tmp`); phpMyAdmin 5
-  ignores `?pma_username=` (POST only), so there is no prefilled login.
+  ignores `?pma_username=` (POST only), so there is no prefilled login without single sign-on; with the wildcard grant
+  the signon user may create `<account>_*` databases inside phpMyAdmin — they appear in the panel's list as "on the
+  server" but count against no quota until adopted with the Database Map Tool.
 
 #### 20.10 Repair Databases
 
@@ -861,7 +885,17 @@ Sidebar category 25. API prefix `/api/cpanel`; the branding read endpoints are a
 - **Account panel tab (root):** the account-panel settings (MANUAL-partC appendix C.2), the *Webmail* card —
   status of the distribution's Roundcube and *Publish webmail* / *Unpublish*, which publish it as
   `https://<hostname>/webmail/` under the server hostname site and write the Keel block in its
-  `config.inc.php` (MANUAL-partC §6.7; `GET/POST/DELETE /api/service-config/webmail…`) — and the
+  `config.inc.php` (MANUAL-partC §6.7; `GET/POST/DELETE /api/service-config/webmail…`) with its
+  *Single sign-on* rows (`GET/PUT /api/panel/admin/webmail/sso { enabled?, loginAs? }`, status also in
+  `GET /api/service-config/webmail` → `sso`): on, the panel writes the Dovecot master user `keel-master`
+  (`/etc/dovecot/whm/master-users`, password generated once, stored encrypted as `panel.webmail.master_enc`),
+  re-renders `98-whm-virtual-auth.conf` with a `master = yes` passdb (needs the virtual-mail wiring; reloads
+  Dovecot), copies the Keel `keel_sso` plugin from `/opt/whm/deploy/roundcube` into Roundcube's `plugins/`
+  and lists it in the Keel block together with `keel_sso_endpoint` (the panel's own loopback listener; the
+  plugin signs the mailbox in as itself with the master user as SASL authentication identity, so it is the
+  same Roundcube user as a password login); off removes the master file, the plugin line and the endpoint. *Allow while logged in
+  as an account* (`panel.login_as_webmail`) lets an administrator acting as the account open mailboxes
+  (audited with the administrator's name); off by default. Audit `webmail.sso.set` — and the
   *Log in as* history. With the panel on, the login page also offers *Forgot password?* to account users
   (MANUAL-partC C.2; mail to the account's contact address) and *List Accounts* gains *Reset 2FA*
   (Part A §13.1).

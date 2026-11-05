@@ -847,6 +847,18 @@ export function createEmailService(ctx) {
     return { domain, accountId, routing: row.routing, created, claimed: !created };
   }
 
+  // The public MX of a domain and whether it lands on this server; the
+  // account panel's routing page reads it (no port-25 probe, no audit).
+  async function mxStatus(domain) {
+    const mx = await lookupSafe(() => getResolver().resolveMx(domain));
+    const records = mx.ok ? [...mx.value].sort((a, b) => a.priority - b.priority).map((m) => ({ exchange: m.exchange, priority: m.priority })) : [];
+    if (!mx.ok) return { ok: false, error: mx.error, records, exchanges: [], pointsHere: null };
+    if (!records.length) return { ok: true, error: null, records, exchanges: [], pointsHere: null };
+    const addrs = await serverAddresses();
+    const mxIps = (await Promise.all(records.slice(0, 3).map((m) => lookupSafe(() => getResolver().resolve4(m.exchange))))).flatMap((r) => r.value || []);
+    return { ok: true, error: null, records, exchanges: records.map((m) => m.exchange), pointsHere: mxIps.length ? mxIps.some((ip) => addrs.includes(ip)) : null };
+  }
+
   async function setRouting(domain, routing, req) {
     const account = stmts.visibleDomains.all().find((d) => d.domain === domain);
     stmts.upsertMailDomain.run({ domain, account_id: account ? stmts.accountByUsername.get(account.account)?.id ?? null : null, routing });
@@ -876,7 +888,7 @@ export function createEmailService(ctx) {
 
   return {
     detect, status, queue, reports, stats, troubleshoot, useBannerProber, deliverability, filters, greylist, mailbox, spamd,
-    sendNotification, installDkimKey, removeDkimKey, setRouting, ensureMailDomain, setOutboundAddresses, routingLists,
+    sendNotification, installDkimKey, removeDkimKey, setRouting, ensureMailDomain, setOutboundAddresses, routingLists, mxStatus,
     renderAcl: () => renderAcl({ dir: 'etc/exim4/whm', ...filterSummary() }),
   };
 }

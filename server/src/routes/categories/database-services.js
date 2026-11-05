@@ -107,6 +107,11 @@ export async function register(ctx) {
   r.post('/phpmyadmin/publish', requireRoot, validate({ body: z.object({ disableGlobal: z.boolean().optional() }).strict() }),
     wrap((req) => dbs().phpmyadmin.publish(req.user, req, { disableGlobal: req.body.disableGlobal ?? true })));
   r.delete('/phpmyadmin/publish', requireRoot, wrap((req) => dbs().phpmyadmin.unpublish(req.user, req)));
+  // Single sign-on from the account panel (contract §44): the switch publishes
+  // the Keel signon script as /keel and writes the conf.d drop-in.
+  r.get('/phpmyadmin/sso', requireRoot, wrap((req) => dbs().phpmyadmin.sso.status(req.user)));
+  r.put('/phpmyadmin/sso', requireRoot, validate({ body: z.object({ enabled: z.boolean() }).strict() }),
+    wrap((req) => dbs().phpmyadmin.sso.set(req.body, req.user, req)));
 
   return { path: '/databases', router: r };
 }

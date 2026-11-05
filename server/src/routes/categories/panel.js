@@ -6,7 +6,12 @@ import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRole, requireRoot, requireReseller, requireScope } from '../../middleware/rbac.js';
 import { HttpError } from '../../lib/errors.js';
 import { createPanelService, LOGIN_AS_TTL } from '../../services/panel.js';
+import { createPanelSsoService, SSO_KINDS, SSO_TOKEN_RE } from '../../services/panel-sso.js';
 import { PANEL_SCOPES, confinePanelTokens, wrap, created } from '../panel/index.js';
+import { LOCALE_CODE_RE } from '../../services/locales-xml.js';
+
+const ssoParams = z.object({ kind: z.enum(SSO_KINDS), token: z.string().regex(SSO_TOKEN_RE) });
+const webmailSsoBody = z.object({ enabled: z.boolean().optional(), loginAs: z.boolean().optional() }).strict().refine((b) => Object.keys(b).length > 0, 'Nothing to update');
 
 const panelDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'panel');
 
@@ -27,6 +32,14 @@ const settingsBody = z.object({
 const adminUserBody = z.object({ password: fields.password.optional() }).strict();
 const adminPasswordBody = z.object({ password: fields.password }).strict();
 const domainParam = z.object({ domain: fields.domain });
+const contactBody = z.object({
+  email: fields.email,
+  email2: z.union([z.literal(''), fields.email]).nullable().optional().transform((v) => (v ? v : null)),
+  notify: z.object({ quota: z.boolean().optional(), bandwidth: z.boolean().optional(), passwordChange: z.boolean().optional() }).strict().prefault({}),
+  // Required by the service unless an administrator is acting as the account.
+  currentPassword: z.string().min(1).max(256).optional(),
+}).strict();
+const localeBody = z.object({ locale: z.union([z.literal(''), z.string().regex(LOCALE_CODE_RE, 'A locale code such as "es" or "pt_br"')]).nullable() }).strict();
 
 // Runs scope() once per request and applies the §2.3–§2.5 gates. Only the
 // paths listed stay reachable while a gate is closed.
@@ -42,8 +55,8 @@ export function panelScope(ctx) {
     if (account.force_password_change && mode === 'user' && !FORCE_PASSWORD_PATHS.has(req.path)) {
       return next(new HttpError(403, 'password_change_required', 'You must change your password before continuing'));
     }
-    if (mode === 'user' && ctx.settings.get('panel.require_2fa_for_users') && !req.user.totp_enabled && req.path !== '/me' && !req.path.startsWith('/security/two-factor')) {
-      return next(new HttpError(403, 'two_factor_required', 'Two-factor authentication is required for your account. Set it up to continue.'));
+    if (mode === 'user') {
+      try { ctx.panel.assertTwoFactor(req.user, req.path); } catch (err) { return next(err); }
     }
     next();
   };
@@ -73,6 +86,7 @@ async function loadSubRouters(ctx) {
 
 export async function register(ctx) {
   ctx.panel = createPanelService(ctx);
+  ctx.panelSso = createPanelSsoService(ctx);
   const s = ctx.panel;
   s.subscribe();
   const backfilled = s.backfill();
@@ -100,15 +114,27 @@ export async function register(ctx) {
   admin.post('/accounts/:username/password', validate({ params: nameParam, body: adminPasswordBody }), wrap((req) => s.adminSetPassword(req.params.username, req.body.password, req.user, req)));
   admin.post('/accounts/:username/2fa/reset', validate({ params: nameParam }), wrap((req) => s.adminReset2fa(req.params.username, req.user, req)));
   admin.post('/domains/:domain/release-mail', requireRoot, validate({ params: domainParam }), wrap((req) => s.releaseMailDomain(req.params.domain, req)));
+  admin.get('/webmail/sso', requireRoot, wrap(() => ctx.web.webmail.sso.status()));
+  admin.put('/webmail/sso', requireRoot, validate({ body: webmailSsoBody }), wrap((req) => ctx.web.webmail.sso.set(req.body, req)));
   r.use('/admin', admin);
+
+  // --- Loopback sign-on exchange (§44; no session: the caller is the published
+  // app's signon code on this host, holding a token the panel just minted) ----
+  const sso = Router();
+  sso.get('/:kind/:token', validate({ params: ssoParams }), wrap((req) => ctx.panelSso.exchange(req.params.kind, req.params.token, req)));
 
   // --- Scoped (one account per session) ---------------------------------------------------
   r.use(panelScope(ctx));
   r.get('/me', wrap((req) => s.me(req)));
+  // Preferences (P1-8): the contact address is also the forgot-password
+  // address, so it changes from a browser session only, never through a
+  // token, and only with the current password (checked in the service).
+  const sessionOnly = (req, _res, next) => (req.auth?.via === 'token' ? next(new HttpError(403, 'session_required', 'API tokens can only be managed from a browser session')) : next());
+  r.put('/me/contact', sessionOnly, validate({ body: contactBody }), wrap((req) => s.preferences.setContact(req.panel, req.body, req)));
+  r.put('/me/locale', validate({ body: localeBody }), wrap((req) => s.preferences.setLocale(req.panel, req.body, req)));
   r.get('/overview/quick-links', wrap((req) => s.quickLinks(req)));
   // /tokens* is the browser's credential manager (§2.4, §4.13): a token may
   // read the list with panel:read but never mint or revoke tokens.
-  const sessionOnly = (req, _res, next) => (req.auth?.via === 'token' ? next(new HttpError(403, 'session_required', 'API tokens can only be managed from a browser session')) : next());
   r.get('/tokens', requireScope('panel:read'), wrap((req) => s.tokens.list(req.panel)));
   r.post('/tokens', sessionOnly, validate({ body: tokenBody }), created((req) => s.tokens.create(req.panel, req.body, req)));
   r.get('/tokens/:id', requireScope('panel:read'), validate({ params: idParam }), wrap((req) => s.tokens.get(req.panel, req.params.id)));
@@ -119,5 +145,5 @@ export async function register(ctx) {
     ctx.logger.debug({ file: mount.file, path: `/panel${mount.path}` }, 'mounted panel router');
   }
 
-  return { path: '/panel', router: r };
+  return [{ path: '/panel/sso', router: sso, public: true }, { path: '/panel', router: r }];
 }

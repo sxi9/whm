@@ -8,11 +8,12 @@ import { useConfirm } from '../../components/Modal.jsx';
 
 const FEATURE_LABELS = {
   addondomains: 'Addon domains', subdomains: 'Subdomains', parkeddomains: 'Aliases (parked domains)', filemanager: 'File manager', ftpaccts: 'FTP accounts',
-  emailaccts: 'Email accounts', forwarders: 'Forwarders', autoresponders: 'Autoresponders', defaultaddress: 'Default address', spamassassin: 'Spam filters',
+  emailaccts: 'Email accounts', forwarders: 'Forwarders', autoresponders: 'Autoresponders', defaultaddress: 'Default address', spamassassin: 'Spam filters', emailfilters: 'Email filters',
   mysql: 'MySQL databases', phpmyadmin: 'phpMyAdmin', postgres: 'PostgreSQL', cron: 'Cron jobs', ssh: 'Terminal and SSH', backup: 'Backups', bandwidth: 'Bandwidth',
   statselect: 'Metrics editor', awstats: 'AWStats', webalizer: 'Webalizer', errlog: 'Error log', rawlog: 'Raw access logs', sslmanager: 'SSL/TLS', autossl: 'AutoSSL',
   phpversion: 'PHP version', multiphp: 'MultiPHP manager', webdisk: 'Web disk', api: 'API access', passwordchange: 'Password and security', hotlink: 'Hotlink protection',
   leechprotect: 'Leech protection', indexmanager: 'Indexes', errpgs: 'Error pages', redirects: 'Redirects', cpanelpro_support: 'Support tickets',
+  ipblocker: 'IP blocker', dirprivacy: 'Directory privacy', webstats: 'Visitors (web statistics)', wordpress: 'WordPress installer',
 };
 
 export default function FeatureManager({ fn }) {

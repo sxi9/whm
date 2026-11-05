@@ -6,6 +6,8 @@ import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
 import { DOMLOGS_ROOT } from './web.js';
+import { assertManaged, accountPath, asUserArgv, requireAsUser, failureOf, lstatOrNull } from './as-user.js';
+import { stagedWrite } from './files.js';
 
 // Statistics Software Configuration: AWStats, Webalizer and Analog run against
 // the per-domain Apache logs the web family writes (plain and TLS vhosts log to
@@ -210,6 +212,110 @@ defineOp('stats.generate', {
       finalizeTree(outDir, owner.gid);
     }
     return { generator, domain, username, logFiles: logs, outputDir: outDir, skipped: false, ...result };
+  },
+});
+
+// Visitors (account panel): GoAccess renders one HTML report per domain into
+// <home>/.keel/stats/ *as the account*, so the output tree is the account's
+// own and nothing root writes can be redirected by it; the panel reads the
+// report and the summary back through files.* as the account as well. The
+// JSON report goes to stdout and only the compact summary is kept on disk,
+// so a busy site's multi-megabyte report never lands in the home.
+export const GOACCESS_PACKAGES = { apt: ['goaccess'], dnf: ['goaccess'] };
+export const STATS_DIR = '.keel/stats';
+export const SUMMARY_VERSION = 1;
+const MiB = 1024 * 1024;
+const TOP = 10;
+
+export const goaccessOutputs = (home, domain) => ({ dir: path.join(home, STATS_DIR), html: path.join(home, STATS_DIR, `${domain}.html`), summary: path.join(home, STATS_DIR, `${domain}.summary.json`) });
+
+export function goaccessArgv(logFiles, outHtml) {
+  return ['--no-global-config', '--log-format=COMBINED', `--output=${outHtml}`, '--output=json', ...logFiles];
+}
+
+// The lowest CPU and I/O priority the host offers around the as-user wrapper.
+export function ioniceArgv(exe, args, { ionice = hasBinary('ionice') } = {}) {
+  if (!ionice) return [exe, args];
+  const wrapper = resolveBinary(exe);
+  if (!wrapper) throw new OpError('binary_not_found', `Required program "${exe}" is not installed on this server`, { bin: exe });
+  return ['ionice', ['-c', '2', '-n', '7', '--', wrapper, ...args]];
+}
+
+const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+const rows = (panel, limit = TOP) => (Array.isArray(panel?.data) ? panel.data : []).slice(0, limit).map((d) => ({ label: String(d?.data ?? ''), hits: num(d?.hits?.count), visitors: num(d?.visitors?.count), bytes: num(d?.bytes?.count) }));
+const byHits = (a, b) => b.hits - a.hits;
+const dayOf = (label) => (/^\d{8}$/.test(label) ? `${label.slice(0, 4)}-${label.slice(4, 6)}-${label.slice(6, 8)}` : null);
+
+export function summarizeGoaccess(report, { domain, logFiles = [], generatedAt = new Date().toISOString() } = {}) {
+  const g = report?.general && typeof report.general === 'object' ? report.general : {};
+  return {
+    version: SUMMARY_VERSION, domain, generatedAt, logFiles,
+    period: { start: g.start_date ?? null, end: g.end_date ?? null },
+    totals: {
+      requests: num(g.total_requests), validRequests: num(g.valid_requests), failedRequests: num(g.failed_requests), visitors: num(g.unique_visitors),
+      files: num(g.unique_files), notFound: num(g.unique_not_found), referrers: num(g.unique_referrers), bandwidth: num(g.bandwidth), logBytes: num(g.log_size),
+    },
+    days: rows(report?.visitors, 1000).map((d) => ({ ...d, date: dayOf(d.label) })).filter((d) => d.date).sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 31),
+    pages: rows(report?.requests).sort(byHits),
+    staticFiles: rows(report?.static_requests).sort(byHits),
+    notFound: rows(report?.not_found).sort(byHits),
+    referrers: rows(report?.referring_sites).sort(byHits),
+    countries: rows(report?.geolocation).sort(byHits),
+    statusCodes: rows(report?.status_codes).sort(byHits),
+    browsers: rows(report?.browsers).sort(byHits),
+    os: rows(report?.os).sort(byHits),
+  };
+}
+
+defineOp('stats.goaccess.detect', {
+  description: 'Whether GoAccess (the account panel\'s Visitors report generator) is installed, and its version',
+  run: async () => {
+    const bin = resolveBinary('goaccess');
+    return { installed: Boolean(bin), bin, version: await versionOf(bin, ['--version']), packages: GOACCESS_PACKAGES, statsDir: STATS_DIR, nice: hasBinary('nice'), ionice: hasBinary('ionice') };
+  },
+});
+
+defineOp('stats.goaccess.run', {
+  description: 'Render the GoAccess HTML report and a JSON summary of one domain\'s access logs into <home>/.keel/stats as the account (nice/ionice, 120 s)',
+  timeoutMs: 180_000,
+  schema: z.object({ username: arg.username, domain: arg.domain, logFiles: z.array(arg.absPath).min(1).max(4).optional() }).strict(),
+  run: async ({ username, domain, logFiles }, ctx) => {
+    const bin = resolveBinary('goaccess');
+    if (!bin) throw new OpError('capability_missing', 'goaccess is not installed on this server', { packages: GOACCESS_PACKAGES });
+    const info = assertManaged(username);
+    const home = path.resolve(info.home);
+    const logDir = path.join(DOMLOGS_ROOT, username);
+    const candidates = (logFiles || domainLogFiles(username, domain)).map((p) => {
+      const resolved = ctx.assertAllowedPath(p, 'read');
+      if (path.dirname(resolved) !== logDir || !path.basename(resolved).startsWith(`${domain}-`)) throw new OpError('path_not_allowed', `${p} is not an access log of ${domain} under ${logDir}`);
+      return resolved;
+    });
+    const logs = candidates.filter((p) => { const st = lstatOrNull(p); return Boolean(st?.isFile()) && st.size > 0; });
+    const out = goaccessOutputs(home, domain);
+    if (!logs.length) return { domain, username, skipped: true, reason: 'no_log', logFiles: candidates, html: out.html, summary: out.summary };
+    const tool = requireAsUser();
+    const dir = accountPath(username, out.dir, ctx, 'write').target;
+    const runAs = (program, argv, opts) => {
+      const [exe, args] = asUserArgv(info, program, argv, { tool, nice: opts.nice && hasBinary('nice') });
+      const [wrapped, wrappedArgs] = opts.nice ? ioniceArgv(exe, args) : [exe, args];
+      return exec(wrapped, wrappedArgs, { timeoutMs: opts.timeoutMs, maxBuffer: opts.maxBuffer, allowFailure: true, env: { HOME: info.home, USER: info.username, LOGNAME: info.username } });
+    };
+    const keel = await runAs('mkdir', ['-p', '-m', '0711', '--', path.dirname(dir)], { timeoutMs: 30_000 });
+    if (keel.code !== 0) throw failureOf(keel, `create ${path.relative(home, path.dirname(dir))}`);
+    const made = await runAs('mkdir', ['-p', '-m', '0750', '--', dir], { timeoutMs: 30_000 });
+    if (made.code !== 0) throw failureOf(made, `create ${path.relative(home, dir)}`);
+    // The report is rendered beside its final name and renamed into place, so
+    // the panel never serves a half-written file.
+    const staging = `${out.html}.tmp`;
+    const run = await runAs(bin, goaccessArgv(logs, staging), { nice: true, timeoutMs: 120_000, maxBuffer: 256 * MiB });
+    if (run.code !== 0) { await runAs('rm', ['-f', '--', staging], { timeoutMs: 30_000 }).catch(() => {}); throw failureOf(run, `goaccess for ${domain}`); }
+    let report;
+    try { report = JSON.parse(run.stdout); } catch { throw new OpError('command_failed', `goaccess for ${domain} produced no JSON report`, { stderr: run.stderr.slice(-4000) }); }
+    const moved = await runAs('mv', ['-f', '-T', '--', staging, out.html], { timeoutMs: 30_000 });
+    if (moved.code !== 0) throw failureOf(moved, `replace ${path.relative(home, out.html)}`);
+    const summary = summarizeGoaccess(report, { domain, logFiles: logs });
+    await stagedWrite(info, home, out.summary, JSON.stringify(summary), '0640');
+    return { domain, username, skipped: false, logFiles: logs, html: out.html, summary: out.summary, generatedAt: summary.generatedAt, totals: summary.totals };
   },
 });
 

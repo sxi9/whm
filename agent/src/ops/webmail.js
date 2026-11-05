@@ -113,11 +113,15 @@ export const CONFIG_BLOCK = { begin: '// BEGIN Keel (Webmail) - managed block, e
 const phpString = (s) => `'${String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
 const hostUri = (scheme, host, port) => (scheme === 'plain' ? `${host}:${port}` : `${scheme}://${host}:${port}`);
 
+// Plugins are appended to whatever list the distribution's config declares
+// above the block ($config['plugins'] = [...] on Debian), never replacing it.
 export function renderRoundcubeBlock(a) {
   return [
     `$config['imap_host'] = ${phpString(hostUri(a.imapScheme, a.hostname, a.imapPort))};`,
     `$config['smtp_host'] = ${phpString(hostUri(a.smtpScheme, a.hostname, a.smtpPort))};`,
     `$config['product_name'] = ${phpString(a.productName)};`,
+    ...(a.plugins || []).map((p) => `$config['plugins'][] = ${phpString(p)};`),
+    ...(a.ssoEndpoint ? [`$config['keel_sso_endpoint'] = ${phpString(a.ssoEndpoint)};`] : []),
   ].join('\n');
 }
 
@@ -152,7 +156,8 @@ export function readConfigBlock(text) {
   if (!found) return null;
   const body = t.slice(found.start + CONFIG_BLOCK.begin.length, found.stop);
   const value = (key) => { const m = body.match(new RegExp(`\\$config\\['${key}'\\]\\s*=\\s*'((?:[^'\\\\]|\\\\.)*)';`)); return m ? m[1].replace(/\\(.)/g, '$1') : null; };
-  return { imapHost: value('imap_host'), smtpHost: value('smtp_host'), productName: value('product_name') };
+  const plugins = [...body.matchAll(/\$config\['plugins'\]\[\]\s*=\s*'((?:[^'\\]|\\.)*)';/g)].map((m) => m[1].replace(/\\(.)/g, '$1'));
+  return { imapHost: value('imap_host'), smtpHost: value('smtp_host'), productName: value('product_name'), plugins, ssoEndpoint: value('keel_sso_endpoint') };
 }
 
 function statConfig(file) {
@@ -217,8 +222,16 @@ defineOp('web.webmail.detect', {
   schema: z.object({ lint: z.boolean().default(false) }).strict(),
   run: async ({ lint }, ctx) => {
     const hit = findInstall();
-    const none = { installed: false, flavor: null, path: null, root: null, version: null, configured: null, apacheAlias: null, published: null, globalAlias: null, config: null };
+    const none = { installed: false, flavor: null, path: null, root: null, version: null, configured: null, apacheAlias: null, published: null, globalAlias: null, config: null, plugins: null };
     if (!hit) return none;
+    // Keel-installed plugins (the marker file) in the install's plugins/ directory.
+    let plugins = null;
+    if (hit.flavor === 'roundcube') {
+      const dir = pluginsDirOf(hit);
+      let keel = [];
+      try { keel = fs.readdirSync(dir).filter((n) => PLUGIN_NAME.test(n) && isFile(path.join(dir, n, `.${PLUGIN_MARK}`))).sort(); } catch { keel = []; }
+      plugins = { dir, keel };
+    }
     const apache = apacheLayout();
     let published = null;
     let globalAlias = null;
@@ -251,6 +264,7 @@ defineOp('web.webmail.detect', {
       published,
       globalAlias,
       config,
+      plugins,
     };
   },
 });
@@ -259,11 +273,17 @@ defineOp('web.webmail.detect', {
 
 const productName = z.string().min(1).max(80).regex(/^[^\0-\x1f\x7f]*$/, 'single line');
 const port = z.number().int().min(1).max(65535);
+export const PLUGIN_NAME = /^[a-z][a-z0-9_]{0,31}$/;
+const pluginName = z.string().regex(PLUGIN_NAME, 'Plugin name: lowercase letters, digits or "_"; max 32 chars');
+// The keel_sso plugin's exchange address: the panel's own loopback listener, nothing else.
+export const SSO_ENDPOINT_RE = /^https?:\/\/127\.0\.0\.1:\d{1,5}\/api\/panel\/sso\/webmail\/$/;
 const configSchema = z.object({
   hostname: arg.domain,
   imapScheme: z.enum(['ssl', 'tls', 'plain']).default('ssl'), imapPort: port.default(993),
   smtpScheme: z.enum(['ssl', 'tls', 'plain']).default('tls'), smtpPort: port.default(587),
   productName,
+  plugins: z.array(pluginName).max(8).default([]),
+  ssoEndpoint: z.string().max(80).regex(SSO_ENDPOINT_RE, 'https?://127.0.0.1:<port>/api/panel/sso/webmail/').optional(),
 }).strict();
 
 // The detected install's config (Debian /etc/roundcube, RHEL /etc/roundcubemail); the
@@ -271,7 +291,7 @@ const configSchema = z.object({
 const roundcubeConfigFile = () => findInstall()?.config || ROUNDCUBE_CONFIG;
 
 defineOp('web.webmail.config.write', {
-  description: 'Write the Keel-managed block at the end of Roundcube config.inc.php (/etc/roundcube or /etc/roundcubemail: imap_host, smtp_host, product_name), validated with php -l on a copy before the file is replaced; everything else in the file is kept',
+  description: 'Write the Keel-managed block at the end of Roundcube config.inc.php (/etc/roundcube or /etc/roundcubemail: imap_host, smtp_host, product_name, plugins, keel_sso_endpoint), validated with php -l on a copy before the file is replaced; everything else in the file is kept',
   schema: configSchema,
   run: async (a, ctx) => {
     const file = ctx.assertAllowedPath(roundcubeConfigFile(), 'write');
@@ -281,6 +301,85 @@ defineOp('web.webmail.config.write', {
     if (content === previous) return { path: file, changed: false, validated: null, values };
     const r = await replaceConfig(ctx, file, previous, content);
     return { path: file, changed: true, validated: r.validated, values };
+  },
+});
+
+// ---------------------------------------------------------------- plugin ---
+
+// Keel-shipped Roundcube plugins live in the deployed tree
+// (/opt/whm/deploy/roundcube/<name>) and are copied, not linked, into the
+// install's plugins/ directory so the web root never reaches into /opt/whm.
+// Only regular files at the plugin's top level travel (a plugin here is PHP +
+// composer.json), as root:root 0755/0644; a destination that is a symlink or
+// a directory Keel did not create is refused.
+export const PLUGIN_SOURCE_ROOT = '/opt/whm/deploy/roundcube';
+const PLUGIN_SOURCE = /^\/(?!(?:.*\/)?\.\.(?:\/|$))[A-Za-z0-9._\/-]*\/deploy\/roundcube\/[a-z][a-z0-9_]{0,31}$/;
+const PLUGIN_FILE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}\.(?:php|json|js|css|txt|md)$/;
+const PLUGIN_MARK = 'keel_plugin';
+
+export function pluginsDirOf(install) {
+  return path.join(install.path, 'plugins');
+}
+
+defineOp('web.webmail.plugin.install', {
+  description: 'Copy a Keel-shipped Roundcube plugin (deploy/roundcube/<name> in the deployed tree) into the installed Roundcube plugins/ directory as root:root (dirs 0755, files 0644); existing files of that plugin are replaced, nothing else is touched',
+  schema: z.object({ source: z.string().max(512).regex(PLUGIN_SOURCE, 'A plugin directory under <deploy>/roundcube/<name>') }).strict(),
+  run: async ({ source }, ctx) => {
+    const src = ctx.assertAllowedPath(source, 'read');
+    const name = path.basename(src);
+    if (!PLUGIN_NAME.test(name)) throw new OpError('invalid_args', `${name} is not a plugin name`);
+    let st = null;
+    try { st = fs.lstatSync(src); } catch { st = null; }
+    if (!st || !st.isDirectory()) throw new OpError('not_found', `${src} does not exist in the deployed tree; run install.sh --upgrade`);
+    const hit = findInstall();
+    if (!hit || hit.flavor !== 'roundcube') throw new OpError('capability_missing', 'Roundcube is not installed on this server');
+    const pluginsDir = ctx.assertAllowedPath(pluginsDirOf(hit), 'write');
+    let pst = null;
+    try { pst = fs.lstatSync(pluginsDir); } catch { pst = null; }
+    if (!pst || pst.isSymbolicLink() || !pst.isDirectory()) throw new OpError('refused', `${pluginsDir} is not a directory; Roundcube's plugins directory must exist`);
+    const dest = ctx.assertAllowedPath(path.join(pluginsDir, name), 'write');
+    let dst = null;
+    try { dst = fs.lstatSync(dest); } catch { dst = null; }
+    if (dst && (dst.isSymbolicLink() || !dst.isDirectory())) throw new OpError('refused', `${dest} exists and is not a directory`);
+    if (dst && !fs.existsSync(path.join(dest, `.${PLUGIN_MARK}`))) throw new OpError('refused', `${dest} was not installed by Keel; remove it first`);
+    const files = fs.readdirSync(src, { withFileTypes: true }).filter((d) => d.isFile() && PLUGIN_FILE.test(d.name)).map((d) => d.name);
+    if (!files.includes(`${name}.php`)) throw new OpError('invalid_args', `${src} has no ${name}.php`);
+    if (!dst) fs.mkdirSync(dest, { mode: 0o755 });
+    fs.chmodSync(dest, 0o755);
+    fs.chownSync(dest, 0, 0);
+    const written = [];
+    for (const f of files) {
+      const target = path.join(dest, f);
+      const tst = (() => { try { return fs.lstatSync(target); } catch { return null; } })();
+      if (tst && (tst.isSymbolicLink() || !tst.isFile())) throw new OpError('refused', `${target} is not a regular file`);
+      const content = fs.readFileSync(path.join(src, f));
+      const tmp = `${target}.whm-tmp-${process.pid}`;
+      fs.writeFileSync(tmp, content, { mode: 0o644 });
+      fs.chmodSync(tmp, 0o644);
+      fs.chownSync(tmp, 0, 0);
+      fs.renameSync(tmp, target);
+      written.push(f);
+    }
+    fs.writeFileSync(path.join(dest, `.${PLUGIN_MARK}`), `${name}\n`, { mode: 0o644 });
+    return { name, source: src, path: dest, files: written };
+  },
+});
+
+defineOp('web.webmail.plugin.remove', {
+  description: 'Remove a Keel-installed Roundcube plugin directory from the install (only one carrying the Keel marker)',
+  destructive: true,
+  schema: z.object({ name: pluginName }).strict(),
+  run: async ({ name }, ctx) => {
+    const hit = findInstall();
+    if (!hit || hit.flavor !== 'roundcube') return { name, removed: false };
+    const dest = ctx.assertAllowedPath(path.join(pluginsDirOf(hit), name), 'write');
+    let dst = null;
+    try { dst = fs.lstatSync(dest); } catch { dst = null; }
+    if (!dst) return { name, path: dest, removed: false };
+    if (dst.isSymbolicLink() || !dst.isDirectory()) throw new OpError('refused', `${dest} is not a directory`);
+    if (!fs.existsSync(path.join(dest, `.${PLUGIN_MARK}`))) throw new OpError('refused', `${dest} was not installed by Keel; refusing to delete it`);
+    fs.rmSync(dest, { recursive: true, force: false });
+    return { name, path: dest, removed: true };
   },
 });
 

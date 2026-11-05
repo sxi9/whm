@@ -5,6 +5,8 @@ import { Field, Toggle, Button } from '../../../../components/Form.jsx';
 import { Modal } from '../../../../components/Modal.jsx';
 import { PanelCapabilityState } from '../../../../panel/PanelPage.jsx';
 import { panelApi } from '../../../../panel/hooks/usePanel.js';
+import { useT } from '../../../../i18n/useT.js';
+import { fill, plural } from '../../../../i18n/fill.js';
 import { RequestError } from './common.jsx';
 import { bytesToBase64, joinRel } from './paths.js';
 
@@ -36,6 +38,7 @@ export async function uploadFile(file, dir, { overwrite = false, onProgress, isC
 }
 
 export function UploadModal({ open, dir, onClose, onDone }) {
+  const { t } = useT();
   const [files, setFiles] = useState([]);
   const [overwrite, setOverwrite] = useState(false);
   const [rows, setRows] = useState([]);
@@ -68,21 +71,22 @@ export function UploadModal({ open, dir, onClose, onDone }) {
 
   const total = files.reduce((s, f) => s + f.size, 0);
   const finished = rows.length > 0 && !running;
+  const statusText = { queued: t('panel.files.upload_queued', 'queued'), running: t('panel.files.upload_running', 'running'), done: t('panel.files.upload_done', 'done'), failed: t('panel.files.upload_failed', 'failed'), cancelled: t('panel.files.upload_cancelled', 'cancelled') };
   return (
-    <Modal open={open} title={`Upload to ${dir ? `~/${dir}` : 'the home directory'}`} onClose={close} size="md"
+    <Modal open={open} title={fill(t('panel.files.upload_to', 'Upload to {dir}'), { dir: dir ? `~/${dir}` : t('panel.files.the_home_directory', 'the home directory') })} onClose={close} size="md"
       footer={(
         <>
-          <Button onClick={close}>{running ? 'Cancel' : finished ? 'Done' : 'Close'}</Button>
-          {!finished && <Button variant="primary" icon={Upload} loading={running} disabled={!files.length || running} onClick={start}>Upload {files.length ? `${files.length} file${files.length === 1 ? '' : 's'} (${formatBytes(total)})` : ''}</Button>}
-          {finished && <Button variant="primary" onClick={() => { reset(); inputRef.current?.click(); }}>Upload more</Button>}
+          <Button onClick={close}>{running ? t('panel.files.cancel', 'Cancel') : finished ? t('panel.files.done', 'Done') : t('panel.files.close', 'Close')}</Button>
+          {!finished && <Button variant="primary" icon={Upload} loading={running} disabled={!files.length || running} onClick={start}>{files.length ? fill(plural(t, 'panel.files.upload_n_files', files.length, 'Upload {count} file ({size})', 'Upload {count} files ({size})'), { size: formatBytes(total) }) : t('panel.files.upload', 'Upload')}</Button>}
+          {finished && <Button variant="primary" onClick={() => { reset(); inputRef.current?.click(); }}>{t('panel.files.upload_more', 'Upload more')}</Button>}
         </>
       )}>
       {!rows.length && (
         <>
-          <Field label="Files" help="Up to 20 GB per file; large files are sent in pieces so a slow connection still gets there" htmlFor="upload-files">
+          <Field label={t('panel.files.files', 'Files')} help={t('panel.files.upload_files_help', 'Up to 20 GB per file; large files are sent in pieces so a slow connection still gets there')} htmlFor="upload-files">
             <input ref={inputRef} id="upload-files" className="input" type="file" multiple style={{ height: 'auto', padding: 8 }} onChange={(e) => setFiles(Array.from(e.target.files || []))} />
           </Field>
-          <Toggle checked={overwrite} onChange={setOverwrite} label="Replace files that already exist" description="Off: an upload with the name of an existing file is refused" />
+          <Toggle checked={overwrite} onChange={setOverwrite} label={t('panel.files.replace_existing', 'Replace files that already exist')} description={t('panel.files.replace_existing_help', 'Off: an upload with the name of an existing file is refused')} />
           {files.length > 0 && (
             <ul className="list-plain" style={{ marginTop: 12 }}>
               {files.map((f) => <li key={f.name} className="small" style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '4px 0' }}><code>{f.name}</code><span className="muted">{formatBytes(f.size)}</span></li>)}
@@ -98,7 +102,7 @@ export function UploadModal({ open, dir, onClose, onDone }) {
               <li key={r.name} style={{ padding: '8px 0' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }} className="small">
                   <code>{r.name}</code>
-                  <span className="muted">{r.status === 'done' ? formatBytes(r.size) : `${formatBytes(r.sent)} of ${formatBytes(r.size)}`} · {r.status}</span>
+                  <span className="muted">{r.status === 'done' ? formatBytes(r.size) : fill(t('panel.files.sent_of', '{sent} of {size}'), { sent: formatBytes(r.sent), size: formatBytes(r.size) })} · {statusText[r.status] || r.status}</span>
                 </div>
                 <div className={`meter ${r.status === 'failed' ? 'bad' : ''}`}><span style={{ width: `${pct}%` }} /></div>
                 {r.error && r.error.code !== 'cancelled' && <div style={{ marginTop: 8 }}><PanelCapabilityState error={r.error} /><RequestError error={r.error} /></div>}
@@ -107,7 +111,7 @@ export function UploadModal({ open, dir, onClose, onDone }) {
           })}
         </ul>
       )}
-      {!rows.length && !files.length && <p className="muted small" style={{ marginTop: 8 }}><AlertTriangle size={12} style={{ verticalAlign: '-2px' }} /> Folders cannot be uploaded as such: compress them first and extract the archive here.</p>}
+      {!rows.length && !files.length && <p className="muted small" style={{ marginTop: 8 }}><AlertTriangle size={12} style={{ verticalAlign: '-2px' }} /> {t('panel.files.folders_not_uploadable', 'Folders cannot be uploaded as such: compress them first and extract the archive here.')}</p>}
     </Modal>
   );
 }

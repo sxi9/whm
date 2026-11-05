@@ -22,6 +22,16 @@ export function setPreferredLocale(code) {
   return loadActiveLocale(true);
 }
 
+// A login's stored language (users.locale, GET /api/panel/me) wins over this
+// browser's own preference once per load; null means "no preference stored",
+// so the browser choice stands. Returns true when the strings were reloaded.
+export function adoptUserLocale(code) {
+  if (typeof code !== 'string' || !code) return false;
+  if (code === preferredLocale() || (state.loaded && code === state.code)) return false;
+  setPreferredLocale(code);
+  return true;
+}
+
 // Uses fetch directly (not api.request) so a 401 on this background call never
 // triggers the global sign-out handler.
 export function loadActiveLocale(force = false) {

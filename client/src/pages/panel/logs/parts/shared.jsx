@@ -1,5 +1,6 @@
 import { AlertTriangle } from 'lucide-react';
 import { ErrorBanner } from '../../../../components/Form.jsx';
+import { useT } from '../../../../i18n/useT.js';
 
 export function isCapabilityError(error) {
   return Boolean(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
@@ -10,9 +11,10 @@ export function isFeatureDisabled(error) {
 }
 
 export function RequestError({ error, onRetry }) {
+  const { t } = useT();
   if (!error || isCapabilityError(error) || isFeatureDisabled(error)) return null;
   if (error.status === 503 && error.code === 'service_unavailable') {
-    return <div className="banner banner-warning" role="alert"><AlertTriangle size={18} /><div><strong>Temporarily unavailable</strong><p>{error.message}</p><p className="muted">Try again in a moment; if it keeps happening, tell your hosting provider.</p></div></div>;
+    return <div className="banner banner-warning" role="alert"><AlertTriangle size={18} /><div><strong>{t('panel.logs.unavailable_title', 'Temporarily unavailable')}</strong><p>{error.message}</p><p className="muted">{t('panel.logs.unavailable_help', 'Try again in a moment; if it keeps happening, tell your hosting provider.')}</p></div></div>;
   }
   return <ErrorBanner error={error} onRetry={onRetry} />;
 }
@@ -43,3 +45,10 @@ export function domainOfFile(name, domains) {
 }
 
 export const LOCATION_LABELS = { server: 'Web server', home: 'Your logs folder' };
+
+// Catalogue key panel.logs.location_<server|home>; unknown locations show as they are.
+export function locationLabel(location, t) {
+  const fallback = LOCATION_LABELS[location];
+  if (!fallback) return location;
+  return t ? t(`panel.logs.location_${location}`, fallback) : fallback;
+}

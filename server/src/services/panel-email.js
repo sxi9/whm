@@ -18,6 +18,12 @@ export const DEFAULT_ACTIONS = ['fail', 'blackhole', 'forward'];
 export const SYSTEM_ROOT = Object.freeze({ id: null, username: 'panel', role: 'root' });
 // Mirrors fields.password in lib/validate.js (zod's min has no public getter).
 export const PASSWORD_MIN_LENGTH = 8;
+// Mirrors agent/src/ops/vmail.js (vmail.mailbox.expunge): the agent refuses anything else.
+export const EMPTIABLE_FOLDERS = ['Trash', 'Junk'];
+export const EXPUNGE_MIN_DAYS = 7;
+export const EXPUNGE_MAX_DAYS = 3650;
+export const FOLDER_NAME = /^(?!\.)(?!.*\.\.)(?!.*\.$)[^\0-\x1f\x7f"\\*%]{1,200}$/;
+export const MESSAGE_STATUSES = ['delivered', 'completed', 'failed', 'rejected', 'deferred', 'queued'];
 
 const MB = 1024 * 1024;
 
@@ -51,6 +57,109 @@ export function renderUserPrefs({ enabled, requiredScore, whitelist = [], blackl
   if (!enabled) lines.push('# Spam filtering is disabled for this account');
   for (const a of whitelist) lines.push(`whitelist_from ${a}`);
   for (const a of blacklist) lines.push(`blacklist_from ${a}`);
+  return `${lines.join('\n')}\n`;
+}
+
+// Mail filters (P1-3): structured rules rendered into Sieve here, never
+// accepted as script text. Every value lands inside a Sieve quoted string, so
+// the grammar refuses what a quoted string cannot carry (control characters,
+// a second line) and the renderer escapes the two characters that end or
+// escape one. Folder names and redirect targets are grammar-checked too; the
+// compiled script is the agent's business (vmail.sieve.write runs sievec).
+export const FILTER_HEADERS = ['from', 'to', 'subject', 'body', 'any_header', 'custom'];
+export const FILTER_OPS = ['contains', 'is', 'matches', 'not_contains'];
+export const FILTER_ACTION_TYPES = ['fileinto', 'discard', 'redirect', 'stop'];
+export const FILTER_ANY_HEADERS = ['from', 'to', 'cc', 'subject', 'reply-to', 'sender', 'list-id'];
+export const FILTER_DEFAULT_FOLDERS = ['INBOX', 'Junk', 'Trash', 'Archive', 'Drafts', 'Sent'];
+export const FILTER_MAX_MATCH = 10;
+export const FILTER_MAX_ACTIONS = 5;
+// sieve_max_redirects (Pigeonhole default 4) caps a script run; one filter stays under it.
+export const FILTER_MAX_REDIRECTS = 4;
+export const FILTER_NAME = /^[^\u0000-\u001f\u007f]{1,80}$/u;
+export const FILTER_VALUE = /^[^\u0000-\u001f\u007f]{1,998}$/u;
+export const FILTER_HEADER_NAME = /^[A-Za-z][A-Za-z0-9-]{0,63}$/;
+// An IMAP folder name as Dovecot's Maildir++ layout takes it: "." separates
+// levels, so no leading, trailing or doubled dots; no control characters.
+export const FILTER_FOLDER = /^(?!\.)(?!.*\.\.)(?!.*\.$)[^\u0000-\u001f\u007f/\\"]{1,200}$/u;
+export const FILTER_ADDRESS = /^(?=.{3,254}$)[A-Za-z0-9][A-Za-z0-9._+=-]{0,63}@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
+export const SIEVE_HEADER = '# Keel (customer panel mail filters) - managed script, edits are overwritten';
+
+export function sieveString(value) {
+  if (typeof value !== 'string' || !FILTER_VALUE.test(value)) throw unprocessable('A filter value must be a single line of 1 to 998 characters without control characters', { rules: ['Invalid value'] });
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+// Canonical rules object from a validated body; every string is re-checked
+// against the grammar of where it lands.
+export function normalizeRules(rules) {
+  const bad = (message, key = 'rules') => unprocessable(message, { [key]: [message] });
+  if (!rules || typeof rules !== 'object') throw bad('Rules are required');
+  const match = Array.isArray(rules.match) ? rules.match : [];
+  const actions = Array.isArray(rules.actions) ? rules.actions : [];
+  if (match.length < 1 || match.length > FILTER_MAX_MATCH) throw bad(`A filter needs 1 to ${FILTER_MAX_MATCH} conditions`);
+  if (actions.length < 1 || actions.length > FILTER_MAX_ACTIONS) throw bad(`A filter needs 1 to ${FILTER_MAX_ACTIONS} actions`);
+  const out = { matchAll: rules.matchAll !== false, match: [], actions: [] };
+  for (const m of match) {
+    if (!FILTER_HEADERS.includes(m?.header)) throw bad('Unknown condition field');
+    if (!FILTER_OPS.includes(m?.op)) throw bad('Unknown condition operator');
+    if (typeof m.value !== 'string' || !FILTER_VALUE.test(m.value)) throw bad('A condition value must be a single line of 1 to 998 characters without control characters');
+    const entry = { header: m.header, op: m.op, value: m.value };
+    if (m.header === 'custom') {
+      if (typeof m.name !== 'string' || !FILTER_HEADER_NAME.test(m.name)) throw bad('A custom header name uses letters, digits and "-" only (64 characters)');
+      entry.name = m.name.toLowerCase();
+    }
+    out.match.push(entry);
+  }
+  let redirects = 0;
+  for (const a of actions) {
+    if (!FILTER_ACTION_TYPES.includes(a?.type)) throw bad('Unknown action');
+    const entry = { type: a.type };
+    if (a.type === 'fileinto') {
+      if (typeof a.folder !== 'string' || !FILTER_FOLDER.test(a.folder)) throw bad('A folder name has 1 to 200 characters, no control characters, quotes, slashes or leading, trailing or doubled dots');
+      entry.folder = a.folder;
+    } else if (a.type === 'redirect') {
+      if (typeof a.address !== 'string' || !FILTER_ADDRESS.test(a.address)) throw bad('A redirect target must be an email address');
+      entry.address = a.address.toLowerCase();
+      if (++redirects > FILTER_MAX_REDIRECTS) throw bad(`At most ${FILTER_MAX_REDIRECTS} redirects per filter`);
+    }
+    out.actions.push(entry);
+  }
+  return out;
+}
+
+export function renderSieveTest(m) {
+  const op = { contains: ':contains', is: ':is', matches: ':matches', not_contains: ':contains' }[m.op];
+  const not = m.op === 'not_contains' ? 'not ' : '';
+  const value = sieveString(m.value);
+  if (m.header === 'body') return `${not}body :text ${op} ${value}`;
+  const names = m.header === 'any_header' ? `[${FILTER_ANY_HEADERS.map(sieveString).join(', ')}]` : sieveString(m.header === 'custom' ? m.name : m.header);
+  return `${not}header ${op} ${names} ${value}`;
+}
+
+export function renderSieveAction(a) {
+  if (a.type === 'fileinto') return `fileinto :create ${sieveString(a.folder)};`;
+  if (a.type === 'redirect') return `redirect ${sieveString(a.address)};`;
+  return `${a.type};`;
+}
+
+// The whole script of one scope: enabled filters in position order; only the
+// extensions the rules use are required.
+export function renderSieve(filters) {
+  const requires = new Set();
+  const blocks = [];
+  for (const f of filters) {
+    if (!f.enabled) continue;
+    const rules = normalizeRules(f.rules);
+    const tests = rules.match.map(renderSieveTest);
+    if (rules.match.some((m) => m.header === 'body')) requires.add('body');
+    if (rules.actions.some((a) => a.type === 'fileinto')) { requires.add('fileinto'); requires.add('mailbox'); }
+    const name = FILTER_NAME.test(f.name || '') ? f.name : 'filter';
+    const condition = tests.length === 1 ? tests[0] : `${rules.matchAll ? 'allof' : 'anyof'} (${tests.join(', ')})`;
+    blocks.push(`# ${name}`, `if ${condition} {`, ...rules.actions.map((a) => `  ${renderSieveAction(a)}`), '}');
+  }
+  const lines = [SIEVE_HEADER];
+  if (requires.size) lines.push(`require [${[...requires].map((r) => `"${r}"`).join(', ')}];`);
+  if (blocks.length) lines.push('', ...blocks);
   return `${lines.join('\n')}\n`;
 }
 
@@ -194,10 +303,13 @@ export function createPanelEmailService(ctx) {
 
   // Routing 'local' is wanted once a mailbox exists; Exim not reading the lists
   // is a warning the caller surfaces, never a failure of the mailbox itself.
+  // A domain the customer explicitly routed 'remote' is never flipped back
+  // behind their back: the mailbox is refused until the routing page says local.
   async function routeLocally(domain, warnings, req) {
     if (typeof ctx.mail?.setRouting !== 'function') return;
     const current = stmts.mailDomain.get(domain);
     if (current?.routing === 'local') return;
+    if (current?.routing === 'remote') throw new HttpError(409, 'routing_remote', `Mail for ${domain} is routed to another mail server; switch its email routing to local or automatic before creating mailboxes`);
     try {
       const r = await ctx.mail.setRouting(domain, 'local', req);
       if (r && r.applied === false) warnings.push({ code: 'routing_not_applied', message: r.reason || 'Mail routing was saved but Exim does not read it yet' });
@@ -320,6 +432,7 @@ export function createPanelEmailService(ctx) {
       checkPasswordStrength(password);
       const quota = quotaMb === undefined ? Number(settings.get('panel.mail.default_quota_mb') ?? 1024) || null : quotaMb;
       const mailDomain = ensureMailDomain(scope, d.domain, req);
+      if (mailDomain.routing === 'remote') throw new HttpError(409, 'routing_remote', `Mail for ${d.domain} is routed to another mail server; switch its email routing to local or automatic before creating mailboxes`);
       const warnings = [];
       const hashed = await op('vmail.hash', { password }, req);
       if (typeof hashed?.hash !== 'string' || !hashed.hash.startsWith('$')) throw new HttpError(502, 'agent_error', 'The agent did not return a password hash');
@@ -410,7 +523,8 @@ export function createPanelEmailService(ctx) {
         virtualMailLive: virtualMailLive(),
         warnings,
         passwordPolicy: passwordPolicy(),
-        webmail: settings.get('panel.webmail_url') || null,
+        webmail: await webmailUrl().catch(() => null),
+        webmailSso: await detectWebmail().then((d) => ssoAvailable(d, webmailUrlFrom(d))).catch(() => false),
       };
     },
   };
@@ -641,6 +755,138 @@ export function createPanelEmailService(ctx) {
     },
   };
 
+  // -------------------------------------------------------------- filters ---
+
+  // Sieve filters per mailbox (personal script) and per account (sieve_before).
+  // Host first: the whole script of the scope is re-rendered from the rows as
+  // they would be after the change and handed to vmail.sieve.write (compiled
+  // as the account before activation); the rows change only when that
+  // succeeded. An empty scope removes the script instead.
+  const fstmts = {
+    list: db.prepare('SELECT * FROM panel_mail_filters WHERE account_id = ? AND scope = ? AND mailbox_id IS ? ORDER BY position, id'),
+    get: db.prepare('SELECT * FROM panel_mail_filters WHERE id = ? AND account_id = ?'),
+    count: db.prepare('SELECT COUNT(*) AS n FROM panel_mail_filters WHERE account_id = ? AND scope = ? AND mailbox_id IS ?'),
+    insert: db.prepare('INSERT INTO panel_mail_filters (account_id, scope, mailbox_id, name, position, rules_json, enabled) VALUES (@account_id, @scope, @mailbox_id, @name, @position, @rules_json, @enabled)'),
+    update: db.prepare("UPDATE panel_mail_filters SET name = @name, rules_json = @rules_json, enabled = @enabled, updated_at = datetime('now') WHERE id = @id AND account_id = @account_id"),
+    setPosition: db.prepare("UPDATE panel_mail_filters SET position = ?, updated_at = datetime('now') WHERE id = ? AND account_id = ?"),
+    remove: db.prepare('DELETE FROM panel_mail_filters WHERE id = ? AND account_id = ?'),
+  };
+  const maxFilters = () => Number(settings.get('panel.mail.max_filters_per_scope') ?? 100);
+  const shapeFilter = (r) => ({ id: r.id, scope: r.scope, mailboxId: r.mailbox_id, name: r.name, position: r.position, enabled: Boolean(r.enabled), rules: json.parse(r.rules_json, { matchAll: true, match: [], actions: [] }), createdAt: r.created_at, updatedAt: r.updated_at });
+  const sieveAvailable = () => capabilities.has('dovecot') && capabilities.has('sieve');
+
+  // The script a request addresses: one of the account's mailboxes, or the
+  // account itself. A foreign or unknown mailbox id is "not found" (§3.2).
+  function filterTarget(scope, mailboxId) {
+    if (mailboxId == null) return { scope: 'account', mailboxId: null, address: null };
+    const row = loadMailbox(scope, mailboxId);
+    return { scope: 'mailbox', mailboxId: row.id, address: `${row.local_part}@${row.domain}` };
+  }
+  const filterRows = (scope, target) => fstmts.list.all(scope.accountId, target.scope, target.mailboxId);
+  const opTarget = (scope, target) => ({ username: scope.username, scope: target.scope, ...(target.address ? { mailbox: target.address } : {}) });
+
+  // A row reached by id must belong to the route's scope family and, for a
+  // mailbox, to a mailbox the account still owns.
+  function loadFilter(scope, id, expectedScope) {
+    const row = fstmts.get.get(id, scope.accountId);
+    if (!row || row.scope !== expectedScope) throw notFound('Filter');
+    return { row, target: filterTarget(scope, row.mailbox_id) };
+  }
+
+  async function applyFilters(scope, target, rows, req) {
+    capabilities.require('dovecot', 'Dovecot is not installed on this server, so mail filters cannot be applied yet');
+    const args = opTarget(scope, target);
+    try {
+      if (!rows.length) return { ...(await op('vmail.sieve.remove', args, req, 'sieve')), script: null };
+      const script = renderSieve(rows.map(shapeFilter));
+      return { ...(await op('vmail.sieve.write', { ...args, script }, req, 'sieve')), script };
+    } catch (err) {
+      if (err?.code === 'invalid_sieve') throw new HttpError(422, 'sieve_compile_failed', err.message, { rules: (err.details?.errors || []).map((e) => (e.line ? `line ${e.line}: ${e.message}` : e.message)) });
+      throw err;
+    }
+  }
+
+  const filterAudit = (req, scope, action, target, row, extra = {}) => audit(req, scope, action, { scope: target.scope, mailbox: target.address, name: row?.name ?? null, id: row?.id ?? null, ...extra });
+
+  const filters = {
+    target: filterTarget,
+
+    list(scope, mailboxId = null) {
+      assertFeature(scope, 'emailfilters');
+      const target = filterTarget(scope, mailboxId);
+      const data = filterRows(scope, target).map(shapeFilter);
+      return {
+        data,
+        meta: {
+          scope: target.scope, mailbox: target.address ? { id: target.mailboxId, address: target.address } : null,
+          max: maxFilters(), folders: FILTER_DEFAULT_FOLDERS, headers: FILTER_HEADERS, ops: FILTER_OPS, actions: FILTER_ACTION_TYPES,
+          sieve: { available: sieveAvailable(), dovecot: capabilities.has('dovecot'), sievec: capabilities.has('sieve') },
+          script: renderSieve(data),
+        },
+      };
+    },
+
+    async create(scope, mailboxId, input, req) {
+      assertFeature(scope, 'emailfilters');
+      const target = filterTarget(scope, mailboxId);
+      const rules = normalizeRules(input.rules);
+      const rows = filterRows(scope, target);
+      const max = maxFilters();
+      if (rows.length >= max) throw new HttpError(409, 'limit_reached', `At most ${max} filters per ${target.scope === 'account' ? 'account' : 'mailbox'}`);
+      const row = { account_id: scope.accountId, scope: target.scope, mailbox_id: target.mailboxId, name: input.name, position: rows.reduce((m, r) => Math.max(m, r.position), 0) + 1, rules_json: JSON.stringify(rules), enabled: input.enabled === false ? 0 : 1 };
+      const applied = await applyFilters(scope, target, [...rows, row], req);
+      const id = Number(fstmts.insert.run(row).lastInsertRowid);
+      filterAudit(req, scope, 'panel.email.filter.create', target, { ...row, id }, { enabled: Boolean(row.enabled) });
+      return { data: shapeFilter(fstmts.get.get(id, scope.accountId)), meta: { activated: applied.activated ?? null, warnings: applied.warnings ?? [] } };
+    },
+
+    async update(scope, id, input, req, expectedScope = 'mailbox') {
+      assertFeature(scope, 'emailfilters');
+      const { row: current, target } = loadFilter(scope, id, expectedScope);
+      const next = { ...current, name: input.name ?? current.name, rules_json: input.rules === undefined ? current.rules_json : JSON.stringify(normalizeRules(input.rules)), enabled: input.enabled === undefined ? current.enabled : (input.enabled ? 1 : 0) };
+      const rows = filterRows(scope, target).map((r) => (r.id === current.id ? next : r));
+      const applied = await applyFilters(scope, target, rows, req);
+      fstmts.update.run({ ...next, account_id: scope.accountId });
+      filterAudit(req, scope, 'panel.email.filter.update', target, next, { enabled: Boolean(next.enabled) });
+      return { data: shapeFilter(fstmts.get.get(id, scope.accountId)), meta: { activated: applied.activated ?? null, warnings: applied.warnings ?? [] } };
+    },
+
+    async remove(scope, id, req, expectedScope = 'mailbox') {
+      assertFeature(scope, 'emailfilters');
+      const { row, target } = loadFilter(scope, id, expectedScope);
+      await applyFilters(scope, target, filterRows(scope, target).filter((r) => r.id !== row.id), req);
+      fstmts.remove.run(row.id, scope.accountId);
+      filterAudit(req, scope, 'panel.email.filter.delete', target, row);
+      return { id: row.id, removed: true };
+    },
+
+    // The new order is the complete list of the scope's filter ids.
+    async reorder(scope, mailboxId, { ids }, req) {
+      assertFeature(scope, 'emailfilters');
+      const target = filterTarget(scope, mailboxId);
+      const rows = filterRows(scope, target);
+      const have = rows.map((r) => r.id).sort((a, b) => a - b);
+      const want = [...ids].sort((a, b) => a - b);
+      if (have.length !== want.length || have.some((v, i) => v !== want[i])) throw unprocessable('The order must list every filter of this scope exactly once', { ids: ['Must contain every filter id exactly once'] });
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      const ordered = ids.map((id, i) => ({ ...byId.get(id), position: i + 1 }));
+      await applyFilters(scope, target, ordered, req);
+      db.transaction(() => { for (const r of ordered) fstmts.setPosition.run(r.position, r.id, scope.accountId); })();
+      filterAudit(req, scope, 'panel.email.filter.reorder', target, null, { ids });
+      return filterRows(scope, target).map(shapeFilter);
+    },
+
+    // The "Test" button: compile one filter's script (sievec -d) without touching the live one.
+    async test(scope, mailboxId, input, req) {
+      assertFeature(scope, 'emailfilters');
+      const target = filterTarget(scope, mailboxId);
+      capabilities.require('dovecot', 'Dovecot is not installed on this server, so mail filters cannot be compiled yet');
+      const script = renderSieve([{ name: input.name ?? 'test', enabled: true, rules: normalizeRules(input.rules) }]);
+      const r = await op('vmail.sieve.test', { ...opTarget(scope, target), script }, req, 'sieve');
+      return { ok: Boolean(r.ok), errors: r.errors ?? [], warnings: r.warnings ?? [], script };
+    },
+  };
+
   // ----------------------------------------------------------------- spam ---
 
   const shapeSpam = (row) => (row
@@ -734,6 +980,58 @@ export function createPanelEmailService(ctx) {
     .map((i) => ({ id: i.id, name: RECORD_NAMES[i.id](status.domain, i), type: 'TXT', value: i.expected, status: i.status }));
   const withDelegation = (status, delegation) => ({ ...status, delegation, records: copyRecords(status) });
 
+  // ------------------------------------------------------------- routing ---
+
+  // Per-domain mail routing (P1-4): 'auto'/'local' deliver here, 'remote' lets
+  // Exim look the MX up like any outside domain. The public MX is read through
+  // the Email category's resolver (ctx.mail.mxStatus) and the delegation
+  // banner tells the customer where that MX record is edited.
+  const ROUTING_VALUES = ['auto', 'local', 'remote'];
+  const mailboxesOfDomain = db.prepare('SELECT COUNT(*) AS n FROM mail_accounts ma JOIN mail_domains md ON md.id = ma.domain_id WHERE md.domain = ? AND md.account_id = ?');
+  const mxStatusOf = async (domain) => {
+    if (typeof ctx.mail?.mxStatus !== 'function') return null;
+    try { return await ctx.mail.mxStatus(domain); } catch (err) { return { ok: false, error: err.message, records: [], pointsHere: null }; }
+  };
+  async function routingRow(scope, d) {
+    const row = stmts.mailDomain.get(d.domain);
+    const routing = row && row.account_id === scope.accountId ? (ROUTING_VALUES.includes(row.routing) ? row.routing : 'auto') : 'auto';
+    const [mx, delegation] = await Promise.all([mxStatusOf(d.domain), delegationOf(d.domain)]);
+    const mailboxes = mailboxesOfDomain.get(d.domain, scope.accountId).n;
+    const effective = routing === 'remote' ? 'remote' : 'local';
+    const hints = [];
+    if (mx?.pointsHere === false && effective === 'local') hints.push(`The MX records of ${d.domain} point at another server (${mx.exchanges?.join(', ') || 'unresolved'}), so mail from the internet does not arrive here; fix the MX record or set the routing to remote.`);
+    if (mx?.pointsHere === true && effective === 'remote') hints.push(`The MX records of ${d.domain} point at this server while the routing is remote: mail sent from here is handed to this same server and bounces.`);
+    return { domain: d.domain, type: d.type, routing, effective, mailboxes, canRemote: mailboxes === 0, mx, delegation, hints };
+  }
+  const routing = {
+    async list(scope) {
+      const rows = await Promise.all(domainsOf(scope).map((d) => routingRow(scope, d)));
+      return { data: rows, meta: { hostname: hostname(), values: ROUTING_VALUES } };
+    },
+    async get(scope, domain) {
+      return routingRow(scope, assertDomain(scope, domain));
+    },
+    async set(scope, domain, { routing: wanted }, req) {
+      const d = assertDomain(scope, domain);
+      if (!ROUTING_VALUES.includes(wanted)) throw unprocessable('routing must be auto, local or remote', { routing: ['auto, local or remote'] });
+      const mailboxes = mailboxesOfDomain.get(d.domain, scope.accountId).n;
+      if (wanted === 'remote' && mailboxes > 0) throw new HttpError(409, 'mailboxes_exist', `${d.domain} has ${mailboxes} mailbox${mailboxes === 1 ? '' : 'es'} on this server; delete them before routing its mail elsewhere`);
+      ensureMailDomain(scope, d.domain, req);
+      let result = { applied: null, reason: 'the Email category is not loaded', hint: null };
+      if (typeof ctx.mail?.setRouting === 'function') {
+        try {
+          const r = await ctx.mail.setRouting(d.domain, wanted, req);
+          result = { applied: Boolean(r?.applied), reason: r?.reason ?? null, hint: r?.hint ?? null };
+        } catch (err) {
+          if (err.code !== 'routing_not_applied') throw err;
+          result = { applied: false, reason: err.reason || err.message, hint: err.hint ?? null };
+        }
+      }
+      audit(req, scope, 'panel.email.routing.set', { domain: d.domain, routing: wanted, applied: result.applied });
+      return { ...(await routingRow(scope, d)), ...result };
+    },
+  };
+
   const deliverability = {
     async check(scope, domain) {
       const d = assertDomain(scope, domain);
@@ -811,6 +1109,14 @@ export function createPanelEmailService(ctx) {
     return webmailUrlFrom(await detectWebmail()).url;
   }
 
+  // Single sign-on (contract §44) is offered only for the Roundcube the panel
+  // published itself (the Keel plugin lives there; an operator-configured
+  // Webmail URL is another installation) and once root switched it on.
+  function ssoAvailable(detected, urlInfo) {
+    const sso = ctx.web?.webmail?.sso;
+    return Boolean(sso?.enabled?.() && detected.flavor === 'roundcube' && urlInfo.published && !urlInfo.configuredUrl && settings.get('panel.webmail.master_enc'));
+  }
+
   async function webmail(scope, query = {}) {
     const detected = await detectWebmail();
     const { url, configuredUrl: configured, alias, published } = webmailUrlFrom(detected);
@@ -821,7 +1127,43 @@ export function createPanelEmailService(ctx) {
       if (d && stmts.mailboxByAddress.get(domain, localPart, scope.accountId)) prefillUser = `${localPart}@${domain}`;
     }
     if (!prefillUser) { const first = stmts.mailboxesOf.get(scope.accountId); prefillUser = first ? `${first.local_part}@${first.domain}` : null; }
-    return { installed: Boolean(detected.installed), flavor: detected.flavor ?? null, version: detected.version ?? null, url, configuredUrl: configured || null, alias, published, prefillUser, hostname: hostname() };
+    return { installed: Boolean(detected.installed), flavor: detected.flavor ?? null, version: detected.version ?? null, url, configuredUrl: configured || null, alias, published, prefillUser, hostname: hostname(), sso: ssoAvailable(detected, { published, configuredUrl: configured }) };
+  }
+
+  // POST /email/webmail/sso: a 60 s single-use token for one of the account's
+  // mailboxes, handed to Roundcube as ?_keel=. Refused while an administrator
+  // acts as the account unless panel.login_as_webmail allows it (the mailbox's
+  // contents are the customer's, not the operator's).
+  async function webmailSso(scope, { mailbox }, req) {
+    assertFeature(scope, 'emailaccts');
+    if (scope.mode === 'acting' && !ctx.web?.webmail?.sso?.loginAs?.()) throw new HttpError(403, 'not_while_impersonating', 'Opening a mailbox is not available while logged in as the account');
+    const { localPart, domain } = splitAddress(mailbox);
+    const owned = domainsOf(scope).find((x) => x.domain === domain) && stmts.mailboxByAddress.get(domain, localPart, scope.accountId);
+    const row = owned ? stmts.mailbox.get(owned.id, scope.accountId) : null;
+    if (!row) throw notFound('Mailbox');
+    if (row.suspended) throw conflict(`The mailbox ${localPart}@${domain} is suspended`);
+    const detected = await detectWebmail();
+    const urlInfo = webmailUrlFrom(detected);
+    if (!ssoAvailable(detected, urlInfo)) throw conflict('Webmail single sign-on is not available on this server');
+    if (!ctx.panelSso) throw conflict('Webmail single sign-on is not available on this server');
+    const address = `${localPart}@${domain}`;
+    const { token, expiresAt } = ctx.panelSso.issue({ kind: 'webmail', userId: scope.actor?.id ?? null, account: scope.username, payload: { mailbox: address } });
+    audit(req, scope, 'panel.email.webmail.sso', { mailbox: address, expiresAt });
+    return { url: `${urlInfo.url}?_keel=${token}`, mailbox: address, expiresAt };
+  }
+
+  // The loopback exchange (GET /api/panel/sso/webmail/:token): the master
+  // credential leaves the server only through this handler, to a process on
+  // this host that holds a fresh token.
+  function registerSso() {
+    ctx.panelSso?.register('webmail', (claim) => {
+      const mailbox = String(claim.payload?.mailbox || '');
+      if (!/^[a-z0-9][a-z0-9._-]{0,63}@[a-z0-9.-]+$/.test(mailbox)) throw notFound('Mailbox');
+      const sso = ctx.web?.webmail?.sso;
+      if (!sso) throw conflict('Webmail single sign-on is not available on this server');
+      const c = sso.credentials();
+      return { user: `${mailbox}*${c.user}`, password: c.password, host: c.host, mailbox };
+    });
   }
 
   // ---------------------------------------------------------------- usage ---
@@ -860,6 +1202,63 @@ export function createPanelEmailService(ctx) {
       log: { from: report.meta?.logFrom ?? null, truncated: Boolean(report.meta?.logTruncated), exists: report.meta?.logExists ?? null },
     };
   }
+
+  // The report rows that belong to this account: a domain of its own on
+  // either side, or a message its mailbox authenticated.
+  function accountRows(scope, report) {
+    const domains = new Set(domainNames(scope));
+    const mailboxSet = new Set(stmts.mailboxesOf.all(scope.accountId).map((r) => `${r.local_part}@${r.domain}`));
+    return report.data.filter((r) => domains.has(domainOf(r.sender)) || domains.has(domainOf(r.recipient)) || mailboxSet.has(String(r.authUser || '').toLowerCase()));
+  }
+
+  // P1-12: the delivery log as a paginated, filterable list. The mail
+  // category's report is post-filtered to the account (it cannot be asked for
+  // "these domains only"), then searched and paged here.
+  const shapeMessage = (r) => ({ id: r.id, key: r.key ?? r.id, arrivedAt: r.arrivedAt, sender: r.sender, recipient: r.recipient, status: r.status, subject: r.subject ?? null, size: r.size ?? null, detail: r.detail ?? null, deliveredAt: r.deliveredAt ?? null, remoteHost: r.remoteHost ?? null });
+  async function usageMessages(scope, { sinceHours = 24, q = '', status = null, page = 1, pageSize = 25 } = {}) {
+    assertFeature(scope, 'emailaccts');
+    const mail = requireMail();
+    const report = await mail.reports.delivery({ hours: sinceHours, page: 1, pageSize: 20_000 });
+    let rows = accountRows(scope, report);
+    if (status) rows = rows.filter((r) => r.status === status);
+    const needle = String(q || '').trim().toLowerCase();
+    if (needle) rows = rows.filter((r) => [r.sender, r.recipient, r.subject, r.detail, r.id].some((v) => String(v || '').toLowerCase().includes(needle)));
+    const total = rows.length;
+    const start = (page - 1) * pageSize;
+    return {
+      data: rows.slice(start, start + pageSize).map(shapeMessage),
+      meta: { page, pageSize, total, hours: sinceHours, q: needle || null, status: status || null, log: { from: report.meta?.logFrom ?? null, truncated: Boolean(report.meta?.logTruncated), exists: report.meta?.logExists ?? null } },
+    };
+  }
+
+  // Folders of one mailbox through doveadm (vmail.mailbox.status); the
+  // per-folder size is what Dovecot indexes (vsize), the quota line is the
+  // same figure the account list shows.
+  const folders = {
+    async list(scope, id) {
+      assertFeature(scope, 'emailaccts');
+      const row = loadMailbox(scope, id);
+      capabilities.require('dovecot', 'Dovecot is not installed on this server, so mailbox folders cannot be read');
+      const address = `${row.local_part}@${row.domain}`;
+      const r = await agent().op('vmail.mailbox.status', { user: address });
+      const data = (r.folders || []).map((f) => ({ name: f.name, messages: f.messages ?? null, bytes: f.bytes ?? null, unseen: f.unseen ?? null, emptiable: EMPTIABLE_FOLDERS.includes(f.name) }));
+      return { data, meta: { mailbox: { id: row.id, address }, usage: await mailboxUsage(scope, row), minOlderThanDays: EXPUNGE_MIN_DAYS } };
+    },
+
+    // Trash and Junk may be emptied outright; any other folder only loses
+    // mail older than olderThanDays (>= EXPUNGE_MIN_DAYS). The agent enforces
+    // the same rule; the message here is the customer-facing one.
+    async empty(scope, id, folder, { olderThanDays = null } = {}, req) {
+      assertFeature(scope, 'emailaccts');
+      const row = loadMailbox(scope, id);
+      capabilities.require('dovecot', 'Dovecot is not installed on this server, so mailbox folders cannot be emptied');
+      if (olderThanDays == null && !EMPTIABLE_FOLDERS.includes(folder)) throw unprocessable(`Only ${EMPTIABLE_FOLDERS.join(' and ')} can be emptied outright`, { olderThanDays: [`Give an age in days (at least ${EXPUNGE_MIN_DAYS}) to delete old messages from "${folder}"`] });
+      const address = `${row.local_part}@${row.domain}`;
+      const r = await agent().op('vmail.mailbox.expunge', { user: address, folder, ...(olderThanDays != null ? { olderThanDays } : {}) }, { req });
+      audit(req, scope, 'panel.email.folder.empty', { mailbox: address, folder, olderThanDays: olderThanDays ?? null, before: r.before ?? null, after: r.after ?? null, removed: r.removed ?? null });
+      return { mailbox: { id: row.id, address }, folder, olderThanDays: olderThanDays ?? null, before: r.before ?? null, after: r.after ?? null, removed: r.removed ?? null };
+    },
+  };
 
   // ------------------------------------------------- releasing a domain ---
 
@@ -1061,7 +1460,7 @@ export function createPanelEmailService(ctx) {
   return {
     LOCAL_PART, SYSTEM_ROOT,
     domainsOf, assertDomain, assertDomainClean, ensureMailDomain, releaseDomain, subscribe,
-    accounts, forwarders, defaultAddress, domainForward, autoresponders, spam, deliverability, dkim, webmail, webmailUrl, usage,
+    accounts, forwarders, defaultAddress, domainForward, autoresponders, filters, spam, routing, deliverability, dkim, webmail, webmailUrl, webmailSso, registerSso, usage, usageMessages, folders,
     ensureVirtualMail, renderCheck, advisorFindings, virtualMailLive, requestVirtualMail, VIRTUAL_MAIL_JOB, spamStatus, passwordPolicy,
   };
 }

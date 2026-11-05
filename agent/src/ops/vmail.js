@@ -1,10 +1,11 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { exec, hasBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
 import { eximBaseLayout } from './exim-layout.js';
-import { assertManaged } from './as-user.js';
+import { assertManaged, accountPath, asUser, failureOf, lstatOrNull } from './as-user.js';
 import { SHADOW_HASH } from './transfer.js';
 
 // Virtual mailboxes for the customer panel. The agent owns a handful of data
@@ -26,6 +27,10 @@ import { SHADOW_HASH } from './transfer.js';
 // expansion. The uid/gid/home behind a mailbox always come from /etc/passwd.
 
 export const DOVECOT_PASSWD_DIR = '/etc/dovecot/whm/passwd';
+// The webmail single sign-on master user (contract §44): one passwd-file line
+// read by the `master = yes` passdb service-configuration renders.
+export const DOVECOT_MASTER_FILE = '/etc/dovecot/whm/master-users';
+export const MASTER_USER = /^[a-z][a-z0-9_-]{0,31}$/;
 export const AUTOREPLY_DB_DIR = '/var/lib/whm/autoreply';
 export const MANAGED = '# Keel (customer panel mail) - managed file, edits are overwritten';
 
@@ -400,6 +405,39 @@ defineOp('vmail.passwd.set', {
   },
 });
 
+// One master user per file: the whole file is rewritten, so a user from an
+// earlier enable never lingers. The scheme prefix keeps the line valid with no
+// default_password_scheme on the master passdb.
+export function renderMasterUsers(user, h) {
+  return `${MANAGED}\n${user}:{SHA512-CRYPT}${h}\n`;
+}
+
+defineOp('vmail.master.write', {
+  description: 'Write the Dovecot master-user passwd-file (/etc/dovecot/whm/master-users, 0640 root:dovecot) with the single user the webmail single sign-on authenticates as',
+  schema: z.object({ user: z.string().regex(MASTER_USER, 'Master user: lowercase letters, digits, "_" or "-"; max 32 chars'), hash }).strict(),
+  timeoutMs: 30_000,
+  run: async ({ user, hash: h }, ctx) => {
+    const { gid } = requireDovecotDir(ctx);
+    const file = ctx.assertAllowedPath(DOVECOT_MASTER_FILE, 'write');
+    const content = renderMasterUsers(user, h);
+    const changed = readText(file) !== content;
+    if (changed) writeAtomic(file, content, { mode: 0o640, gid });
+    return { user, path: file, changed };
+  },
+});
+
+defineOp('vmail.master.remove', {
+  description: 'Delete the Dovecot master-user passwd-file (webmail single sign-on off)',
+  schema: z.object({}).strict(),
+  destructive: true,
+  timeoutMs: 30_000,
+  run: async (_args, ctx) => {
+    requireDovecot();
+    const file = ctx.assertAllowedPath(DOVECOT_MASTER_FILE, 'write');
+    return { path: file, removed: removeFile(file) };
+  },
+});
+
 defineOp('vmail.passwd.rekey', {
   description: 'Re-key every Dovecot passwd-file line still keyed by a bare local part to local@domain (one-time upgrade; already-keyed lines are untouched, dryRun only counts)',
   schema: z.object({ dryRun: z.boolean().default(false) }).strict(),
@@ -649,5 +687,265 @@ defineOp('vmail.render.check', {
     if (out.exim.installed && out.exim.configOk && !out.authHooked) missing.push(`Exim has no "${EXPECTED_EXIM.authenticator}" authenticator, so mailbox users cannot send through SMTP`);
     out.hint = missing.length ? missing.join('; ') : null;
     return out;
+  },
+});
+
+// ---------------------------------------------------------- sieve filters ---
+
+// The account panel's Sieve scripts (Dovecot Pigeonhole). Every file lives in
+// the account's home and is written as the account uid (as-user.js), where
+// service-configuration's Dovecot fragment looks for it: the personal script
+// of a mailbox in ~/mail/<domain>/<local>/sieve/ with the active symlink
+// ~/mail/<domain>/<local>/.dovecot.sieve, the account-wide script
+// (sieve_before) at ~/mail/sieve-global/keel.sieve. The script text is
+// rendered by the panel from structured rules; the agent never interprets it,
+// it only compiles it: a staged copy goes through sievec first and replaces
+// the live script (and is activated) only after a clean compile, so a script
+// that does not compile can never take over from one that did.
+export const SIEVE_SCRIPT = 'keel.sieve';
+export const SIEVE_BINARY = 'keel.svbin';
+export const SIEVE_MAILBOX_DIR = 'sieve';
+export const SIEVE_ACTIVE = '.dovecot.sieve';
+export const SIEVE_GLOBAL_DIR = 'mail/sieve-global';
+export const SIEVE_MAX_BYTES = 256 * 1024;
+
+const sieveScope = z.enum(['mailbox', 'account']);
+const sieveTarget = { username: arg.username, scope: sieveScope, mailbox: emailAddress.optional() };
+const sieveTargetRule = (a) => (a.scope === 'mailbox') === (a.mailbox != null);
+const SIEVE_TARGET_MESSAGE = 'mailbox is required for scope "mailbox" and refused for scope "account"';
+const sieveScript = z.string().max(SIEVE_MAX_BYTES).refine((s) => !s.includes('\0'), 'The script cannot contain NUL bytes');
+
+export function sievePaths(home, scope, mailbox = null) {
+  if (scope === 'account') {
+    const dir = path.join(home, SIEVE_GLOBAL_DIR);
+    return { dir, script: path.join(dir, SIEVE_SCRIPT), binary: path.join(dir, SIEVE_BINARY), maildir: null, active: null, activeTarget: null };
+  }
+  if (!EMAIL_ADDRESS.test(mailbox || '')) throw new OpError('invalid_args', 'A mailbox address is required');
+  const [local, domain] = mailbox.split('@');
+  const maildir = path.join(home, 'mail', domain, local);
+  const dir = path.join(maildir, SIEVE_MAILBOX_DIR);
+  return { dir, script: path.join(dir, SIEVE_SCRIPT), binary: path.join(dir, SIEVE_BINARY), maildir, active: path.join(maildir, SIEVE_ACTIVE), activeTarget: `${SIEVE_MAILBOX_DIR}/${SIEVE_SCRIPT}` };
+}
+
+// sievec reports "<name>: line N: error: …" per problem; doveconf warnings
+// and the final "sievec: Fatal" line are noise.
+export function parseSievecOutput(text) {
+  const errors = [];
+  const warnings = [];
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    if (!line || /^doveconf: /.test(line) || /^sievec: Fatal/.test(line)) continue;
+    const m = line.match(/^(?:[^\n]*?: )?(?:line (\d+): )?(error|warning): (.*)$/);
+    if (!m) continue;
+    (m[2] === 'error' ? errors : warnings).push({ line: m[1] ? Number(m[1]) : null, message: m[3] });
+  }
+  return { errors, warnings };
+}
+
+function requireSievec() {
+  requireDovecot();
+  if (!hasBinary('sievec')) throw new OpError('capability_missing', 'sievec (dovecot-sieve / Pigeonhole) is required to compile mail filters');
+}
+
+// Resolves the script location of a target as the account and checks the
+// mailbox really has a maildir (a symlink or a missing directory is refused so
+// a script can never be planted for a mailbox that does not exist).
+function sieveTargetOf({ username, scope, mailbox }, ctx) {
+  const info = assertManaged(username);
+  const home = path.resolve(info.home);
+  const p = sievePaths(home, scope, mailbox);
+  const { target: dir } = accountPath(username, p.dir, ctx, 'write');
+  if (p.maildir) {
+    const st = lstatOrNull(p.maildir);
+    if (!st) throw new OpError('not_found', `Mailbox ${mailbox} has no mail directory`);
+    if (st.isSymbolicLink() || !st.isDirectory()) throw new OpError('refused', `${p.maildir} is not a directory`);
+  }
+  return { info, home, dir, ...p };
+}
+
+const runAs = (info, bin, argv, opts = {}) => asUser(info, bin, argv, { allowFailure: true, timeoutMs: 60_000, ...opts });
+
+// Writes the script into a staging file beside its final name (0600) and
+// compiles it there; the caller moves or removes the pair.
+async function stageSieve(t, script, { compileTo = null } = {}) {
+  const stage = `${t.script}.whm-${crypto.randomBytes(6).toString('hex')}`;
+  const files = compileTo ? [stage, compileTo(stage)] : [stage];
+  const cleanup = () => runAs(t.info, 'rm', ['-f', '--', ...files], { timeoutMs: 30_000 }).catch(() => {});
+  try {
+    const mk = await runAs(t.info, 'mkdir', ['-p', '-m', '0700', '--', t.dir]);
+    if (mk.code !== 0) throw failureOf(mk, `create ${path.relative(t.home, t.dir)}`);
+    const w = await runAs(t.info, 'dd', [`of=${stage}`, 'bs=1M', 'status=none'], { input: Buffer.from(script, 'utf8'), timeoutMs: 120_000 });
+    if (w.code !== 0) throw failureOf(w, `write ${SIEVE_SCRIPT}`);
+    const c = await runAs(t.info, 'chmod', ['--', '0600', stage], { timeoutMs: 30_000 });
+    if (c.code !== 0) throw failureOf(c, `chmod ${SIEVE_SCRIPT}`);
+    return { stage, files, cleanup };
+  } catch (err) {
+    await cleanup();
+    throw err;
+  }
+}
+
+function sieveCompileError(r) {
+  const { errors, warnings } = parseSievecOutput(`${r.stderr}\n${r.stdout}`);
+  return new OpError('invalid_sieve', errors.length ? `The filter script does not compile: ${errors.map((e) => (e.line ? `line ${e.line}: ${e.message}` : e.message)).join('; ')}` : `sievec failed: ${(r.stderr || r.stdout).trim().split('\n').pop() || `exit ${r.code}`}`, { errors, warnings });
+}
+
+defineOp('vmail.sieve.write', {
+  description: 'Install a Sieve script for a mailbox (personal script + .dovecot.sieve symlink) or account-wide (sieve_before) as the account: staged, compiled with sievec, moved into place and activated only after a clean compile',
+  schema: z.object({ ...sieveTarget, script: sieveScript }).strict().refine(sieveTargetRule, SIEVE_TARGET_MESSAGE),
+  timeoutMs: 180_000,
+  run: async (args, ctx) => {
+    requireSievec();
+    const t = sieveTargetOf(args, ctx);
+    const { stage, files, cleanup } = await stageSieve(t, args.script, { compileTo: (s) => `${s}.svbin` });
+    const [, stageBin] = files;
+    let activated = false;
+    let compiled;
+    try {
+      compiled = await runAs(t.info, 'sievec', [stage, stageBin], { timeoutMs: 120_000 });
+      if (compiled.code !== 0) throw sieveCompileError(compiled);
+      const cb = await runAs(t.info, 'chmod', ['--', '0600', stageBin], { timeoutMs: 30_000 });
+      if (cb.code !== 0) throw failureOf(cb, `chmod ${SIEVE_BINARY}`);
+      const m1 = await runAs(t.info, 'mv', ['-f', '-T', '--', stage, t.script]);
+      if (m1.code !== 0) throw failureOf(m1, `replace ${SIEVE_SCRIPT}`);
+      const m2 = await runAs(t.info, 'mv', ['-f', '-T', '--', stageBin, t.binary]);
+      if (m2.code !== 0) throw failureOf(m2, `replace ${SIEVE_BINARY}`);
+      if (t.active) {
+        // The active symlink is swapped atomically (ln into a sibling, mv -T over the old one).
+        const linkStage = `${t.active}.whm-${crypto.randomBytes(6).toString('hex')}`;
+        const ln = await runAs(t.info, 'ln', ['-s', '-T', '--', t.activeTarget, linkStage]);
+        if (ln.code !== 0) throw failureOf(ln, `link ${SIEVE_ACTIVE}`);
+        const mv = await runAs(t.info, 'mv', ['-f', '-T', '--', linkStage, t.active]);
+        if (mv.code !== 0) { await runAs(t.info, 'rm', ['-f', '--', linkStage]).catch(() => {}); throw failureOf(mv, `activate ${SIEVE_ACTIVE}`); }
+        activated = true;
+      }
+    } finally { await cleanup(); }
+    const { warnings } = parseSievecOutput(`${compiled.stderr}\n${compiled.stdout}`);
+    return { scope: args.scope, mailbox: args.mailbox ?? null, path: t.script, binary: t.binary, active: t.active, activated, bytes: Buffer.byteLength(args.script), warnings };
+  },
+});
+
+defineOp('vmail.sieve.test', {
+  description: 'Compile a Sieve script with sievec -d on a staged copy inside the target directory (nothing is installed or activated); answers ok:false with the compiler errors instead of failing',
+  schema: z.object({ ...sieveTarget, script: sieveScript }).strict().refine(sieveTargetRule, SIEVE_TARGET_MESSAGE),
+  timeoutMs: 120_000,
+  run: async (args, ctx) => {
+    requireSievec();
+    const t = sieveTargetOf(args, ctx);
+    const { stage, cleanup } = await stageSieve(t, args.script);
+    try {
+      const r = await runAs(t.info, 'sievec', ['-d', stage], { timeoutMs: 120_000 });
+      const parsed = parseSievecOutput(`${r.stderr}\n${r.stdout}`);
+      if (r.code !== 0 && !parsed.errors.length) throw sieveCompileError(r);
+      return { ok: r.code === 0, errors: parsed.errors, warnings: parsed.warnings };
+    } finally { await cleanup(); }
+  },
+});
+
+defineOp('vmail.sieve.remove', {
+  description: 'Remove the panel-managed Sieve script (and its compiled binary) of a mailbox or the account; the .dovecot.sieve symlink is removed only when it points at that script',
+  schema: z.object(sieveTarget).strict().refine(sieveTargetRule, SIEVE_TARGET_MESSAGE),
+  destructive: true,
+  timeoutMs: 60_000,
+  run: async (args, ctx) => {
+    const t = sieveTargetOf(args, ctx);
+    let deactivated = false;
+    if (t.active) {
+      const st = lstatOrNull(t.active);
+      if (st?.isSymbolicLink() && fs.readlinkSync(t.active) === t.activeTarget) {
+        const r = await runAs(t.info, 'rm', ['-f', '--', t.active]);
+        if (r.code !== 0) throw failureOf(r, `remove ${SIEVE_ACTIVE}`);
+        deactivated = true;
+      }
+    }
+    const existed = Boolean(lstatOrNull(t.script));
+    const r = await runAs(t.info, 'rm', ['-f', '--', t.script, t.binary]);
+    if (r.code !== 0) throw failureOf(r, `remove ${SIEVE_SCRIPT}`);
+    return { scope: args.scope, mailbox: args.mailbox ?? null, path: t.script, removed: existed, deactivated };
+  },
+});
+
+// --- Mailbox folders (P1-12): doveadm as root, keyed by the Dovecot user -----
+
+// A folder name as Dovecot lists it: no control characters, quotes, backslashes
+// or wildcard characters, no leading, trailing or doubled dots, max 200.
+export const FOLDER = /^(?!\.)(?!.*\.\.)(?!.*\.$)[^\0-\x1f\x7f"\*%]{1,200}$/;
+export const EXPUNGE_MIN_DAYS = 7;
+export const EXPUNGE_MAX_DAYS = 3650;
+export const EMPTIABLE_FOLDERS = ['Trash', 'Junk'];
+const folderName = z.string().regex(FOLDER, 'Folder: no control characters, quotes, backslashes, wildcards or leading, trailing or doubled dots; max 200 chars');
+
+// `doveadm -f tab mailbox status` prints a header line (mailbox, then the
+// requested fields) followed by one tab-separated row per folder; the plain
+// format prints "name field=value …" rows. Either is parsed.
+export function parseDoveadmMailboxStatus(stdout) {
+  const lines = String(stdout || '').split('\n').map((l) => l.replace(/\r$/, '')).filter((l) => l.trim() !== '');
+  if (!lines.length) return [];
+  const toNum = (v) => (v == null || v === '' ? null : Number.isFinite(Number(v)) ? Number(v) : null);
+  if (/^mailbox\t/i.test(lines[0])) {
+    const header = lines[0].split('\t').map((h) => h.trim().toLowerCase());
+    return lines.slice(1).map((line) => {
+      const cells = line.split('\t');
+      const row = Object.fromEntries(header.map((h, i) => [h, cells[i] ?? '']));
+      return { name: row.mailbox, messages: toNum(row.messages), bytes: toNum(row.vsize), unseen: toNum(row.unseen) };
+    }).filter((f) => f.name);
+  }
+  return lines.map((line) => {
+    const tokens = line.trim().split(/\s+/);
+    const fields = {};
+    const nameParts = [];
+    for (const t of tokens) {
+      const m = t.match(/^(messages|vsize|unseen|recent)=(\d+)$/);
+      if (m) fields[m[1]] = Number(m[2]); else if (!Object.keys(fields).length) nameParts.push(t);
+    }
+    return { name: nameParts.join(' '), messages: fields.messages ?? null, bytes: fields.vsize ?? null, unseen: fields.unseen ?? null };
+  }).filter((f) => f.name);
+}
+
+function doveadmFailure(r, what, user) {
+  const last = (r.stderr || r.stdout).trim().split('\n').pop() || '';
+  if (/doesn't exist|not found|unknown user|no such user|user .* not exist/i.test(last)) return new OpError('not_found', `Mailbox ${user} is unknown to Dovecot: ${last}`);
+  return new OpError('command_failed', `${what} failed: ${last}`);
+}
+
+defineOp('vmail.mailbox.status', {
+  description: 'Folders of a mailbox with their message count and size (doveadm mailbox status)',
+  schema: z.object({ user: emailAddress }).strict(),
+  timeoutMs: 60_000,
+  run: async ({ user }) => {
+    if (!hasBinary('doveadm')) throw new OpError('capability_missing', 'doveadm (Dovecot) is required to read mailbox folders');
+    const r = await exec('doveadm', ['-f', 'tab', 'mailbox', 'status', '-u', user, 'messages vsize unseen', '*'], { allowFailure: true, timeoutMs: 60_000 });
+    if (r.code !== 0) throw doveadmFailure(r, 'doveadm mailbox status', user);
+    const folders = parseDoveadmMailboxStatus(r.stdout).sort((a, b) => (a.name === 'INBOX' ? -1 : b.name === 'INBOX' ? 1 : a.name.localeCompare(b.name)));
+    return { user, folders };
+  },
+});
+
+// Trash and Junk may be emptied outright; any other folder only loses mail
+// saved more than olderThanDays days ago (at least EXPUNGE_MIN_DAYS), so the
+// op can never wipe a folder a customer still reads.
+const expungeSchema = z.object({
+  user: emailAddress,
+  folder: folderName,
+  olderThanDays: z.number().int().min(EXPUNGE_MIN_DAYS).max(EXPUNGE_MAX_DAYS).optional(),
+}).strict().refine((a) => a.olderThanDays != null || EMPTIABLE_FOLDERS.includes(a.folder), `Only ${EMPTIABLE_FOLDERS.join(' and ')} can be emptied outright; other folders need olderThanDays (>= ${EXPUNGE_MIN_DAYS})`);
+
+defineOp('vmail.mailbox.expunge', {
+  description: 'Delete the messages of one folder of a mailbox (doveadm expunge): Trash/Junk entirely, any folder older than N days',
+  schema: expungeSchema,
+  destructive: true,
+  timeoutMs: 300_000,
+  run: async ({ user, folder, olderThanDays }) => {
+    if (!hasBinary('doveadm')) throw new OpError('capability_missing', 'doveadm (Dovecot) is required to empty mailbox folders');
+    const before = await exec('doveadm', ['-f', 'tab', 'mailbox', 'status', '-u', user, 'messages', folder], { allowFailure: true, timeoutMs: 60_000 });
+    if (before.code !== 0) throw doveadmFailure(before, 'doveadm mailbox status', user);
+    const found = parseDoveadmMailboxStatus(before.stdout).find((f) => f.name === folder);
+    if (!found) throw new OpError('not_found', `Folder ${folder} does not exist in ${user}`);
+    const query = ['mailbox', folder, ...(olderThanDays != null ? ['savedbefore', `${olderThanDays}d`] : []), 'all'];
+    const r = await exec('doveadm', ['expunge', '-u', user, ...query], { allowFailure: true, timeoutMs: 300_000 });
+    if (r.code !== 0) throw doveadmFailure(r, 'doveadm expunge', user);
+    const after = await exec('doveadm', ['-f', 'tab', 'mailbox', 'status', '-u', user, 'messages', folder], { allowFailure: true, timeoutMs: 60_000 });
+    const left = after.code === 0 ? parseDoveadmMailboxStatus(after.stdout).find((f) => f.name === folder)?.messages ?? null : null;
+    return { user, folder, olderThanDays: olderThanDays ?? null, before: found.messages, after: left, removed: found.messages != null && left != null ? Math.max(0, found.messages - left) : null };
   },
 });

@@ -907,6 +907,7 @@ defineOp('db.phpmyadmin.detect', {
       web.push(classifyPhpMyAdminWebConf(f, text));
     }
     const published = phpMyAdminPublished();
+    const signonText = readText(PMA_SIGNON_CONF);
     const globalEnabled = web.find((w) => w.enabled && w.global) || null;
     const active = (published?.managed && published.alias ? { urlPath: published.alias } : null) || web.find((w) => w.enabled && w.urlPath) || null;
     return {
@@ -916,8 +917,95 @@ defineOp('db.phpmyadmin.detect', {
       dbConfigured: exists('/etc/phpmyadmin/config-db.php'),
       globalAlias: { enabled: Boolean(globalEnabled), path: globalEnabled?.path ?? (exists(PMA_GLOBAL_CONF.available) ? PMA_GLOBAL_CONF.available : null), urlPath: globalEnabled?.urlPath ?? null, a2disconf: hasBinary('a2disconf') && exists(PMA_GLOBAL_CONF.enabled) },
       published,
+      signon: { path: PMA_SIGNON_CONF, exists: signonText != null, managed: Boolean(signonText && signonText.includes(PMA_SIGNON_MARK)), confDir: exists(path.dirname(PMA_SIGNON_CONF)) },
       packageHint: hasBinary('apt-get') ? 'apt-get install phpmyadmin' : hasBinary('dnf') ? 'dnf install phpMyAdmin' : hasBinary('yum') ? 'yum install phpMyAdmin' : null,
     };
+  },
+});
+
+// Debian's config.inc.php includes conf.d/*.php after its own server block, so
+// a drop-in can turn server 1 into a signon server and keep the cookie login
+// as server 2 (?server=2) for customers who prefer a database user.
+export const PMA_SIGNON_CONF = '/etc/phpmyadmin/conf.d/keel-signon.php';
+const PMA_SIGNON_MARK = '// Managed by Keel: phpMyAdmin single sign-on from the account panel.';
+const phpSingle = (s) => `'${String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+const urlPath = z.string().max(256).regex(/^\/(?!(?:.*\/)?\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*\/?$/, 'URL path such as /keel/pma-signon.php');
+// The signon script's exchange address: the panel's own loopback listener, nothing else.
+export const PMA_SSO_ENDPOINT_RE = /^https?:\/\/127\.0\.0\.1:\d{1,5}\/api\/panel\/sso\/phpmyadmin\/$/;
+
+// The drop-in is read by phpMyAdmin and, for the endpoint constant alone, by
+// the signon script (which is what makes the panel's listener address reach
+// PHP-FPM: a pool environment is not something the panel writes).
+export function renderPhpMyAdminSignonConf({ signonUrl, logoutUrl, sessionName, verbose, endpoint }) {
+  return [
+    '<?php',
+    PMA_SIGNON_MARK,
+    '// Rendered by the agent from a structured spec; manual changes are overwritten.',
+    ...(endpoint ? [`defined('KEEL_SSO_ENDPOINT') || define('KEEL_SSO_ENDPOINT', ${phpSingle(endpoint)});`] : []),
+    "if (empty($cfg['Servers'][1]) || !is_array($cfg['Servers'][1])) {",
+    "    $cfg['Servers'][1] = ['host' => 'localhost'];",
+    '}',
+    "$cfg['Servers'][2] = $cfg['Servers'][1];",
+    "$cfg['Servers'][2]['auth_type'] = 'cookie';",
+    "$cfg['Servers'][2]['verbose'] = 'Sign in with a database user';",
+    "$cfg['Servers'][1]['auth_type'] = 'signon';",
+    `$cfg['Servers'][1]['SignonSession'] = ${phpSingle(sessionName)};`,
+    `$cfg['Servers'][1]['SignonURL'] = ${phpSingle(signonUrl)};`,
+    `$cfg['Servers'][1]['LogoutURL'] = ${phpSingle(logoutUrl)};`,
+    `$cfg['Servers'][1]['verbose'] = ${phpSingle(verbose)};`,
+    "$cfg['Servers'][1]['SignonCookieParams'] = ['path' => '/', 'httponly' => true, 'samesite' => 'Lax'];",
+    "$cfg['ServerDefault'] = 1;",
+    '',
+  ].join('\n');
+}
+
+function requirePhpMyAdminConfDir(ctx) {
+  const file = ctx.assertAllowedPath(PMA_SIGNON_CONF, 'write');
+  if (!exists(path.dirname(file))) throw new OpError('not_found', `${path.dirname(file)} does not exist; phpMyAdmin is not installed from the distribution`);
+  return file;
+}
+
+defineOp('db.phpmyadmin.signon.write', {
+  description: "Write /etc/phpmyadmin/conf.d/keel-signon.php: server 1 becomes a signon server (SignonURL under the hostname site), server 2 keeps the cookie login; validated with php -l before it replaces the previous drop-in",
+  schema: z.object({
+    signonUrl: urlPath, logoutUrl: urlPath,
+    sessionName: z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,63}$/, 'PHP session name: letters, digits or "_"'),
+    verbose: z.string().regex(/^[A-Za-z0-9 ._()-]{1,64}$/).default('Account panel'),
+    endpoint: z.string().max(80).regex(PMA_SSO_ENDPOINT_RE, 'https?://127.0.0.1:<port>/api/panel/sso/phpmyadmin/').optional(),
+  }).strict(),
+  run: async (a, ctx) => {
+    const file = requirePhpMyAdminConfDir(ctx);
+    const content = renderPhpMyAdminSignonConf(a);
+    const previous = readText(file);
+    if (previous != null && !previous.includes(PMA_SIGNON_MARK)) throw new OpError('refused', `${file} was not written by the panel; refusing to overwrite it`);
+    if (previous === content) return { path: file, changed: false, validated: null };
+    let validated = null;
+    if (hasBinary('php')) {
+      const tmp = `${file}.whm-tmp-${process.pid}`;
+      fs.writeFileSync(tmp, content, { mode: 0o644 });
+      try {
+        const r = await exec('php', ['-l', tmp], { allowFailure: true, timeoutMs: 30_000 });
+        if (r.code !== 0) throw new OpError('config_invalid', `php -l rejected the signon drop-in: ${`${r.stdout}\n${r.stderr}`.trim().split('\n').pop()}`);
+        validated = true;
+      } finally { try { fs.unlinkSync(tmp); } catch { /* already gone */ } }
+    }
+    writeAtomic(file, content, 0o644);
+    try { fs.unlinkSync(`${file}.whm-bak`); } catch { /* no backup to drop */ }
+    return { path: file, changed: true, validated };
+  },
+});
+
+defineOp('db.phpmyadmin.signon.remove', {
+  description: 'Remove the Keel signon drop-in from /etc/phpmyadmin/conf.d so phpMyAdmin falls back to its cookie login',
+  destructive: true,
+  schema: z.object({}).strict(),
+  run: async (_args, ctx) => {
+    const file = ctx.assertAllowedPath(PMA_SIGNON_CONF, 'write');
+    const text = readText(file);
+    if (text == null) return { path: file, removed: false };
+    if (!text.includes(PMA_SIGNON_MARK)) throw new OpError('refused', `${file} was not written by the panel; refusing to delete it`);
+    fs.unlinkSync(file);
+    return { path: file, removed: true };
   },
 });
 

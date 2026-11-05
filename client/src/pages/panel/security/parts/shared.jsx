@@ -1,6 +1,8 @@
 import { AlertTriangle, UserX, ShieldAlert } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { ErrorBanner } from '../../../../components/Form.jsx';
+import { useT } from '../../../../i18n/useT.js';
+import { fill } from '../../../../i18n/fill.js';
 import { PANEL_PATHS } from '../../../../panel/nav.js';
 
 export function isCapabilityError(error) {
@@ -18,32 +20,34 @@ export function isImpersonating(error) {
 // Security settings belong to the person who owns the account: while an
 // administrator is logged in as the account every write answers 403
 // not_while_impersonating, and the page says so before they try.
-export function ImpersonationNotice({ actingAs, what = 'Security settings' }) {
+export function ImpersonationNotice({ actingAs, what }) {
+  const { t } = useT();
   if (!actingAs) return null;
   return (
     <div className="banner banner-info" role="status">
       <UserX size={18} />
       <div>
-        <strong>Read-only while logged in as {actingAs.account}</strong>
-        <p>{what} can only be changed by the account user. Everything here is shown for reference.</p>
+        <strong>{fill(t('panel.security.readonly_title', 'Read-only while logged in as {account}'), { account: actingAs.account })}</strong>
+        <p>{fill(t('panel.security.readonly_text', '{what} can only be changed by the account user. Everything here is shown for reference.'), { what: what ?? t('panel.security.readonly_what', 'Security settings') })}</p>
       </div>
     </div>
   );
 }
 
 export function RequestError({ error, onRetry }) {
+  const { t } = useT();
   if (!error || isCapabilityError(error) || isFeatureDisabled(error)) return null;
   if (isImpersonating(error)) {
-    return <div className="banner banner-warning" role="alert"><UserX size={18} /><div><strong>Not available while logged in as the account</strong><p>{error.message}</p></div></div>;
+    return <div className="banner banner-warning" role="alert"><UserX size={18} /><div><strong>{t('panel.security.impersonating_title', 'Not available while logged in as the account')}</strong><p>{error.message}</p></div></div>;
   }
   if (error.code === 'two_factor_required') {
-    return <div className="banner banner-warning" role="alert"><ShieldAlert size={18} /><div><strong>Two-factor authentication needed first</strong><p>{error.message}</p><p className="muted"><Link to={PANEL_PATHS.twoFactor}>Set up two-factor authentication</Link>, then come back here.</p></div></div>;
+    return <div className="banner banner-warning" role="alert"><ShieldAlert size={18} /><div><strong>{t('panel.security.tfa_needed_title', 'Two-factor authentication needed first')}</strong><p>{error.message}</p><p className="muted"><Link to={PANEL_PATHS.twoFactor}>{t('panel.security.tfa_set_up', 'Set up two-factor authentication')}</Link>{t('panel.security.tfa_then_return', ', then come back here.')}</p></div></div>;
   }
   if (error.code === 'session_required') {
-    return <div className="banner banner-warning" role="alert"><AlertTriangle size={18} /><div><strong>Sign in to the panel for this</strong><p>{error.message}</p></div></div>;
+    return <div className="banner banner-warning" role="alert"><AlertTriangle size={18} /><div><strong>{t('panel.security.session_required_title', 'Sign in to the panel for this')}</strong><p>{error.message}</p></div></div>;
   }
   if (error.code === 'limit_reached' || (error.status === 409 && /at most/i.test(error.message || ''))) {
-    return <div className="banner banner-warning" role="alert"><AlertTriangle size={18} /><div><strong>Limit reached</strong><p>{error.message}</p><p className="muted">Remove one you no longer use.</p></div></div>;
+    return <div className="banner banner-warning" role="alert"><AlertTriangle size={18} /><div><strong>{t('panel.security.limit_title', 'Limit reached')}</strong><p>{error.message}</p><p className="muted">{t('panel.security.limit_help', 'Remove one you no longer use.')}</p></div></div>;
   }
   return <ErrorBanner error={error} onRetry={onRetry} />;
 }
@@ -68,8 +72,13 @@ export const TOKEN_SCOPES = [
   ['panel:cron', 'Cron', 'Scheduled commands'],
 ];
 
-export function scopeLabel(scope) {
-  return TOKEN_SCOPES.find(([s]) => s === scope)?.[1] || scope;
+// Catalogue keys for a scope: panel.security.scope.<name> / panel.security.scope.<name>_help.
+export const scopeKey = (scope) => `panel.security.scope.${scope.replace(/^panel:/, '')}`;
+
+export function scopeLabel(scope, t) {
+  const row = TOKEN_SCOPES.find(([s]) => s === scope);
+  if (!row) return scope;
+  return t ? t(scopeKey(scope), row[1]) : row[1];
 }
 
 export function expiryState(expiresAt, now = Date.now()) {

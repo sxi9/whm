@@ -383,3 +383,89 @@ describe('pure parsers and renderers', () => {
     expect(parseSpamdDefaults('SPAMDOPTIONS="-d -c -m5"').options).toBe('-d -c -m5');
   });
 });
+
+const { tcpProbe, smarthostLayout, renderSmarthostRouter, renderSmarthostTransport, renderSmarthostAuth, renderSmarthostPasswd, mergeSmarthostPasswd, SMARTHOST } = await import('../src/ops/mail.js');
+
+describe('outbound relay and port-25 probe (Exim Configuration Manager, A3)', () => {
+  it('mail.outbound.probe only takes a hostname or IP and a port; nothing else reaches the socket', async () => {
+    for (const host of ['a;b', '../x', '-x', 'mx.example.com/x', 'MX.EXAMPLE.COM', '', 'mx example.com']) expect((await opError(runOp('mail.outbound.probe', { host }, ctx))).code, host).toBe('invalid_args');
+    for (const port of [0, 70000, -1, '25']) expect((await opError(runOp('mail.outbound.probe', { host: 'mx.example.com', port }, ctx))).code, String(port)).toBe('invalid_args');
+    expect((await opError(runOp('mail.outbound.probe', { host: 'mx.example.com', timeoutMs: 60_000 }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('mail.outbound.probe', { host: 'mx.example.com', payload: 'EHLO' }, ctx))).code).toBe('invalid_args');
+  });
+
+  it('tcpProbe connects without sending, reports a refused port and times out on a black hole', async () => {
+    const net = await import('node:net');
+    let received = 0;
+    const server = net.createServer((s) => { s.on('data', () => { received++; }); });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    try {
+      const ok = await runOp('mail.outbound.probe', { host: '127.0.0.1', port }, ctx);
+      expect(ok).toMatchObject({ host: '127.0.0.1', port, ok: true, error: null });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(received).toBe(0);
+    } finally { server.close(); }
+    const refused = await tcpProbe('127.0.0.1', port, 1000);
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toMatch(/ECONNREFUSED|ECONNRESET/);
+    const dark = await tcpProbe('192.0.2.1', 25, 150);
+    expect(dark.ok).toBe(false);
+    expect(['timeout', 'ENETUNREACH', 'EHOSTUNREACH', 'EACCES']).toContain(dark.error);
+  }, 10_000);
+
+  it('places the relay router per layout: conf.d fragment on split Debian, a whm file otherwise; only non-Debian layouts get their own transport, authenticators and password file', () => {
+    const debianUnsplit = smarthostLayout({ flavor: 'debian', splitConfig: false, whmDir: '/etc/exim4/whm', mainConf: '/etc/exim4/exim4.conf.template' });
+    expect(debianUnsplit).toMatchObject({ routerFile: '/etc/exim4/whm/router_whm_smarthost.conf', routerHookable: false, transportFile: null, authFile: null, passwdFile: '/etc/exim4/passwd.client', passwdBlock: true, transportName: 'remote_smtp_smarthost' });
+    const debianSplit = smarthostLayout({ flavor: 'debian', splitConfig: true, whmDir: '/etc/exim4/whm', mainConf: null });
+    expect(debianSplit).toMatchObject({ routerFile: '/etc/exim4/conf.d/router/150_whm_smarthost', routerHookable: true, passwdFile: '/etc/exim4/passwd.client' });
+    const rhel = smarthostLayout({ flavor: 'rhel', splitConfig: false, whmDir: '/etc/exim/whm', mainConf: '/etc/exim/exim.conf' });
+    expect(rhel).toMatchObject({ routerFile: '/etc/exim/whm/router_whm_smarthost.conf', transportFile: '/etc/exim/whm/transport_whm_smarthost.conf', authFile: '/etc/exim/whm/auth_whm_smarthost.conf', passwdFile: '/etc/exim/whm/smarthost.passwd', passwdBlock: false, transportName: SMARTHOST.transport });
+  });
+
+  it('renders a manualroute router before dnslookup that spares local and backup-MX domains, plus the RHEL transport/authenticators', () => {
+    const sl = smarthostLayout({ flavor: 'debian', splitConfig: false, whmDir: '/etc/exim4/whm', mainConf: '/etc/exim4/exim4.conf.template' });
+    const router = renderSmarthostRouter({ host: 'smtp.relay.example', port: 587 }, sl);
+    expect(router).toContain('whm_smarthost:\n  driver = manualroute\n  domains = ! +local_domains : ! +relay_to_domains\n  transport = remote_smtp_smarthost\n  route_list = * smtp.relay.example::587 byname\n  host_find_failed = defer\n');
+    expect(router).toContain('  no_more\n');
+    const rhel = smarthostLayout({ flavor: 'rhel', splitConfig: false, whmDir: '/etc/exim/whm', mainConf: '/etc/exim/exim.conf' });
+    expect(renderSmarthostRouter({ host: 'smtp.relay.example', port: 25 }, rhel)).toContain('  domains = ! +local_domains\n  transport = whm_smarthost_smtp\n  route_list = * smtp.relay.example::25 byname');
+    expect(renderSmarthostTransport({ requireTls: true, auth: true })).toBe('# Managed by Keel (Exim Configuration Manager: outbound relay transport). .include_if_exists this file after "begin transports".\nwhm_smarthost_smtp:\n  driver = smtp\n  multi_domain\n  hosts_require_tls = *\n  hosts_require_auth = *\n');
+    expect(renderSmarthostTransport({ requireTls: false, auth: false })).not.toMatch(/hosts_require/);
+    const auth = renderSmarthostAuth('/etc/exim/whm/smarthost.passwd');
+    expect(auth).toContain('whm_smarthost_plain:\n  driver = plaintext\n  public_name = PLAIN\n');
+    expect(auth).toContain('whm_smarthost_login:\n  driver = plaintext\n  public_name = LOGIN\n');
+    // The lookup is keyed by the relay host, carets are doubled (NUL separator), the password is everything after "login:".
+    expect(auth).toContain('${sg{${lookup{$host}nwildlsearch{/etc/exim/whm/smarthost.passwd}{$value}fail}}{\\\\N[\\\\^]\\\\N}{^^}}');
+    expect(auth).toContain('{\\\\N([^:]+:)(.*)\\\\N}{\\\\$2}}');
+    expect(renderSmarthostPasswd({ host: 'smtp.relay.example', user: 'apikey', password: 'p^w=d' })).toBe('smtp.relay.example:apikey:p^w=d\n');
+  });
+
+  it('keeps Debian\'s passwd.client comments around one managed block: added, replaced in place, removed', () => {
+    const distro = '# password file used when the local exim is authenticating to a remote\n# host as a client.\n### target.mail.server.example:login:password\n';
+    const added = mergeSmarthostPasswd(distro, 'smtp.relay.example:user:secret\n');
+    expect(added).toBe(`${distro}# BEGIN Keel (Exim Configuration Manager: outbound relay) - managed block, edits inside are overwritten\nsmtp.relay.example:user:secret\n# END Keel (Exim Configuration Manager: outbound relay)\n`);
+    const replaced = mergeSmarthostPasswd(`${added}other.host:x:y\n`, 'smtp.relay.example:user2:secret2\n');
+    expect(replaced).toContain('smtp.relay.example:user2:secret2\n');
+    expect(replaced).not.toContain('user:secret\n');
+    expect(replaced.endsWith('other.host:x:y\n')).toBe(true);
+    expect(replaced.match(/BEGIN Keel/g)).toHaveLength(1);
+    expect(mergeSmarthostPasswd(replaced, null)).toBe(`${distro}other.host:x:y\n`);
+    expect(mergeSmarthostPasswd(null, null)).toBe('');
+    expect(mergeSmarthostPasswd(null, 'h:u:p\n')).toMatch(/^# BEGIN Keel/);
+  });
+
+  it('mail.smarthost.write validates host, port and the login/password pair before anything runs', async () => {
+    exec.mockClear();
+    const bad = [
+      { host: 'smtp.relay.example; rm -rf /' }, { host: 'SMTP.Relay.Example' }, { host: 'smtp.relay.example', port: 0 }, { host: 'smtp.relay.example', port: '587' },
+      { host: 'smtp.relay.example', user: 'me' }, { host: 'smtp.relay.example', password: 'x' }, { host: 'smtp.relay.example', user: 'a:b', password: 'x' },
+      { host: 'smtp.relay.example', user: 'me', password: 'line\nbreak' }, { host: 'smtp.relay.example', user: 'me', password: '' }, { host: 'smtp.relay.example', extra: true },
+      // Debian's passwd.client and ${extract{2}{:}…} truncate a password at ":".
+      { host: 'smtp.relay.example', user: 'me', password: 'p:w' },
+    ];
+    for (const args of bad) expect((await opError(runOp('mail.smarthost.write', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    expect((await opError(runOp('mail.smarthost.remove', { force: true }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+});

@@ -1245,6 +1245,17 @@ export function createSecurityCenterService(ctx) {
         else add({ id: 'phpmyadmin.global_alias', grade: 'info', title: 'phpMyAdmin is installed but not published', detail: 'No web alias serves it. Publish it under the server hostname so customers get a trusted address.', fix });
       });
 
+      // Clouds that block outbound port 25 leave every message queued unless a relay is set (contract §46).
+      await probe('mail.outbound', 'outbound mail path', async () => {
+        if (!capabilities.has('exim') || typeof ctx.web?.exim?.outboundProbe !== 'function') return;
+        const r = await ctx.web.exim.outboundProbe();
+        if (!r.installed) return;
+        const fix = { label: 'Exim Configuration Manager', path: '/service-configuration/exim-configuration-manager' };
+        if (r.smarthost) add({ id: 'mail.outbound.port25', grade: 'ok', title: `Outbound mail is relayed through ${r.smarthost.host}:${r.smarthost.port}` });
+        else if (r.port25?.ok === false) add({ id: 'mail.outbound.port25', grade: 'info', title: 'Outbound port 25 appears to be blocked', detail: `This host could not open a connection to ${r.port25.host}:25 (${r.port25.error || 'no answer'}) and no outbound relay is configured, so mail to the internet stays in the queue. Ask the provider to lift the restriction (EC2: the port 25 throttle removal request) or set an outbound relay with authentication under Exim Configuration Manager.`, fix });
+        else if (r.port25?.ok) add({ id: 'mail.outbound.port25', grade: 'ok', title: `Outbound SMTP reaches the internet (${r.port25.host}:25 answered)` });
+      });
+
       await probe('filesystem', 'filesystem permissions', async () => {
         const fsScan = await op('sec.scan.filesystem', { root: settings.get('basic.home_root') || '/home', limit: 25 });
         for (const f of fsScan.sensitive) if (!f.ok) add({ id: `fs.${f.path}`, grade: 'critical', title: `${f.path} is too permissive (${f.mode})`, detail: `Expected at most ${f.maxMode}.` });
@@ -1268,6 +1279,12 @@ export function createSecurityCenterService(ctx) {
         const p = policy();
         const stored = [p.verifiedIpLogin && 'verified-IP login', p.require2faForRoot && '2FA for root', p.require2faForResellers && '2FA for resellers', p.apiTokensRequire2fa && '2FA for API tokens', p.sessionTimeoutMinutes > 0 && 'session timeout', p.disallowConcurrentSessions && 'single session', p.passwordMaxAgeDays > 0 && 'password age', settings.get('security.questions.enabled') && 'security questions'].filter(Boolean);
         if (stored.length) add({ id: 'policy.unenforced', grade: 'warning', title: `${stored.length} login polic${stored.length === 1 ? 'y is' : 'ies are'} stored but not enforced yet`, detail: `${stored.join(', ')}: the authentication layer does not read these settings yet, so they provide no protection today.`, fix: { label: 'Configure Security Policies', path: '/security-center/configure-security-policies' } });
+        // The account panel's own 2FA policy (ctx.panel.assertTwoFactor, P1-9).
+        const panel = ctx.panel?.settings?.get?.();
+        if (panel?.enabled) {
+          const n = panel.usersWithoutTotp ?? 0;
+          add({ id: 'panel.2fa.policy', grade: panel.require2faForUsers ? 'ok' : 'info', title: `Account panel users: two-factor ${panel.require2faForUsers ? 'required' : 'optional'} (${n} linked user${n === 1 ? '' : 's'} without an authenticator)`, detail: panel.require2faForUsers ? `${n === 0 ? 'Every' : 'Each remaining'} account login must enrol an authenticator before using anything but the enrolment page.` : 'Account logins may sign in with a password alone. Requiring the second factor forces enrolment at their next login (Panel › Customization › Account panel).', fix: { label: 'Account panel settings', path: '/cpanel/customization' } });
+        }
       });
 
       await probe('apache', 'web server hardening', async () => {

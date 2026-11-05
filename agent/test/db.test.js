@@ -1,6 +1,7 @@
+import fs from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { q, parseBatch, parseGrant, parseMysqlcheck, parseCnf, renderCnf, renderClientCnf, renderRootMyCnf, classifyMysqlError, detectEngine, detectLayout, phpMyAdminVersion, phpMyAdminPublished, classifyPhpMyAdminWebConf, cloneUserStatements, revokeStatements, pickPgUnit, PRIVILEGES, validateServerConfig, classifyProbeOutput, clientWarnings, PMA_DIRS, PMA_CONFIGS } from '../src/ops/db.js';
+import { q, parseBatch, parseGrant, parseMysqlcheck, parseCnf, renderCnf, renderClientCnf, renderRootMyCnf, classifyMysqlError, detectEngine, detectLayout, phpMyAdminVersion, phpMyAdminPublished, classifyPhpMyAdminWebConf, cloneUserStatements, revokeStatements, pickPgUnit, PRIVILEGES, validateServerConfig, classifyProbeOutput, clientWarnings, PMA_DIRS, PMA_CONFIGS, PMA_SIGNON_CONF, renderPhpMyAdminSignonConf } from '../src/ops/db.js';
 
 // exec is spied with the real implementation behind it so tests can prove an op
 // refused before any program ran. This dev box has no mysql client: every op
@@ -25,14 +26,16 @@ async function opError(promise) {
   throw new Error('expected the op to reject');
 }
 
-const MYSQL_OPS = ['db.detect', 'db.version', 'db.ping', 'db.databases.list', 'db.database.create', 'db.database.drop', 'db.users.list', 'db.user.create', 'db.user.drop', 'db.user.set_password', 'db.user.add_host', 'db.grants.list', 'db.grant', 'db.revoke', 'db.processlist', 'db.kill', 'db.check', 'db.root_password.set', 'db.variables.get', 'db.config.read', 'db.config.write', 'db.restart', 'db.unit', 'db.dump', 'db.packages', 'db.upgrade_tables', 'db.phpmyadmin.detect', 'db.phpmyadmin.global_conf.disable'];
+const MYSQL_OPS = ['db.detect', 'db.version', 'db.ping', 'db.databases.list', 'db.database.create', 'db.database.drop', 'db.users.list', 'db.user.create', 'db.user.drop', 'db.user.set_password', 'db.user.add_host', 'db.grants.list', 'db.grant', 'db.revoke', 'db.processlist', 'db.kill', 'db.check', 'db.root_password.set', 'db.variables.get', 'db.config.read', 'db.config.write', 'db.restart', 'db.unit', 'db.dump', 'db.packages', 'db.upgrade_tables', 'db.phpmyadmin.detect', 'db.phpmyadmin.global_conf.disable', 'db.phpmyadmin.signon.write', 'db.phpmyadmin.signon.remove'];
 const PG_OPS = ['pg.version', 'pg.ping', 'pg.databases.list', 'pg.database.create', 'pg.database.drop', 'pg.users.list', 'pg.user.create', 'pg.user.drop', 'pg.user.set_password', 'pg.grants.list', 'pg.grant', 'pg.revoke', 'pg.processlist', 'pg.kill', 'pg.check', 'pg.root_password.set', 'pg.variables.get', 'pg.unit', 'pg.restart'];
 
 describe('db op catalog', () => {
   it('registers the whole family with destructive flags on drops, kills, revokes and restarts', () => {
     for (const name of [...MYSQL_OPS, ...PG_OPS]) expect(catalog.has(name), name).toBe(true);
-    for (const name of ['db.database.drop', 'db.user.drop', 'db.revoke', 'db.kill', 'db.restart', 'pg.database.drop', 'pg.user.drop', 'pg.revoke', 'pg.kill', 'pg.restart', 'db.phpmyadmin.global_conf.disable']) expect(catalog.get(name).destructive, name).toBe(true);
-    for (const name of ['db.database.create', 'db.user.create', 'db.grant', 'db.check', 'db.config.write', 'db.dump']) expect(catalog.get(name).destructive, name).toBe(false);
+    for (const name of ['db.database.drop', 'db.user.drop', 'db.revoke', 'db.kill', 'db.restart', 'pg.database.drop', 'pg.user.drop', 'pg.revoke', 'pg.kill', 'pg.restart', 'db.phpmyadmin.global_conf.disable', 'db.phpmyadmin.signon.remove']) expect(catalog.get(name).destructive, name).toBe(true);
+    for (const name of ['db.database.create', 'db.user.create', 'db.grant', 'db.check', 'db.config.write', 'db.dump', 'db.phpmyadmin.signon.write']) expect(catalog.get(name).destructive, name).toBe(false);
+    // The account-prefix wildcard grant is gone: `bob\_%` also covered every database of an account "bob_shop".
+    expect(catalog.has('db.grant.wildcard')).toBe(false);
   });
 
   it('rejects unknown ops in the family', async () => {
@@ -462,6 +465,55 @@ describe('SQL quoting and parsers', () => {
     expect(phpMyAdminPublished({ readText: (f) => files[f] ?? null })).toEqual({ path: '/etc/apache2/keel-host.d/phpmyadmin.conf', managed: true, alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', php: true });
     expect(phpMyAdminPublished({ readText: () => null })).toBeNull();
     expect(phpMyAdminPublished({ readText: (f) => (f.startsWith('/etc/httpd') ? 'Alias /phpmyadmin /usr/share/phpmyadmin\n' : null) })).toEqual({ path: '/etc/httpd/keel-host.d/phpmyadmin.conf', managed: false, alias: null, root: null, php: null });
+  });
+
+  it('renders the phpMyAdmin signon drop-in: server 1 signon, server 2 the cookie login, single-quoted values escaped', () => {
+    const conf = renderPhpMyAdminSignonConf({ signonUrl: '/keel/pma-signon.php', logoutUrl: '/phpmyadmin/', sessionName: 'KeelPmaSignon', verbose: "Keel's panel" });
+    expect(conf.startsWith('<?php\n// Managed by Keel')).toBe(true);
+    expect(conf).toContain("$cfg['Servers'][2] = $cfg['Servers'][1];\n$cfg['Servers'][2]['auth_type'] = 'cookie';");
+    expect(conf).toContain("$cfg['Servers'][1]['auth_type'] = 'signon';");
+    expect(conf).toContain("$cfg['Servers'][1]['SignonSession'] = 'KeelPmaSignon';");
+    expect(conf).toContain("$cfg['Servers'][1]['SignonURL'] = '/keel/pma-signon.php';");
+    expect(conf).toContain("$cfg['Servers'][1]['LogoutURL'] = '/phpmyadmin/';");
+    expect(conf).toContain("$cfg['Servers'][1]['verbose'] = 'Keel\\'s panel';");
+    expect(conf.indexOf("$cfg['Servers'][2] = ")).toBeLessThan(conf.indexOf("['auth_type'] = 'signon'"));
+    expect(conf).toContain("if (empty($cfg['Servers'][1])");
+    expect(conf).not.toContain('KEEL_SSO_ENDPOINT');
+    expect(PMA_SIGNON_CONF).toBe('/etc/phpmyadmin/conf.d/keel-signon.php');
+    // The signon script reads the panel's loopback listener from the same drop-in.
+    const withEndpoint = renderPhpMyAdminSignonConf({ signonUrl: '/keel/pma-signon.php', logoutUrl: '/phpmyadmin/', sessionName: 'KeelPmaSignon', verbose: 'Account panel', endpoint: 'http://127.0.0.1:2086/api/panel/sso/phpmyadmin/' });
+    expect(withEndpoint).toContain("defined('KEEL_SSO_ENDPOINT') || define('KEEL_SSO_ENDPOINT', 'http://127.0.0.1:2086/api/panel/sso/phpmyadmin/');");
+    expect(withEndpoint.indexOf('KEEL_SSO_ENDPOINT')).toBeLessThan(withEndpoint.indexOf("$cfg['Servers'][2]"));
+    const script = fs.readFileSync(new URL('../../deploy/phpmyadmin/pma-signon.php', import.meta.url), 'utf8');
+    expect(script).toContain("defined('KEEL_SSO_ENDPOINT') ? KEEL_SSO_ENDPOINT");
+    expect(script).toContain("const KEEL_PMA_CONF = '/etc/phpmyadmin/conf.d/keel-signon.php';");
+  });
+
+  // The write op touches /etc/phpmyadmin on a real host, so it is only driven
+  // through paths that stop before the file: bad args, and a context whose
+  // allowed roots exclude the directory.
+  it('db.phpmyadmin.signon.write rejects injection in every field before anything runs', async () => {
+    exec.mockClear();
+    const good = { signonUrl: '/keel/pma-signon.php', logoutUrl: '/phpmyadmin/', sessionName: 'KeelPmaSignon' };
+    for (const args of [
+      { ...good, signonUrl: "/keel/x.php'; system('id'); //" }, { ...good, signonUrl: 'https://evil.example/x.php' }, { ...good, signonUrl: '/keel/../x.php' }, { ...good, signonUrl: 'keel/x.php' },
+      { ...good, logoutUrl: '/phpmyadmin/ index.php' }, { ...good, sessionName: "Keel'; phpinfo(); //" }, { ...good, sessionName: '1abc' }, { ...good, sessionName: 'a'.repeat(65) },
+      { ...good, verbose: "x'y" }, { ...good, verbose: '' }, { ...good, extra: 1 }, { signonUrl: '/keel/pma-signon.php' },
+      { ...good, endpoint: 'https://127.0.0.1:2087/api/panel/sso/webmail/' }, { ...good, endpoint: 'https://panel.example.com:2087/api/panel/sso/phpmyadmin/' },
+      { ...good, endpoint: "https://127.0.0.1:2087/api/panel/sso/phpmyadmin/'); system('id" }, { ...good, endpoint: 'http://127.0.0.1:2086/api/panel/sso/phpmyadmin' }, { ...good, endpoint: '' },
+    ]) {
+      expect((await opError(runOp('db.phpmyadmin.signon.write', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    }
+    const confined = createContext({ allowedRoots: ['/tmp/whm'] });
+    expect((await opError(runOp('db.phpmyadmin.signon.write', good, confined))).code).toBe('path_not_allowed');
+    expect((await opError(runOp('db.phpmyadmin.signon.remove', {}, confined))).code).toBe('path_not_allowed');
+    expect((await opError(runOp('db.phpmyadmin.signon.remove', { path: '/etc/phpmyadmin/conf.d/keel-signon.php' }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('db.phpmyadmin.detect reports the signon drop-in state', async () => {
+    const pma = await runOp('db.phpmyadmin.detect', {}, ctx);
+    expect(pma.signon).toMatchObject({ path: PMA_SIGNON_CONF, exists: expect.any(Boolean), managed: expect.any(Boolean), confDir: expect.any(Boolean) });
   });
 
   it('exports the grantable privilege list used by the panel', () => {

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { z } from 'zod';
 import { exec, hasBinary } from '../exec.js';
@@ -830,6 +831,218 @@ defineOp('mail.outbound.set', {
     const aclContent = readText(layout.aclFile) ?? `${MANAGED} (Email filters). No filters are enabled.\n`;
     const write = await runOp('mail.config.include.write', { name: path.basename(layout.aclFile), content: aclContent, reload: true, hook: true, outbound }, ctx);
     return { ipv4, ipv6, applied: write.outboundHooked !== false, hooked: write.outboundHooked, detail: write.outboundDetail, hint: write.outboundHooked === false ? write.hint : null, file: layout.includeMode === 'debian-macro' ? layout.macroFile : layout.transportFile, reloaded: write.reloaded, unit: write.unit };
+  },
+});
+
+// ------------------------------------------------------- outbound relay ---
+
+// Whether this host can open an SMTP connection to the world at all (EC2 and
+// most clouds block outbound port 25): one TCP connect to a well-known MX,
+// capped at 5 s, nothing is sent and the banner is not read.
+export function tcpProbe(host, port, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    let settled = false;
+    const socket = net.connect({ host, port });
+    const done = (result) => { if (settled) return; settled = true; socket.destroy(); resolve({ host, port, ms: Date.now() - started, ...result }); };
+    socket.setTimeout(timeoutMs, () => done({ ok: false, error: 'timeout' }));
+    socket.once('error', (err) => done({ ok: false, error: err.code || err.message }));
+    socket.once('connect', () => done({ ok: true, error: null }));
+  });
+}
+
+defineOp('mail.outbound.probe', {
+  description: 'TCP connect (no payload, 5 s cap) to a mail exchanger to tell whether outbound SMTP leaves this host',
+  schema: z.object({ host: z.union([arg.hostname, arg.ip]), port: z.number().int().min(1).max(65535).default(25), timeoutMs: z.number().int().min(100).max(5000).default(5000) }).strict(),
+  run: ({ host, port, timeoutMs }) => tcpProbe(host, port, timeoutMs),
+});
+
+// The smarthost router: every domain that is neither local nor a backup-MX
+// relay domain goes to one relay. Debian's template ships the
+// remote_smtp_smarthost transport and the passwd.client client authenticators
+// (plain/login/cram_md5) unconditionally and its dnslookup router precedes the
+// DCconfig_smarthost one, so on Debian only the router is ours and it must be
+// loaded before dnslookup: a conf.d fragment on a split host, a whole file the
+// operator .include_if_exists's once after "begin routers" on an unsplit one.
+// RHEL-style layouts get their own transport, authenticators and password file.
+export const SMARTHOST = { router: 'whm_smarthost', transport: 'whm_smarthost_smtp', auth: ['whm_smarthost_plain', 'whm_smarthost_login'], after: ['dnslookup', 'dnslookup_relay_to_domains', 'lookuphost', 'smarthost'] };
+const SMARTHOST_BLOCK = { begin: '# BEGIN Keel (Exim Configuration Manager: outbound relay) - managed block, edits inside are overwritten', end: '# END Keel (Exim Configuration Manager: outbound relay)' };
+
+export function smarthostLayout(layout) {
+  const debian = layout.flavor === 'debian';
+  const split = debian && layout.splitConfig;
+  return {
+    routerFile: split ? '/etc/exim4/conf.d/router/150_whm_smarthost' : `${layout.whmDir}/router_whm_smarthost.conf`,
+    routerHookable: split,
+    transportFile: debian ? null : `${layout.whmDir}/transport_whm_smarthost.conf`,
+    authFile: debian ? null : `${layout.whmDir}/auth_whm_smarthost.conf`,
+    passwdFile: debian ? '/etc/exim4/passwd.client' : `${layout.whmDir}/smarthost.passwd`,
+    passwdBlock: debian,
+    transportName: debian ? 'remote_smtp_smarthost' : SMARTHOST.transport,
+    debian, mainConf: layout.mainConf,
+  };
+}
+
+export function renderSmarthostRouter({ host, port }, sl) {
+  const domains = sl.debian ? '! +local_domains : ! +relay_to_domains' : '! +local_domains';
+  return [
+    `${MANAGED} (Exim Configuration Manager: outbound relay). Routes every non-local domain to the relay; must be loaded before the dnslookup router.`,
+    `${SMARTHOST.router}:`, '  driver = manualroute', `  domains = ${domains}`, `  transport = ${sl.transportName}`, `  route_list = * ${host}::${port} byname`, '  host_find_failed = defer', '  same_domain_copy_routing = yes', '  no_more', '',
+  ].join('\n');
+}
+
+// Non-Debian only: the transport and the client authenticators reading the
+// panel's password file ("<host>:<login>:<password>", Debian's passwd.client
+// format), with every "^" doubled so a password never splits the PLAIN string.
+export function renderSmarthostTransport({ requireTls, auth }) {
+  const lines = [`${MANAGED} (Exim Configuration Manager: outbound relay transport). .include_if_exists this file after "begin transports".`, `${SMARTHOST.transport}:`, '  driver = smtp', '  multi_domain'];
+  if (requireTls) lines.push('  hosts_require_tls = *');
+  if (auth) lines.push('  hosts_require_auth = *');
+  return `${lines.join('\n')}\n`;
+}
+
+export function renderSmarthostAuth(passwdFile) {
+  const line = `\${sg{\${lookup{$host}nwildlsearch{${passwdFile}}{$value}fail}}{\\\\N[\\\\^]\\\\N}{^^}}`;
+  const pass = `\${sg{${line}}{\\\\N([^:]+:)(.*)\\\\N}{\\\\$2}}`;
+  return [
+    `${MANAGED} (Exim Configuration Manager: outbound relay client authentication). .include_if_exists this file after "begin authenticators".`,
+    `${SMARTHOST.auth[0]}:`, '  driver = plaintext', '  public_name = PLAIN', `  client_send = "<; ^\${extract{1}{:}{${line}}}^${pass}"`, '',
+    `${SMARTHOST.auth[1]}:`, '  driver = plaintext', '  public_name = LOGIN', `  client_send = "<; ; \${extract{1}{:}{${line}}} ; ${pass}"`, '',
+  ].join('\n');
+}
+
+export const renderSmarthostPasswd = ({ host, user, password }) => `${host}:${user}:${password}\n`;
+
+function findSmarthostBlock(text) {
+  const start = text.indexOf(SMARTHOST_BLOCK.begin);
+  const stop = text.indexOf(SMARTHOST_BLOCK.end);
+  return start !== -1 && stop !== -1 && stop >= start ? { start, stop } : null;
+}
+
+// passwd.client is Debian's own file (its comments stay): the credential lives
+// in a managed block there, replaced in place or removed.
+export function mergeSmarthostPasswd(previous, entry) {
+  const text = previous || '';
+  const found = findSmarthostBlock(text);
+  const block = entry == null ? '' : `${SMARTHOST_BLOCK.begin}\n${entry.trimEnd()}\n${SMARTHOST_BLOCK.end}\n`;
+  if (found) return `${text.slice(0, found.start)}${block}${text.slice(found.stop + SMARTHOST_BLOCK.end.length).replace(/^\n/, '')}`;
+  if (!block) return text;
+  return `${text.length && !text.endsWith('\n') ? `${text}\n` : text}${block}`;
+}
+
+function writePrivate(file, content, layout) {
+  writeAtomic(file, content, 0o640);
+  const group = passwdEntry(layout.runUser || '')?.gid ?? groupEntry(layout.runUser || '')?.gid ?? null;
+  if (group != null) fs.chownSync(file, 0, group);
+}
+
+async function eximNames(layout, list) {
+  if (!layout.installed) return null;
+  const { code, stdout } = await exec(layout.bin, ['-bP', list], { allowFailure: true, timeoutMs: 30_000 });
+  if (code !== 0) return null;
+  return stdout.split('\n').map((l) => l.trim()).filter((l) => /^[A-Za-z0-9_]+$/.test(l));
+}
+
+// Is the router in the configuration Exim would load, and before dnslookup?
+async function verifySmarthost(layout, sl) {
+  const names = await eximNames(layout, 'router_list');
+  if (names === null) return { hooked: null, precedes: null };
+  const at = names.indexOf(SMARTHOST.router);
+  if (at === -1) return { hooked: false, precedes: null };
+  return { hooked: true, precedes: !names.some((n, i) => SMARTHOST.after.includes(n) && i < at) };
+}
+
+function smarthostHints(layout, sl, verify, { auth = false } = {}) {
+  const hints = [];
+  const include = (file, where) => `Add ".include_if_exists ${file}" ${where} in ${sl.mainConf || 'the Exim configuration'} once, then run update-exim4.conf (Debian) and reload Exim; the panel never edits that file.`;
+  if (verify.hooked === false && !sl.routerHookable) hints.push(include(sl.routerFile, 'directly after "begin routers" (before the dnslookup router)'));
+  else if (verify.hooked === false) hints.push(`Exim's generated configuration does not contain the relay router ${sl.routerFile}: run update-exim4.conf and reload Exim.`);
+  if (verify.precedes === false) hints.push(`The ${SMARTHOST.router} router is loaded after the dnslookup router; move ".include_if_exists ${sl.routerFile}" directly after "begin routers" or mail still goes out directly.`);
+  if (sl.transportFile) hints.push(include(sl.transportFile, 'after "begin transports"'));
+  if (sl.authFile && auth) hints.push(include(sl.authFile, 'after "begin authenticators"'));
+  return hints;
+}
+
+async function smarthostState(layout, sl) {
+  const router = readText(sl.routerFile);
+  const configured = router != null && isManaged(router);
+  const passwd = readText(sl.passwdFile) || '';
+  const auth = sl.passwdBlock ? findSmarthostBlock(passwd) != null : passwd.length > 0 && exists(sl.passwdFile);
+  const verify = configured ? await verifySmarthost(layout, sl) : { hooked: null, precedes: null };
+  const m = configured ? router.match(/^\s*route_list = \* (\S+)::(\d+) byname$/m) : null;
+  return { configured, host: m?.[1] ?? null, port: m ? Number(m[2]) : null, auth, routerFile: sl.routerFile, passwdFile: sl.passwdFile, transportFile: sl.transportFile, authFile: sl.authFile, hookable: sl.routerHookable, ...verify, hints: configured ? smarthostHints(layout, sl, verify, { auth }) : [] };
+}
+
+const relayUser = z.string().min(1).max(254).regex(/^[^\0\r\n:]+$/, 'Login without ":" or line breaks');
+// Debian's passwd.client is host:login:password and its client authenticators
+// extract the password with ${extract{2}{:}…}: a ":" in it is truncated silently.
+const relayPassword = z.string().min(1).max(256).regex(/^[^\0\r\n:]+$/, 'Password without ":" or line breaks');
+
+defineOp('mail.smarthost.status', {
+  description: 'Whether the outbound relay router is written, loaded by Exim and before dnslookup, and which files carry it',
+  run: async (_args, ctx) => {
+    const layout = requireExim();
+    const sl = smarthostLayout(layout);
+    for (const f of [sl.routerFile, sl.passwdFile]) ctx.assertAllowedPath(f, 'read');
+    return smarthostState(layout, sl);
+  },
+});
+
+defineOp('mail.smarthost.write', {
+  description: 'Route all outbound mail through a relay: write the whm_smarthost router (and transport/authenticators on non-Debian layouts), the credential (0640, Exim group), validate with exim -bV (rolled back on error), verify the router is live and reload',
+  schema: z.object({ host: arg.hostname, port: z.number().int().min(1).max(65535).default(587), user: relayUser.nullable().default(null), password: relayPassword.nullable().default(null), requireTls: z.boolean().default(true), reload: z.boolean().default(true) }).strict()
+    .refine((a) => (a.user == null) === (a.password == null), { message: 'user and password go together', path: ['password'] }),
+  run: async ({ host, port, user, password, requireTls, reload }, ctx) => {
+    const layout = requireExim();
+    const sl = smarthostLayout(layout);
+    const files = [sl.routerFile, sl.passwdFile, sl.transportFile, sl.authFile].filter(Boolean);
+    for (const f of files) ctx.assertAllowedPath(f, 'write');
+    const auth = user != null;
+    const previous = Object.fromEntries(files.map((f) => [f, readText(f)]));
+    const rollback = () => { for (const f of files) restore(f, previous[f]); };
+    try {
+      writeAtomic(sl.routerFile, renderSmarthostRouter({ host, port }, sl));
+      if (sl.transportFile) writeAtomic(sl.transportFile, renderSmarthostTransport({ requireTls, auth }));
+      if (sl.authFile) { if (auth) writeAtomic(sl.authFile, renderSmarthostAuth(sl.passwdFile)); else if (exists(sl.authFile)) fs.unlinkSync(sl.authFile); }
+      const entry = auth ? renderSmarthostPasswd({ host, user, password }) : null;
+      if (sl.passwdBlock) writePrivate(sl.passwdFile, mergeSmarthostPasswd(previous[sl.passwdFile], entry), layout);
+      else if (entry) writePrivate(sl.passwdFile, entry, layout);
+      else if (exists(sl.passwdFile)) fs.unlinkSync(sl.passwdFile);
+    } catch (err) { rollback(); throw err; }
+    const regenerated = await regenerateDebianConfig(layout);
+    const test = await validateExim(layout);
+    if (!test.ok || (regenerated && !regenerated.ok)) {
+      rollback();
+      await regenerateDebianConfig(layout);
+      throw new OpError('config_invalid', `Exim rejected the relay configuration; the previous files were restored: ${(regenerated && !regenerated.ok ? regenerated.output : test.output).split('\n').filter(Boolean).pop()}`, { output: test.output });
+    }
+    const verify = await verifySmarthost(layout, sl);
+    const reloaded = reload ? await reloadUnit(layout.units) : { reloaded: false, unit: null };
+    return { host, port, auth, requireTls, routerFile: sl.routerFile, passwdFile: auth ? sl.passwdFile : null, transportFile: sl.transportFile, authFile: auth ? sl.authFile : null, hookable: sl.routerHookable, validated: true, ...verify, hints: smarthostHints(layout, sl, verify, { auth }), ...reloaded };
+  },
+});
+
+defineOp('mail.smarthost.remove', {
+  description: 'Stop relaying: remove the whm_smarthost router, its transport/authenticator files and the stored credential, validate and reload',
+  destructive: true,
+  schema: z.object({ reload: z.boolean().default(true) }).strict(),
+  run: async ({ reload }, ctx) => {
+    const layout = requireExim();
+    const sl = smarthostLayout(layout);
+    const files = [sl.routerFile, sl.passwdFile, sl.transportFile, sl.authFile].filter(Boolean);
+    for (const f of files) ctx.assertAllowedPath(f, 'write');
+    const previous = Object.fromEntries(files.map((f) => [f, readText(f)]));
+    const existed = previous[sl.routerFile] != null;
+    for (const f of [sl.routerFile, sl.transportFile, sl.authFile].filter(Boolean)) if (previous[f] != null) fs.unlinkSync(f);
+    if (sl.passwdBlock) { const merged = mergeSmarthostPasswd(previous[sl.passwdFile], null); if (merged !== (previous[sl.passwdFile] || '')) writePrivate(sl.passwdFile, merged, layout); } else if (previous[sl.passwdFile] != null) fs.unlinkSync(sl.passwdFile);
+    const regenerated = await regenerateDebianConfig(layout);
+    const test = await validateExim(layout);
+    if (!test.ok || (regenerated && !regenerated.ok)) {
+      for (const f of files) restore(f, previous[f]);
+      await regenerateDebianConfig(layout);
+      throw new OpError('config_invalid', `Exim rejected the configuration without the relay router; the files were restored: ${test.output.split('\n').filter(Boolean).pop()}`, { output: test.output });
+    }
+    return { removed: existed, routerFile: sl.routerFile, ...(reload && existed ? await reloadUnit(layout.units) : { reloaded: false, unit: null }) };
   },
 });
 

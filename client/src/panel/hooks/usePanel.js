@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
+import { adoptUserLocale } from '../../i18n/useT.js';
 import { PANEL_SHELL } from '../ShellContext.js';
 import { featureEnabled } from '../nav.js';
 
@@ -38,6 +39,7 @@ export function usePanelMeLoader(enabled) {
       .then((res) => {
         if (!alive) return;
         if (res.data?.csrfToken) api.setCsrfToken(res.data.csrfToken);
+        if (!res.data?.actingAs) adoptUserLocale(res.data?.user?.locale);
         setState({ me: res.data, loading: false, error: null });
       })
       .catch((error) => { if (alive) setState({ me: null, loading: false, error }); });

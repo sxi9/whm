@@ -9,7 +9,7 @@ port (2086) only redirects (301) or refuses (426), so `BASE` defaults to the TLS
 | Script | What it does |
 |---|---|
 | `ui-check.cjs` | Playwright flow: login → create an account through the form → core pages → search → Phase-5 pages (License tab, Manage Plugins › Marketplace, WHM Marketplace) → cleanup. `BASE=https://127.0.0.1:2087 PASSWORD='<root pw>' node e2e/ui-check.cjs` |
-| `panel-check.cjs` | The account panel end to end: root creates an account and its panel login, the user visits every panel function, file and cron APIs, "Log in as". `BASE=https://127.0.0.1:2087 PASSWORD='<root pw>' node e2e/panel-check.cjs` |
+| `panel-check.cjs` | The account panel end to end: root creates an account and its panel login, the user visits every panel function (at 1440×900 and again at 390×844, where sideways overflow, header actions outside the viewport or a visible keyboard hint fail the run, and once more under a pseudo-locale that serves every catalogue string as `⟦key⟧`, where an English sentence left on a page fails the run), file and cron APIs, "Log in as". `BASE=https://127.0.0.1:2087 PASSWORD='<root pw>' node e2e/panel-check.cjs` |
 | `screenshot-all.cjs` | Every one of the 212 function pages plus the core pages, labelled, with gallery READMEs. |
 | `screenshots.sh` | Runs all three into `docs/screenshots/`. `BASE=… PASSWORD='…' bash e2e/screenshots.sh` |
 | `live-hub-flow.sh` | The Phase-5 end-to-end flow against a real hub and a real panel (below). |

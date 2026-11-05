@@ -5,13 +5,15 @@ import { Toggle, Button, ErrorBanner } from '../../../../components/Form.jsx';
 import { Modal } from '../../../../components/Modal.jsx';
 import { PanelCapabilityState, PendingPill } from '../../../../panel/PanelPage.jsx';
 import { usePanelApi, usePanelMe } from '../../../../panel/hooks/usePanel.js';
+import { useT, translate } from '../../../../i18n/useT.js';
+import { fill } from '../../../../i18n/fill.js';
 
 export const isFeatureDisabled = (err) => Boolean(err) && err.status === 403 && err.code === 'feature_disabled';
 export const isCapabilityError = (err) => Boolean(err) && (err.status === 501 || err.code === 'capability_missing' || err.code === 'binary_not_found');
 export const isLimitError = (err) => Boolean(err) && err.code === 'limit_reached';
 
 export const TYPE_LABELS = { main: 'Main domain', addon: 'Addon domain', sub: 'Subdomain', parked: 'Parked domain', alias: 'Parked domain' };
-export const typeLabel = (type) => TYPE_LABELS[type] || type;
+export const typeLabel = (type) => (TYPE_LABELS[type] ? translate(`panel.domains.type_${type === 'alias' ? 'parked' : type}`, TYPE_LABELS[type]) : type);
 export const isParked = (row) => row.type === 'parked' || row.type === 'alias';
 
 // GET /panel/domains: every hostname of the account plus meta.counts / meta.limits.
@@ -33,14 +35,15 @@ export function limitReached(count, limit) {
 }
 
 export function LimitNotice({ count, limit, noun }) {
+  const { t } = useT();
   if (limit == null) return null;
   if (limitReached(count, limit)) {
     return (
       <div className="banner banner-warning">
         <AlertTriangle size={18} />
         <div>
-          <strong>{limit === 0 ? `Your plan does not include ${noun}` : `All ${limit} ${noun} of your plan are in use`}</strong>
-          <p className="muted">{limit === 0 ? 'Ask your hosting provider about a plan that includes them.' : 'Remove one to make room, or ask your hosting provider about a larger plan.'}</p>
+          <strong>{limit === 0 ? fill(t('panel.domains.limit_none', 'Your plan does not include {noun}'), { noun }) : fill(t('panel.domains.limit_full', 'All {limit} {noun} of your plan are in use'), { limit, noun })}</strong>
+          <p className="muted">{limit === 0 ? t('panel.domains.limit_none_help', 'Ask your hosting provider about a plan that includes them.') : t('panel.domains.limit_full_help', 'Remove one to make room, or ask your hosting provider about a larger plan.')}</p>
         </div>
       </div>
     );
@@ -51,24 +54,25 @@ export function LimitNotice({ count, limit, noun }) {
 // Plan limits as the server enforces them (assertLimit): null is unlimited, 0 is
 // a closed door, any other value is the cap.
 export function usageText(count, limit, noun) {
-  if (limit == null) return `${count} ${noun} · no plan limit`;
-  if (limit === 0) return `No ${noun} in your plan`;
-  return `${count} of ${limit} ${noun}`;
+  if (limit == null) return fill(translate('panel.domains.usage_unlimited', '{count} {noun} · no plan limit'), { count, noun });
+  if (limit === 0) return fill(translate('panel.domains.usage_none', 'No {noun} in your plan'), { noun });
+  return fill(translate('panel.domains.usage_of', '{count} of {limit} {noun}'), { count, limit, noun });
 }
 
 export function allowedText(limit) {
-  if (limit == null) return 'no plan limit';
-  if (limit === 0) return 'none in your plan';
-  return `of ${limit} allowed`;
+  if (limit == null) return translate('panel.domains.allowed_unlimited', 'no plan limit');
+  if (limit === 0) return translate('panel.domains.allowed_none', 'none in your plan');
+  return fill(translate('panel.domains.allowed_of', 'of {limit} allowed'), { limit });
 }
 
 export function WarningsBanner({ warnings }) {
+  const { t } = useT();
   if (!warnings?.length) return null;
   return (
     <div className="banner banner-info">
       <Info size={18} />
       <div>
-        <strong>Saved, with notes from the server</strong>
+        <strong>{t('panel.domains.saved_with_notes', 'Saved, with notes from the server')}</strong>
         <ul>{warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
       </div>
     </div>
@@ -78,13 +82,14 @@ export function WarningsBanner({ warnings }) {
 // Errors a form could not place on a field: plan limits, conflicts, missing
 // daemons. Field errors stay next to their inputs.
 export function RequestError({ error, onRetry }) {
+  const { t } = useT();
   if (!error || error.fields) return null;
   if (isCapabilityError(error)) return <PanelCapabilityState error={error} onRetry={onRetry} />;
   if (isLimitError(error)) {
     return (
       <div className="banner banner-warning" role="alert">
         <AlertTriangle size={18} />
-        <div><strong>Plan limit reached</strong><p>{error.message}</p></div>
+        <div><strong>{t('panel.domains.limit_reached', 'Plan limit reached')}</strong><p>{error.message}</p></div>
       </div>
     );
   }
@@ -92,18 +97,20 @@ export function RequestError({ error, onRetry }) {
 }
 
 export function VhostPill({ vhost }) {
+  const { t } = useT();
   if (!vhost) return <span className="muted">—</span>;
   const status = vhost.status || 'unknown';
-  const label = { active: 'Serving', pending: 'Pending', failed: 'Failed', error: 'Failed', disabled: 'Disabled' }[status] || status;
+  const label = { active: t('panel.domains.vhost_active', 'Serving'), pending: t('panel.domains.vhost_pending', 'Pending'), failed: t('panel.domains.vhost_failed', 'Failed'), error: t('panel.domains.vhost_failed', 'Failed'), disabled: t('panel.domains.vhost_disabled', 'Disabled') }[status] || status;
   return <span title={vhost.error || ''}><StatusPill status={status}>{label}</StatusPill></span>;
 }
 
 export function SslPill({ ssl }) {
-  if (!ssl) return <StatusPill status="unknown">None</StatusPill>;
+  const { t } = useT();
+  if (!ssl) return <StatusPill status="unknown">{t('panel.domains.ssl_none', 'None')}</StatusPill>;
   if (ssl.installed) {
     const days = ssl.daysRemaining;
     const tone = days != null && days <= 7 ? 'warning' : 'ok';
-    return <span title={ssl.issuer || ''}><StatusPill status={tone}>{days != null ? `Valid · ${days} d` : 'Installed'}</StatusPill></span>;
+    return <span title={ssl.issuer || ''}><StatusPill status={tone}>{days != null ? fill(t('panel.domains.ssl_valid_days', 'Valid · {days} d'), { days }) : t('panel.domains.ssl_installed', 'Installed')}</StatusPill></span>;
   }
   return <StatusPill status={ssl.state || 'pending'} />;
 }
@@ -115,16 +122,18 @@ export function DocrootCode({ docroot, homeDir }) {
   return <code title={docroot}>{shown}</code>;
 }
 
-export function AppliedPill({ result, okLabel = 'Applied' }) {
+export function AppliedPill({ result, okLabel }) {
+  const { t } = useT();
   if (!result) return <span className="muted">—</span>;
   if (result.applied === false) return <PendingPill result={result} />;
-  return <StatusPill status="ok">{okLabel}</StatusPill>;
+  return <StatusPill status="ok">{okLabel ?? t('panel.domains.applied', 'Applied')}</StatusPill>;
 }
 
 // The outcome of a create: the row plus what happened on the host.
 export function CreateResult({ title, items, warnings, onDismiss }) {
+  const { t } = useT();
   return (
-    <Card title={title} actions={onDismiss && <Button size="sm" onClick={onDismiss}>Dismiss</Button>}>
+    <Card title={title} actions={onDismiss && <Button size="sm" onClick={onDismiss}>{t('panel.domains.dismiss', 'Dismiss')}</Button>}>
       <WarningsBanner warnings={warnings} />
       <KeyValue items={items} />
     </Card>
@@ -134,6 +143,7 @@ export function CreateResult({ title, items, warnings, onDismiss }) {
 // Removal with per-domain options (zone, document root); confirmed by typing nothing,
 // the options are the decision.
 export function RemoveDomainModal({ open, domain, title, options, onClose, onConfirm }) {
+  const { t } = useT();
   const [choice, setChoice] = useState(() => Object.fromEntries((options || []).map((o) => [o.key, Boolean(o.default)])));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
@@ -143,15 +153,15 @@ export function RemoveDomainModal({ open, domain, title, options, onClose, onCon
     try { await onConfirm(choice); } catch (err) { setError(err); } finally { setBusy(false); }
   };
   return (
-    <Modal open={open} title={title || `Remove ${domain}?`} onClose={busy ? undefined : onClose} size="sm"
+    <Modal open={open} title={title || fill(t('panel.domains.remove_title', 'Remove {domain}?'), { domain })} onClose={busy ? undefined : onClose} size="sm"
       footer={(
         <>
-          <Button onClick={onClose} disabled={busy}>Cancel</Button>
-          <Button variant="danger" onClick={confirm} loading={busy}>Remove</Button>
+          <Button onClick={onClose} disabled={busy}>{t('panel.domains.cancel', 'Cancel')}</Button>
+          <Button variant="danger" onClick={confirm} loading={busy}>{t('panel.domains.remove', 'Remove')}</Button>
         </>
       )}>
       <RequestError error={error} />
-      <p>{domain} stops being served by this account. Visitors get an error until the name points somewhere else.</p>
+      <p>{fill(t('panel.domains.remove_help', '{domain} stops being served by this account. Visitors get an error until the name points somewhere else.'), { domain })}</p>
       {(options || []).map((o) => (
         <Toggle key={o.key} checked={choice[o.key]} onChange={(v) => setChoice((c) => ({ ...c, [o.key]: v }))} label={o.label} description={o.description} />
       ))}

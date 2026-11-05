@@ -291,8 +291,15 @@ describe('S4: ctx.web.applyVirtualMail', () => {
     expect(dc).toContain('unix_listener lmtp');
     expect(dc).toContain('mail_plugins = $mail_plugins quota');
     expect(renderDovecotVirtualAuth({})).toContain('keep their defaults');
+    // Pigeonhole is wired only when asked (the service passes the `sieve` capability): Dovecot checks plugins at
+    // delivery time, so an unconditional `sieve` would stop every LMTP delivery on a host without dovecot-sieve.
+    expect(dc).not.toMatch(/sieve/i);
+    expect(renderDovecotVirtualAuth({ version: '2.3.21', sieve: true })).toContain('protocol lmtp {\n  mail_plugins = $mail_plugins sieve\n}');
+    expect(renderDovecotVirtualAuth({ version: '2.3.21', sieve: true })).toContain('sieve_before = ~/mail/sieve-global/keel.sieve');
+    expect(renderDovecotVirtualAuth({ version: '2.4.2' })).not.toMatch(/sieve/i);
+    expect(renderDovecotVirtualAuth({ version: '2.4.2' })).toContain('protocol lmtp {\n  auth_username_format = %{user | lower}\n}');
     // Dovecot 2.4 (named sections, no args/%n/%d, mail_plugins block, count quota driver), validated with doveconf -n on a 2.4.2 host.
-    const dc24 = renderDovecotVirtualAuth({ passwdDir: VMAIL.passwdDir, eximUser: 'Debian-exim', eximGroup: 'Debian-exim', version: '2.4.2' });
+    const dc24 = renderDovecotVirtualAuth({ passwdDir: VMAIL.passwdDir, eximUser: 'Debian-exim', eximGroup: 'Debian-exim', version: '2.4.2', sieve: true });
     expect(dc24).toContain('passdb passwd-file {\n  passwd_file_path = /etc/dovecot/whm/passwd/%{user | domain}\n  default_password_scheme = SHA512-CRYPT');
     expect(dc24).toContain('userdb passwd-file {\n  passwd_file_path = /etc/dovecot/whm/passwd/%{user | domain}');
     expect(dc24).toContain('passdb passwd-file {\n  passwd_file_path = /etc/dovecot/whm/passwd/%{user | domain}\n  default_password_scheme = SHA512-CRYPT\n  username_filter = *@*\n  result_success = return-ok\n  result_failure = continue\n  result_internalfail = continue\n}');
@@ -300,7 +307,7 @@ describe('S4: ctx.web.applyVirtualMail', () => {
     expect(dc24).toContain('quota_driver = count');
     expect(dc24).toContain('protocol imap {\n  mail_plugins {\n    imap_quota = yes');
     // LMTP must look the full address up, or the per-domain passwd file is never found (2.4 default strips the domain).
-    expect(dc24).toContain('protocol lmtp {\n  auth_username_format = %{user | lower}\n}');
+    expect(dc24).toContain('protocol lmtp {\n  auth_username_format = %{user | lower}\n  mail_plugins {\n    sieve = yes\n  }\n}');
     expect(dc24).toContain('unix_listener auth-client {\n    mode = 0660\n    user = Debian-exim');
     for (const legacy of ['driver = passwd-file', 'args =', 'username_format=%n', '%n', '%d', 'plugin {', '$mail_plugins']) expect(dc24, legacy).not.toContain(legacy);
     expect([dovecotIsV24('2.4.2'), dovecotIsV24('2.4.0'), dovecotIsV24('3.0.0'), dovecotIsV24('2.3.21'), dovecotIsV24(null), dovecotIsV24('')]).toEqual([true, true, true, false, false, false]);

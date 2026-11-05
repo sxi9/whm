@@ -3,6 +3,7 @@ import path from 'node:path';
 import { validate, z, fields } from '../../lib/validate.js';
 import { panelRouter, wrap, created, assertFeature } from './index.js';
 import { HttpError, notFound, conflict, unprocessable, forbidden } from '../../lib/errors.js';
+import { createPanelHtaccessService, ipOrCidr } from '../../services/panel-htaccess.js';
 
 // /api/panel/security — mounted by routes/categories/panel.js behind panelScope.
 // The password and session flows are the core panel service's (§2.2,
@@ -180,6 +181,15 @@ export async function register(ctx) {
   r.delete('/ssh-keys/:fingerprint', sessionOnly, validate({ params: z.object({ fingerprint: z.string().regex(FINGERPRINT) }) }), wrap((req) => svc.removeSshKey(req.panel, req.params.fingerprint, req)));
   r.get('/sessions', wrap((req) => svc.listSessions(req.panel, req)));
   r.delete('/sessions', sessionOnly, wrap((req) => svc.endSessions(req.panel, req)));
+
+  // IP blocker (feature ipblocker): "Require not ip" in the panel-managed block
+  // of public_html/.htaccess (services/panel-htaccess.js).
+  ctx.panelHtaccess ??= createPanelHtaccessService(ctx);
+  const ht = ctx.panelHtaccess;
+  const ipBody = z.object({ ip: ipOrCidr }).strict();
+  r.get('/ip-blocker', wrap((req) => ht.ipBlocker.get(req.panel, req)));
+  r.post('/ip-blocker', sessionOnly, validate({ body: ipBody }), created((req) => ht.ipBlocker.add(req.panel, req.body, req)));
+  r.delete('/ip-blocker', sessionOnly, validate({ query: ipBody }), wrap((req) => ht.ipBlocker.remove(req.panel, req.query, req)));
 
   return { path: '/security', router: r };
 }

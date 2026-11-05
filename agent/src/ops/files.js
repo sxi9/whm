@@ -160,7 +160,7 @@ defineOp('files.chunk_read', {
 // (mv -T, same directory, so the rename is atomic and a failed write, quota
 // included, leaves the previous content intact). Each step is its own exec as
 // the account; there is no shell to chain them.
-async function stagedWrite(info, home, target, data, mode) {
+export async function stagedWrite(info, home, target, data, mode) {
   const stage = `${target}.whm-${crypto.randomBytes(6).toString('hex')}`;
   try {
     const w = await asUser(info, 'dd', [`of=${stage}`, 'bs=1M', 'status=none'], { input: data, allowFailure: true, timeoutMs: 120_000 });

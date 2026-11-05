@@ -4,7 +4,7 @@ import {
   renderPasswdLine, parsePasswdLine, upsertPasswdText, removeFromPasswdText, dropForeignPasswdLines, renderAliases, renderDomainForwards,
   renderSpamUsers, renderAutoresponderConf, autoreplyOnceFiles, parseDoveadmQuota, LOCAL_PART, EMAIL_TARGET, HOME_FIELD, MANAGED,
   AUTORESPONDER_KEYS, DOVECOT_PASSWD_DIR, AUTOREPLY_DB_DIR, dovecotFormat, dovecotFormatFromVersion, resetDovecotFormat, passwdKeyLocal,
-  rekeyPasswdText, rekeyPasswdDir, rekeyPasswd,
+  rekeyPasswdText, rekeyPasswdDir, rekeyPasswd, DOVECOT_MASTER_FILE, renderMasterUsers,
 } from '../src/ops/vmail.js';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -453,5 +453,129 @@ describe('field grammars', () => {
     for (const ok of ['a', 'first.last', 'a_b-c', 'x'.repeat(64)]) expect(LOCAL_PART.test(ok), ok).toBe(true);
     for (const bad of ['', '.a', '-a', 'A', 'a@b', 'a b', 'a:b', 'a|b', 'a/b', 'a${b}', 'x'.repeat(65)]) expect(LOCAL_PART.test(bad), bad).toBe(false);
     for (const bad of ['a@b.com|x', 'a@b.com/x', 'a@b.com:x', 'a@b.com,c@d.com', '${a}@b.com', 'a@b.com ', ' a@b.com']) expect(EMAIL_TARGET.test(bad), bad).toBe(false);
+  });
+});
+
+describe('vmail.master.* (webmail single sign-on master user)', () => {
+  it('are registered, remove is destructive, and the file is the one the master passdb reads', () => {
+    expect(catalog.has('vmail.master.write')).toBe(true);
+    expect(catalog.get('vmail.master.write').destructive).toBe(false);
+    expect(catalog.get('vmail.master.remove').destructive).toBe(true);
+    expect(DOVECOT_MASTER_FILE).toBe('/etc/dovecot/whm/master-users');
+    expect(ctx.assertAllowedPath(DOVECOT_MASTER_FILE, 'write')).toBe(DOVECOT_MASTER_FILE);
+  });
+
+  it('rejects a user or hash that could become a second field, line or user; never runs a program', async () => {
+    for (const user of ['', 'Keel', 'keel:x', 'keel master', 'keel\nx', 'keel*', '-keel', '1keel', 'x'.repeat(33), 'a@b.c']) await invalid('vmail.master.write', { user, hash: HASH });
+    for (const h of ['', 'plain', '$1$abc', `${HASH}\nkeel:x`, `${HASH}:x`, 'x'.repeat(200)]) await invalid('vmail.master.write', { user: 'keel-master', hash: h });
+    await invalid('vmail.master.write', { user: 'keel-master', hash: HASH, path: '/etc/passwd' });
+    await invalid('vmail.master.remove', { user: 'keel-master' });
+  });
+
+  it('renders one managed line with the scheme prefix (no default_password_scheme needed)', () => {
+    const text = renderMasterUsers('keel-master', HASH);
+    expect(text.split('\n')).toEqual([MANAGED, `keel-master:{SHA512-CRYPT}${HASH}`, '']);
+  });
+
+  it('refuses a context whose roots do not cover /etc/dovecot before touching anything', async () => {
+    const restricted = createContext({ allowedRoots: ['/home'] });
+    hasBinary.mockImplementation(() => true);
+    try {
+      for (const [name, args] of [['vmail.master.write', { user: 'keel-master', hash: HASH }], ['vmail.master.remove', {}]]) {
+        const err = await opError(runOp(name, args, restricted));
+        expect(err.code, name).toBe('path_not_allowed');
+      }
+    } finally { hasBinary.mockRestore(); hasBinary.mockImplementation((await vi.importActual('../src/exec.js')).hasBinary); }
+    expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('vmail.mailbox.* (folders and emptying, P1-12)', async () => {
+  const { parseDoveadmMailboxStatus, FOLDER, EMPTIABLE_FOLDERS, EXPUNGE_MIN_DAYS } = await import('../src/ops/vmail.js');
+
+  it('registers both ops; expunge is destructive, status is not', () => {
+    expect(catalog.has('vmail.mailbox.status')).toBe(true);
+    expect(catalog.has('vmail.mailbox.expunge')).toBe(true);
+    expect(catalog.get('vmail.mailbox.status').destructive).toBe(false);
+    expect(catalog.get('vmail.mailbox.expunge').destructive).toBe(true);
+    expect(EMPTIABLE_FOLDERS).toEqual(['Trash', 'Junk']);
+    expect(EXPUNGE_MIN_DAYS).toBe(7);
+  });
+
+  it('parses the tab and the plain doveadm formats', () => {
+    const tab = 'mailbox\tmessages\tvsize\tunseen\nINBOX\t12\t40960\t3\nTrash\t0\t0\t0\nArchive.2025 Q1\t7\t1024\t\n';
+    expect(parseDoveadmMailboxStatus(tab)).toEqual([
+      { name: 'INBOX', messages: 12, bytes: 40960, unseen: 3 },
+      { name: 'Trash', messages: 0, bytes: 0, unseen: 0 },
+      { name: 'Archive.2025 Q1', messages: 7, bytes: 1024, unseen: null },
+    ]);
+    const plain = 'INBOX messages=12 vsize=40960 unseen=3\nSent messages=2 vsize=100\n';
+    expect(parseDoveadmMailboxStatus(plain)).toEqual([
+      { name: 'INBOX', messages: 12, bytes: 40960, unseen: 3 },
+      { name: 'Sent', messages: 2, bytes: 100, unseen: null },
+    ]);
+    expect(parseDoveadmMailboxStatus('')).toEqual([]);
+  });
+
+  it('the folder grammar refuses what doveadm would read as a wildcard, a quote or a path trick', () => {
+    for (const ok of ['INBOX', 'Trash', 'Junk', 'Archive.2025', 'Sent Items', 'Projekte/Alt', 'Entwürfe']) expect(FOLDER.test(ok), ok).toBe(true);
+    for (const bad of ['', '.hidden', 'a..b', 'INBOX.', 'a*', 'a%b', 'x"y', 'a\b', 'a\nb', 'a\0b', 'x'.repeat(201)]) expect(FOLDER.test(bad), JSON.stringify(bad)).toBe(false);
+  });
+
+  it('schemas: status takes one address only; expunge needs olderThanDays >= 7 unless the folder is Trash or Junk', async () => {
+    await invalid('vmail.mailbox.status', { user: 'info@alice.com', extra: 1 });
+    await invalid('vmail.mailbox.status', { user: 'info@alice.com; rm -rf /' });
+    await invalid('vmail.mailbox.status', { user: 'Info@alice.com' });
+    await invalid('vmail.mailbox.status', { user: '-u@alice.com' });
+    await invalid('vmail.mailbox.expunge', { user: 'info@alice.com', folder: 'INBOX' });
+    await invalid('vmail.mailbox.expunge', { user: 'info@alice.com', folder: 'INBOX', olderThanDays: 6 });
+    await invalid('vmail.mailbox.expunge', { user: 'info@alice.com', folder: 'INBOX', olderThanDays: 30.5 });
+    await invalid('vmail.mailbox.expunge', { user: 'info@alice.com', folder: 'INBOX', olderThanDays: 3651 });
+    await invalid('vmail.mailbox.expunge', { user: 'info@alice.com', folder: 'Trash', olderThanDays: '7' });
+    await invalid('vmail.mailbox.expunge', { user: 'info@alice.com', folder: '*' });
+    await invalid('vmail.mailbox.expunge', { user: 'info@alice.com', folder: 'Trash', force: true });
+    await invalid('vmail.mailbox.expunge', { user: 'info@alice.com', folder: 'Trash OR mailbox INBOX' , olderThanDays: 'x' });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('passes the search query as separate argv words and never runs without doveadm', async () => {
+    const stdout = (lines) => ({ code: 0, stdout: lines, stderr: '' });
+    hasBinary.mockImplementation((name) => name === 'doveadm');
+    exec.mockClear();
+    exec.mockImplementation(async (bin, argv) => {
+      if (argv[0] === '-f' && argv.includes('status')) return stdout(argv.at(-1) === '*' ? 'mailbox\tmessages\tvsize\tunseen\nINBOX\t2\t10\t1\nTrash\t3\t30\t0\n' : `mailbox\tmessages\n${argv.at(-1)}\t${argv.at(-1) === 'Trash' ? 3 : 0}\n`);
+      if (argv[0] === 'expunge') return stdout('');
+      return { code: 1, stdout: '', stderr: 'unexpected' };
+    });
+    try {
+      const st = await runOp('vmail.mailbox.status', { user: 'info@alice.com' }, ctx);
+      expect(st.folders.map((f) => f.name)).toEqual(['INBOX', 'Trash']);
+      expect(exec.mock.calls[0][1]).toEqual(['-f', 'tab', 'mailbox', 'status', '-u', 'info@alice.com', 'messages vsize unseen', '*']);
+      exec.mockClear();
+      const trash = await runOp('vmail.mailbox.expunge', { user: 'info@alice.com', folder: 'Trash' }, ctx);
+      expect(exec.mock.calls.map((c) => c[1])).toEqual([
+        ['-f', 'tab', 'mailbox', 'status', '-u', 'info@alice.com', 'messages', 'Trash'],
+        ['expunge', '-u', 'info@alice.com', 'mailbox', 'Trash', 'all'],
+        ['-f', 'tab', 'mailbox', 'status', '-u', 'info@alice.com', 'messages', 'Trash'],
+      ]);
+      expect(trash).toMatchObject({ folder: 'Trash', olderThanDays: null, before: 3, after: 3 });
+      exec.mockClear();
+      await runOp('vmail.mailbox.expunge', { user: 'info@alice.com', folder: 'Sent Items', olderThanDays: 30 }, ctx);
+      expect(exec.mock.calls[1][1]).toEqual(['expunge', '-u', 'info@alice.com', 'mailbox', 'Sent Items', 'savedbefore', '30d', 'all']);
+      exec.mockClear();
+      exec.mockImplementation(async () => stdout('mailbox\tmessages\n'));
+      const gone = await opError(runOp('vmail.mailbox.expunge', { user: 'info@alice.com', folder: 'Nope' , olderThanDays: 30 }, ctx));
+      expect(gone.code).toBe('not_found');
+      expect(exec.mock.calls.map((c) => c[1][0])).toEqual(['-f']);
+      hasBinary.mockImplementation(() => false);
+      exec.mockClear();
+      const missing = await opError(runOp('vmail.mailbox.status', { user: 'info@alice.com' }, ctx));
+      expect(missing.code).toBe('capability_missing');
+      expect(exec).not.toHaveBeenCalled();
+    } finally {
+      const actual = await vi.importActual('../src/exec.js');
+      hasBinary.mockImplementation(actual.hasBinary);
+      exec.mockImplementation(actual.exec);
+    }
   });
 });

@@ -736,3 +736,42 @@ describe('server hostname site', () => {
     expect(HOST_VHOST).toMatchObject({ name: 'keel-host', docroot: '/var/www/keel-host', certDir: '/etc/ssl/whm/service/apache' });
   });
 });
+
+describe('hostname-site application probe and the disable_ipv6 merge (A3)', () => {
+  it('web.host.app.probe takes an alias under the hostname site and a bounded timeout only', async () => {
+    for (const alias of ['webmail', '/..', '/web mail', '/a/../b', 'https://x/', '', '/web;mail']) expect((await opError(runOp('web.host.app.probe', { alias }, ctx))).code, alias).toBe('invalid_args');
+    expect((await opError(runOp('web.host.app.probe', { alias: '/webmail', timeoutMs: 99_000 }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('web.host.app.probe', { alias: '/webmail', host: 'evil.example' }, ctx))).code).toBe('invalid_args');
+  });
+
+  it('picks the last PHP fatal out of an Apache error log tail, without the proxy_fcgi quoting', async () => {
+    const { lastPhpFatal } = await import('../src/ops/web.js');
+    const log = [
+      "[Wed Nov 05 10:00:00.000000 2026] [proxy_fcgi:error] [pid 1] [client 127.0.0.1:1] AH01071: Got error 'PHP message: PHP Warning:  something in /x.php on line 1'",
+      "[Wed Nov 05 10:00:01.000000 2026] [proxy_fcgi:error] [pid 1] [client 127.0.0.1:2] AH01071: Got error 'PHP message: PHP Fatal error:  Cannot redeclare array_first() in /var/lib/roundcube/program/lib/Roundcube/bootstrap.php on line 70\\n'",
+      '[Wed Nov 05 10:00:02.000000 2026] [core:notice] [pid 1] AH00094: Command line',
+    ].join('\n');
+    expect(lastPhpFatal(log)).toBe('PHP Fatal error:  Cannot redeclare array_first() in /var/lib/roundcube/program/lib/Roundcube/bootstrap.php on line 70');
+    expect(lastPhpFatal('nothing here')).toBeNull();
+    expect(lastPhpFatal(null)).toBeNull();
+    expect(lastPhpFatal(`PHP Fatal error: ${'x'.repeat(500)}`)).toHaveLength(300);
+  });
+
+  it('drops a hand-written disable_ipv6 outside the managed block only when the block sets it (Exim takes a main option once)', () => {
+    const note = '# Keel host note (outside the managed blocks): no global IPv6 route on this host.\n';
+    const previous = `MAIN_TLS_ENABLE = true\n${note}disable_ipv6 = true\n`;
+    const merged = mergeEximBlock(previous, 'WHM_SERVICE_CONFIG = 1\ndisable_ipv6 = true\n');
+    expect(merged.match(/^disable_ipv6 = true$/gm)).toHaveLength(1);
+    expect(merged).toContain(note);
+    expect(merged).toContain('MAIN_TLS_ENABLE = true\n');
+    expect(merged.indexOf('disable_ipv6')).toBeGreaterThan(merged.indexOf('# BEGIN Keel (Service Configuration'));
+    // Replacing an existing block strips the stray line on both sides of it.
+    const again = mergeEximBlock(`${merged}disable_ipv6 = true\n`, 'WHM_SERVICE_CONFIG = 1\ndisable_ipv6 = true\n');
+    expect(again.match(/disable_ipv6 = true/g)).toHaveLength(1);
+    expect(readEximBlock(again)).toContain('disable_ipv6 = true');
+    // Without the option in the block the operator's line is left alone.
+    const kept = mergeEximBlock(previous, 'WHM_SERVICE_CONFIG = 1\n');
+    expect(kept).toContain(`${note}disable_ipv6 = true\n`);
+    expect(kept.match(/disable_ipv6/g)).toHaveLength(1);
+  });
+});

@@ -2,7 +2,8 @@
 // root creates a hosting account and its panel login, the account user signs in and
 // visits every panel function, the file and cron APIs are exercised through the
 // §4 contract, then root opens the account through "Log in as". Console errors,
-// page errors and 5xx responses fail the run.
+// page errors, 5xx responses, phone-width overflow and untranslated page text under
+// the pseudo-locale fail the run.
 //
 // Usage: BASE=https://127.0.0.1:2087 PASSWORD='<root password>' node e2e/panel-check.cjs
 // (needs the built client served by the API with the /panel routes wired, and playwright installed)
@@ -113,6 +114,81 @@ async function logout(page) {
   await page.goto(`${BASE}/panel/overview/account`);
   await page.waitForSelector('.kv');
   await shot('02-account-details');
+
+  // 3b. phone pass (plan P1-11): the home page and every function page at 390×844 must not
+  // scroll sideways, the header actions must stay inside the viewport and the keyboard
+  // hint is hidden. Tables scroll inside .table-wrap, so that subtree is not an overflow.
+  const phone = await page.context().newPage();
+  await phone.setViewportSize({ width: 390, height: 844 });
+  phone.on('pageerror', (e) => errors.push(`pageerror @390: ${e.message}`));
+  phone.on('response', (r) => { if (r.status() >= 500 && r.status() !== 501) errors.push(`http ${r.status()} ${r.url()} @390`); });
+  const phoneAudit = () => phone.evaluate(() => {
+    const w = window.innerWidth;
+    const name = (el) => `${el.tagName.toLowerCase()}${typeof el.className === 'string' && el.className.trim() ? `.${el.className.trim().split(/\s+/).join('.')}` : ''}`;
+    const wide = [...document.querySelectorAll('body *')].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.right > w + 1 && !el.closest('.table-wrap'); }).slice(0, 4).map(name);
+    const header = document.querySelector('.page-header, .home-hero');
+    const actions = header && header.querySelector('.page-header-actions');
+    const a = actions ? actions.getBoundingClientRect() : null;
+    const kbd = document.querySelector('.topbar-search kbd');
+    return {
+      innerWidth: w, scrollWidth: document.documentElement.scrollWidth, wide,
+      actionsRight: a ? Math.round(a.right) : null,
+      actionsOverflow: Boolean(a && (a.right > header.getBoundingClientRect().right + 1 || a.right > w + 1)),
+      kbdVisible: Boolean(kbd && getComputedStyle(kbd).display !== 'none'),
+    };
+  });
+  let phoneVisited = 0;
+  for (const target of [{ path: '/panel', selector: '.home-hero h1' }, ...PANEL_FUNCTIONS.map((fn) => ({ path: fn.path, selector: '.page-header h1' }))]) {
+    await phone.goto(`${BASE}${target.path}`);
+    await phone.waitForSelector(target.selector, { timeout: 15000 });
+    await phone.waitForTimeout(300);
+    const m = await phoneAudit();
+    if (m.scrollWidth > m.innerWidth) errors.push(`${target.path} @390: horizontal overflow ${m.scrollWidth}px > ${m.innerWidth}px (${m.wide.join(', ') || 'no element wider than the viewport'})`);
+    if (m.actionsOverflow) errors.push(`${target.path} @390: header actions overflow (right edge ${m.actionsRight}px)`);
+    if (m.kbdVisible) errors.push(`${target.path} @390: keyboard shortcut hint shown on a phone`);
+    phoneVisited += 1;
+  }
+  note('phone pass (390×844):', phoneVisited, 'pages checked for sideways overflow');
+  await phone.goto(`${BASE}/panel`);
+  await phone.waitForSelector('.panel-meters .stat');
+  await phone.screenshot({ path: path.join(OUT, '04-phone-home.png'), fullPage: false });
+  await phone.goto(`${BASE}/panel/files/file-manager`);
+  await phone.waitForSelector('.page-header h1');
+  await phone.screenshot({ path: path.join(OUT, '05-phone-file-manager.png'), fullPage: false });
+  await phone.close();
+
+  // 3c. pseudo-locale pass (plan P1-10): the catalogue is served with every string replaced
+  // by its bracketed key, so an English sentence left on a page is a string that bypassed
+  // t(). Text the host supplies (error messages, log and file names, table cells) is skipped.
+  const catalog = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'client', 'src', 'i18n', 'en.json'), 'utf8'));
+  const pseudo = Object.fromEntries(Object.keys(catalog).map((k) => [k, `⟦${k}⟧`]));
+  const xx = await page.context().newPage();
+  await xx.route('**/api/locales/active*', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ data: { code: 'xx', strings: pseudo, enabled: ['en', 'xx'], default: 'en' } }) }));
+  xx.on('pageerror', (e) => errors.push(`pageerror @pseudo-locale: ${e.message}`));
+  const leakAudit = () => xx.evaluate(() => {
+    const skip = (el) => el.closest('code, pre, kbd, td, .banner, .empty-state p');
+    const root = document.getElementById('main') || document.body;
+    const texts = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) if (n.parentElement && !skip(n.parentElement)) texts.push(n.textContent);
+    for (const el of root.querySelectorAll('[aria-label], [placeholder], [title]')) {
+      if (skip(el)) continue;
+      for (const a of ['aria-label', 'placeholder', 'title']) if (el.hasAttribute(a)) texts.push(el.getAttribute(a));
+    }
+    return [...new Set(texts.map((s) => s.trim()).filter((s) => /[A-Z][a-z]+ [a-z]+/.test(s)))].slice(0, 6);
+  });
+  let pseudoVisited = 0;
+  for (const target of [{ path: '/panel', selector: '.home-hero h1' }, ...PANEL_FUNCTIONS.map((fn) => ({ path: fn.path, selector: '.page-header h1' }))]) {
+    await xx.goto(`${BASE}${target.path}`);
+    await xx.waitForSelector(target.selector, { timeout: 15000 });
+    await xx.waitForTimeout(300);
+    if (pseudoVisited === 0 && !(await xx.textContent(target.selector)).includes('⟦')) errors.push(`${target.path} @pseudo-locale: the catalogue strings are not applied (title is not a key)`);
+    const found = await leakAudit();
+    if (found.length) errors.push(`${target.path} @pseudo-locale: untranslated text: ${found.map((s) => JSON.stringify(s)).join(', ')}`);
+    pseudoVisited += 1;
+  }
+  note('pseudo-locale pass:', pseudoVisited, 'pages checked for untranslated text');
+  await xx.close();
 
   // 4. file manager API (§4.5): create and delete a folder as the account.
   const mk = await call(page, 'POST', '/api/panel/files/mkdir', { path: `public_html/e2e-${suffix}` });

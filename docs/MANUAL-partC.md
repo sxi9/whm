@@ -30,7 +30,8 @@ describing it.
 - Groups: [1. Overview](#1-overview) · [2. Domains](#2-domains) · [3. DNS](#3-dns) · [4. SSL](#4-ssl) ·
   [5. Files](#5-files) · [6. Email](#6-email) · [7. Databases](#7-databases) · [8. FTP](#8-ftp) ·
   [9. Cron](#9-cron) · [10. Backups](#10-backups) · [11. Logs](#11-logs) · [12. PHP](#12-php) ·
-  [13. Security](#13-security) · [14. Usage](#14-usage)
+  [13. Security](#13-security) · [14. Usage](#14-usage) · [15. Advanced](#15-advanced) ·
+  [16. Software](#16-software)
 - [C.9 Administering the account panel](#c9-administering-the-account-panel)
 - [C.10 Troubleshooting](#c10-troubleshooting)
 
@@ -241,7 +242,14 @@ account's **owner** ([C.7](#c7-how-the-panel-keeps-to-one-account)).
 - **Branding** (company name, tagline, logo, colours, footer text) is the one configured under
   *Panel › Customization*; the login page shows the same.
 - Labels come from the locale catalogue under the keys `panel.<group>/<function>.label` and
-  `panel.shell.*`, so *Locales* translations apply.
+  `panel.shell.*`, page text under `panel.<group>.*`, so *Locales* translations apply (see the
+  appendix *Languages* at the end of this part).
+- **On a phone** (up to 640 px wide) the sidebar becomes a drawer behind the menu button, the
+  page title and its buttons stack, long tables scroll sideways inside their card, account
+  details show each value under its label, the `Alt /` hint disappears on touch screens (the
+  shortcut still works with a keyboard) and the file manager keeps *Upload* as a button with
+  *New file* / *New folder* behind the "More actions" menu. Nothing on a page should need a
+  sideways scroll of the whole screen; if it does, report the page.
 
 ## C.7 How the panel keeps to one account
 
@@ -322,6 +330,36 @@ under the home before anything runs.
   creation date, server hostname; the plan's limits (effective limits as *Account Information ›
   Manage Account Enhancements* computes them) and the feature list with what is on and off.
 - **Server:** `GET /me` only.
+
+#### 1.3 Preferences
+
+- **Purpose:** contact addresses, language and notifications.
+- **Who:** any plan; contact and notifications also while acting, the language never while acting
+  (it belongs to the account login, and the acting administrator's own row is never written).
+- **Screen:** *Contact information* — the **contact email** (the account's `contactEmail` as the
+  console shows it, also the address *Forgot password?* mails to), an optional **second contact
+  email** (gets a copy of every notice) and three **notification** switches: *Disk quota*,
+  *Bandwidth*, *Password changes* (all on by default). *Language* — a select of the locales the
+  operator enabled under *Locales*, or *Server default*; saving it reloads the panel's strings at
+  once and the choice follows the login on every browser (it wins over the browser's own locale
+  pick in `localStorage` on the next load).
+- **Server:** `GET /me` carries `preferences: { email, email2, notify: { quota, bandwidth,
+  passwordChange }, locale, locales: [{ code, name }], defaultLocale }` and `user.locale`;
+  `PUT /me/contact { email, email2?, notify?, currentPassword }` writes `accounts.contact_email`, mirrors it to the
+  linked login's `users.email` and stores the rest in `panel_account_prefs` (switches not mentioned
+  keep their value; audited `panel.me.contact` with the previous address); `PUT /me/locale
+  { locale | null }` stores `users.locale` (must be an enabled locale; `422` otherwise; audited
+  `panel.me.locale`). The contact endpoint is session-only (`403 session_required` for an API
+  token) and asks for the current password again (`422` without it, `401` when wrong; not while an
+  administrator is logged in as the account): it is the recovery address, so a stolen session alone
+  cannot move it. When the address changes, the previous address gets a notice saying where resets
+  now go.
+- **What the switches do today:** *Password changes* mails every contact address after a
+  successful change (panel page, console forced change or a mailed reset), detached from the
+  request; *Disk quota* and *Bandwidth* are read through `ctx.panel.preferences.notifyFor(username)`
+  by whatever sends those warnings (contract §50) — nothing in core mails customers for them yet.
+- **Gotchas:** the panel-side 2FA policy gates `/me/contact` and `/me/locale` like every other
+  route (only `/me` and the two-factor pages stay open); a forced password change does too.
 
 ## 2. Domains
 
@@ -520,6 +558,59 @@ Routes under `/files` (`services/panel-files.js`); the whole group needs the pla
 - **Server:** `GET /files/du?path=&depth=0..2` runs `du` as the account; the result is cached for
   five minutes per path (`cached: true` in the answer). An upload or write clears the cache.
 
+#### The `.htaccess` family (5.3, 5.4, 13.6, 15.1)
+
+Directory privacy, Indexes, the IP blocker and Error pages all edit the same thing: one block
+between `# BEGIN Keel` and `# END Keel` in a folder's `.htaccess` (`services/panel-htaccess.js`,
+agent family `files.htaccess.*`). The panel never sends Apache directives; it sends a structured
+spec and the agent renders the block from a closed grammar (`Options ±Indexes`, `ErrorDocument
+<code> /errors/<file>.html`, `AuthType Basic` + `AuthName` + `AuthUserFile` + `Require
+valid-user`, `<RequireAll>` with `Require not ip …`), checks every rendered line against that
+grammar again, and merges it as the account: lines outside the markers are kept byte for byte, a
+`.htaccess` that is a symlink or over 1 MiB is refused, the file is written through a staged
+rename (`0644`, or the mode it already had). Folders must sit inside one of the account's document
+roots (`public_html` or an addon/subdomain folder, `422` otherwise); the agent pins them under
+`public_html` again. Because Apache only reads `.htaccess` on a request, every write is followed
+by a loopback probe of the folder (`GET http(s)://<domain>/<folder>/` against `127.0.0.1` with the
+`Host` header, 5 s, redirects not followed): a `500` means the block broke the site, the previous
+content is restored and the request answers `422 config_invalid`; any other status (`401` for a
+protected folder, `403` for a hidden listing) is reported in the answer as `probe.status`. The vhost
+template grants `AllowOverride All`, which covers the `AuthConfig`, `Limit`, `Indexes` and `FileInfo`
+classes these directives need. `GET /files/htaccess?path=` shows the parsed block (`foreign` counts
+hand-edited lines inside the markers), `POST /files/htaccess/probe { path }` runs the probe alone.
+
+#### 5.3 Directory privacy
+
+- **Purpose:** ask visitors for a username and password before a folder opens.
+- **Who:** feature `dirprivacy`; also while acting. Mutations with a token need `panel:files`.
+- **Screen:** pick a folder (`?path=`, default `public_html`); **Protection** (switch + the name
+  browsers show in the prompt, 1–64 letters, digits, spaces and `. _ ( ) ' -`); **Users** (add with
+  username `A-Za-z0-9._@-` ≤ 64 and a password ≥ 8 characters — an existing name gets the new
+  password; *Remove*).
+- **Server:** `GET /files/privacy?path=`, `PUT /files/privacy { path, enabled, realm? }`,
+  `POST /files/privacy/users { path, user, password }`, `DELETE /files/privacy/users?path=&user=`.
+  Passwords are hashed **server-side** with bcrypt (cost 12) and written as `$2y$` (what Apache's
+  APR validates; `$2a$`/`$2b$` are the same algorithm) into `~/.keel/htpasswd/<id>` — one file per
+  folder, `<id>` = the first 16 hex of sha256 of the folder path, so a folder keeps its users across
+  protect/unprotect. The file is `0640` with the web server's group when `web.detect` knows it
+  (`0644` otherwise); `.keel` and `.keel/htpasswd` are `0711`. Protecting a folder writes the (possibly
+  empty) password file first — a missing `AuthUserFile` makes Apache answer `500`. Audit
+  `panel.dirprivacy.set`, `panel.dirprivacy.user.add|remove` (never the password).
+- **Gotchas:** at most 200 users per folder; a protected folder with no users admits nobody; the
+  probe answers `401` for a protected folder, which is the expected result, not a failure.
+
+#### 5.4 Indexes
+
+- **Purpose:** whether a folder without an index page lists its files.
+- **Who:** feature `indexmanager`; also while acting. Token mutations need `panel:files`.
+- **Screen:** pick a folder; *Server default* (no line of your own: inherits), *No indexing*
+  (`Options -Indexes`, a listing answers `403`), *Show the file list* (`Options +Indexes`).
+- **Server:** `GET /files/indexes?path=`, `PUT /files/indexes { path, indexes: inherit|off|on }`.
+  Audit `panel.indexes.set`.
+- **Gotchas:** the vhost already sets `Options -Indexes` on the document root, so *Server default*
+  hides listings unless a folder above turned them on; neither screen needs the `filemanager`
+  feature (their routes sit ahead of that gate).
+
 ## 6. Email
 
 Routes under `/email` (`services/panel-email.js`); agent ops `vmail.*` (capabilities `dovecot`
@@ -697,21 +788,121 @@ removed), followed by `update-exim4.conf` and a reload.
   — dbconfig creates the `roundcube` database; `501 webmail` otherwise), Apache (`501 apache`), a
   fully-qualified `basic.hostname` (`422`) with its service certificate so the IMAP/SMTP names in
   the block verify, and the virtual-mail wiring live for the mailboxes to sign in.
-- **Gotchas:** link and prefilled username only — single sign-on into the webmail is not
-  available in this version. The distribution's own alias file (`/etc/roundcube/apache.conf`,
-  symlinked as `conf-enabled/roundcube.conf`, alias commented out on Debian) is never edited; if an
-  operator uncommented it, the status says so and `a2disconf roundcube` keeps the webmail off the
-  customer sites.
+- **Single sign-on (root switch, Panel › Customization › Account panel › Webmail › *Single sign-on*):**
+  once on, `GET /email/webmail` answers `sso: true` and *Open webmail* / the per-mailbox *Open* buttons
+  (and *Open webmail* in the mailbox connection sheet) no longer link: they `POST /email/webmail/sso
+  { mailbox }` and open the answered `url` (`https://<hostname>/webmail/?_keel=<token>`) in the window
+  the click opened. The token is single-use and valid for 60 s (`panel_sso_tokens`, sha256 only); the
+  mailbox must be one of yours and not suspended (404/409), the request must come from a browser
+  session (API tokens get `403 session_required`), feature `emailaccts`. Roundcube's `keel_sso`
+  plugin exchanges the token over loopback (`GET /api/panel/sso/webmail/<token>`, accepted only from
+  `127.0.0.1`/`::1` and never with a forwarded header; a replay answers 404) for the Dovecot **master
+  credential** (`keel-master`), signs the mailbox in with it as the SASL authentication identity (the
+  mailbox stays the login name, so it is the same Roundcube user as a password login: one set of
+  identities, contacts and settings) and opens the inbox without a login form; the mailbox password
+  stays what it is for mail apps. Opening a second mailbox while one is open switches the webmail
+  session to it; opening the mailbox that is already open just lands in it. A suspended mailbox
+  keeps a plain link. Audit
+  `panel.email.webmail.sso` (mailbox, expiry) and `panel.sso.exchange`; the exchange is recorded on
+  the server only.
+- **While acting:** refused with `403 not_while_impersonating` (audited) unless the operator turned on
+  *Allow while logged in as an account*; then the audit row names the administrator (`actingAs`/`by`).
+- **Gotchas:** an operator-configured *Webmail URL* never gets
+  single sign-on (the plugin only lives in the published Roundcube). The distribution's own alias
+  file (`/etc/roundcube/apache.conf`, symlinked as `conf-enabled/roundcube.conf`, alias commented
+  out on Debian) is never edited; if an operator uncommented it, the status says so and `a2disconf
+  roundcube` keeps the webmail off the customer sites.
 
 #### 6.8 Mail usage
 
 - **Purpose:** messages sent and delivered recently.
 - **Who:** feature `emailaccts`; also while acting.
 - **Screen:** totals, per domain and per mailbox for the last 1–168 hours (default 24), plus
-  storage (mailboxes, quota allocated, `max_email`).
+  storage (mailboxes, quota allocated, `max_email`); the **Messages** table — every log entry for
+  your domains and mailboxes in the window, 25 per page, with a text search (sender, recipient,
+  subject, detail or message id) and a status filter (*delivered*, *failed*, *deferred*,
+  *rejected*, *queued*, *completed*); the **Folders** card — pick a mailbox and see each folder's
+  message count, unread count and size as the mail server indexes them, with **Empty** on *Trash*
+  and *Junk* and **Delete old mail** on any other folder (asks for an age in days, at least 7;
+  anything saved more recently stays). Both actions confirm first and are permanent.
 - **Server:** `GET /email/usage?sinceHours=` → *Email › Mail Delivery Reports* and *View Mail
-  Statistics* filtered to exactly this account's domains and mailboxes.
-- **Needs:** Exim logs readable by the panel (`501` otherwise).
+  Statistics* filtered to exactly this account's domains and mailboxes; `GET /email/usage/messages
+  ?sinceHours&q&status&page&pageSize` (post-filtered the same way, then searched and paged,
+  `pageSize` ≤ 100); `GET /email/accounts/:id/folders` → `doveadm mailbox status` through the agent
+  (`vmail.mailbox.status`), `meta.usage` is the quota line of the mailbox; `POST
+  /email/accounts/:id/folders/:folder/empty { olderThanDays? }` → `doveadm expunge -u <mailbox>
+  mailbox <folder> [savedbefore <N>d] all` (`vmail.mailbox.expunge`, destructive, audited
+  `panel.email.folder.empty` with the counts before and after). Without `olderThanDays` only
+  `Trash` and `Junk` are accepted (`422` otherwise); the agent enforces the same rule.
+- **Needs:** Exim logs readable by the panel (`501` otherwise); Dovecot for the folders card
+  (`501` without it; `404` for a folder the mailbox does not have).
+
+#### 6.9 Email filters and Account-wide filters
+
+- **Purpose:** sort, forward or discard incoming mail with Sieve rules — per mailbox (*Email
+  filters*) or for every mailbox of the account (*Account-wide filters*, which run first).
+- **Who:** feature `emailfilters`; at most `panel.mail.max_filters_per_scope` (100) rules per
+  mailbox and per account; also while acting.
+- **Screen:** *Email filters* asks for a mailbox (kept in `?mailbox=<id>`), then lists its rules in
+  the order they run with *Enabled/Disabled*, *Edit*, *Enable/Disable*, *Move up/down*, *Delete*,
+  and *Create filter*: a name, one or more conditions (*From*, *To*, *Subject*, *Body*, *Any
+  header* — From, To, Cc, Subject, Reply-To, Sender, List-Id — or *Other header…* with its name;
+  *contains*, *does not contain*, *is exactly*, *matches* with `*`/`?` wildcards; *All* or *Any*
+  of the conditions), one or more actions in order (*Deliver to folder* — INBOX, Junk, Trash,
+  Archive, Drafts, Sent or another name, the folder is created when missing —, *Redirect to
+  address*, *Discard the message*, *Stop processing further filters*) and an *Enabled* switch.
+  *Test* compiles the rule on the server and shows the compiler's verdict with the generated
+  script; the *Generated script* card shows the whole script of the scope.
+- **Server:** `GET/POST /email/filters?mailbox=<id>`, `PUT/DELETE /email/filters/:id`,
+  `POST /email/filters/reorder?mailbox=<id> { ids }` (every id of the scope exactly once),
+  `POST /email/filters/test?mailbox=<id> { rules }`; the same under `/email/global-filters`
+  without the mailbox. Rules are **structured only** (`match[] { header, name?, op, value }`,
+  `actions[] { type, folder?, address? }`, `matchAll`); the panel renders the Sieve script
+  (`services/panel-email.js renderSieve`, every value escaped inside a quoted string, values
+  single-line, folder names without quotes, slashes or leading/trailing/doubled dots, redirect
+  targets plain addresses, at most 4 redirects per rule) and hands it to **`vmail.sieve.write`**,
+  which, as the account uid, stages the script beside its final name, compiles it with `sievec`,
+  and only then replaces `~/mail/<domain>/<local>/sieve/keel.sieve` (+ `keel.svbin`) and swaps the
+  `.dovecot.sieve` symlink — or, for the account scope, `~/mail/sieve-global/keel.sieve` (Dovecot's
+  `sieve_before`). A rule that does not compile is `422 sieve_compile_failed` with the compiler
+  lines and the previous script stays active; the last rule of a scope removed deletes the script
+  (`vmail.sieve.remove`). Rows live in `panel_mail_filters` (migration `034c`); deleting a mailbox
+  deletes its rules. Audit `panel.email.filter.create|update|delete|reorder`.
+- **Needs:** Dovecot with Pigeonhole (`dovecot-sieve`; `501 sieve` without `sievec`), the
+  virtual-mail wiring live (the `98-whm-virtual-auth.conf` fragment loads the `sieve` plugin for
+  LMTP and names both script locations; re-apply it under *Service Configuration › Exim
+  Configuration Manager › virtual mail* after installing the package, then restart Dovecot).
+- **Gotchas:** filters run at delivery (LMTP) only — mail already in the mailbox is not re-sorted;
+  ManageSieve stays off, so a client's own Sieve editor cannot replace the panel's script; a folder
+  named in *Deliver to folder* is created on first use; mail redirected elsewhere still counts as
+  delivered here when the rule has no *Discard* or *Stop*.
+
+#### 6.10 Email routing
+
+- **Purpose:** where mail for each of your domains is delivered: on this server (*Automatic* or
+  *Local mail exchanger*) or at another mail server named by the public MX records (*Remote mail
+  exchanger*).
+- **Who:** every account user; also while acting.
+- **Screen:** one row per domain (main, addon, sub, parked) with the routing select and its
+  explanation, the *Effective* side (Local/Remote), the *Public MX* column (what the internet's
+  DNS says today: *Points here*, *Points elsewhere* with the exchangers, *No MX record*, *Lookup
+  failed*), the mailbox count, **Save** per row and **Re-check MX**. A domain delivered here whose
+  MX points elsewhere gets a hint and, when its DNS is managed at another provider, the delegation
+  banner with the exact `MX 10 <server hostname>` record to add there. *Remote* is greyed out while
+  the domain has mailboxes on this server.
+- **Server:** `GET /email/routing` (every domain), `GET|PUT /email/domains/:domain/routing
+  { routing: 'auto'|'local'|'remote' }`. `PUT` claims the mail domain for the account, then
+  *Email › Email Routing* (`ctx.mail.setRouting`) rewrites Exim's `local_domains.lst` /
+  `relay_domains.lst` and verifies Exim reads them; `applied:false` with `reason`/`hint` when it
+  does not (the choice is saved either way). The MX comes from the Email category's resolver
+  (`ctx.mail.mxStatus`), with no port-25 probe. Audit `panel.email.routing.set`.
+- **Needs:** Exim for the apply (`applied:false` otherwise); the Email category.
+- **Gotchas:** `409 mailboxes_exist` when switching to remote with mailboxes present — delete them
+  first; `409 routing_remote` when creating a mailbox on a domain you routed remotely — switch it
+  back first (the panel never flips an explicit *Remote* back to local by itself; the first mailbox
+  only turns *Automatic* into *Local*). Forwarders, autoresponders and the default address of a
+  remote domain are not consulted here any more. Backup MX ("relay") routing is an administrator
+  setting and is not offered in the account panel.
 
 ## 7. Databases
 
@@ -764,15 +955,28 @@ prefix when it is missing, regardless of the console's `db.prefixing` setting.
 
 - **Purpose:** open the database administration tool.
 - **Who:** feature `phpmyadmin`; also while acting.
-- **Screen:** a link when phpMyAdmin is installed, enabled in the console
+- **Screen:** **Open phpMyAdmin** when phpMyAdmin is installed, enabled in the console
   (`db.phpmyadmin.enabled`) and published under the server hostname
-  (`https://<hostname>/phpmyadmin/`, MANUAL-partB §20.9), with your database user names to
-  log in with. "No address yet" means the provider has not published it.
-- **Server:** `GET /databases/phpmyadmin` → `{ installed, url, featureEnabled, version, users }`;
-  `url` is the published address (or the console's URL override), never a guess.
-- **Gotchas:** link only, no single sign-on, and no prefilled user name — phpMyAdmin's cookie
-  login only reads the name from its own form, so type one of the listed users; nothing is
-  offered on a PostgreSQL profile.
+  (`https://<hostname>/phpmyadmin/`, MANUAL-partB §20.9), with your database user names. With
+  **single sign-on** switched on by the provider (MANUAL-partB §20.9) the button opens phpMyAdmin
+  already signed in to the account's databases through a one-minute, single-use link; without it
+  phpMyAdmin asks for one of the listed users and its password. "No address yet" means the
+  provider has not published it.
+- **Server:** `GET /databases/phpmyadmin` → `{ installed, url, featureEnabled, version, users, sso }`;
+  `url` is the published address (or the console's URL override), never a guess; `sso` is true
+  only for the panel's own publication with sign-on on. `POST /databases/phpmyadmin/sso {}`
+  (browser session only, `403 session_required` for API tokens; `409 sso_unavailable` while off)
+  → `{ url, user, expiresAt }`: the hidden user `<username>_pma` (recreated for every sign-on with
+  `GRANT ALL` on each database you own at that moment — a database created afterwards shows up at the
+  next sign-on — password never shown) is handed to phpMyAdmin through the signon
+  script `/keel/pma-signon.php` over loopback (contract §44). Audit `panel.db.phpmyadmin.sso`.
+- **Gotchas:** without single sign-on there is no prefilled user name — phpMyAdmin's cookie
+  login only reads the name from its own form; with it, the cookie login is still there as
+  "Sign in with a database user" (`?server=2`) on the phpMyAdmin page. The `pma` user name is
+  reserved (`400`) and `<username>_pma` never appears in *Database users*. A sign-on link used
+  twice or after a minute lands on a page that says so. Nothing is offered on a PostgreSQL
+  profile, and on MySQL (user names of 32 characters at most) an account name longer than 28
+  characters answers `409 sso_unavailable`.
 
 ## 8. FTP
 
@@ -880,6 +1084,34 @@ only the archives generated or uploaded from the panel** (`retention_class = pan
   this account.
 - **Needs:** the bandwidth collection schedule running (*Account Information*).
 
+#### 11.3 Visitors
+
+- **Purpose:** who visits your sites — unique visitors, requests, bytes transferred, top pages,
+  referring sites, missing addresses, responses (countries when the server has a GeoIP database),
+  visitors per day, and the complete GoAccess report.
+- **Who:** feature `webstats`; also while acting.
+- **Screen:** pick a domain (main, addon and subdomains; parked aliases share their target's
+  report); stat tiles and top-ten tables from the stored summary; **Generate now** (or *Generate
+  again*) queues a job for that domain — one at a time per account, and at most once per
+  `panel.stats.generate_cooldown_s` (default 600 s) per domain, after which the button says when
+  it reopens; **Open full report** shows the GoAccess HTML inside an isolated frame (*New tab*
+  opens it on its own). *All domains* lists every domain with its last generation and state.
+- **Server:** `GET /logs/stats` → `{ goaccess: { installed, version }, cooldownSeconds, schedule,
+  domains: [{ domain, type, available, generatedAt, running, cooldownUntil, error, summary }] }`;
+  `POST /logs/stats/:domain/generate` → `202 { job }` (`409 busy`, `429 generate_cooldown` with
+  `retryAfterSeconds`); `GET /logs/stats/:domain/report` streams the HTML with
+  `Content-Security-Policy: sandbox allow-scripts; frame-ancestors 'self'` and
+  `X-Frame-Options: SAMEORIGIN` (it is customer-generated content: it runs with an opaque origin and
+  never sees the panel session). Reports are rendered **as the account** by the agent op
+  `stats.goaccess.run` into `~/.keel/stats/<domain>.html` with `<domain>.summary.json` next to it,
+  with the lowest CPU/I-O priority and a 120 s limit, from `/var/log/whm/domlogs/<user>/<domain>-access.log`
+  and `-ssl-access.log`; the nightly job `panel.stats.generate` (schedule `panel-stats-generate`,
+  01:50) does the same for every active account whose plan includes the feature and skips domains
+  whose logs are empty. Audit `panel.stats.generate`.
+- **Needs:** `goaccess` installed (`501` with an install prompt otherwise — `apt install goaccess`,
+  RHEL `goaccess` from EPEL); `setpriv`/`runuser`. Without visitors there is nothing to generate: the
+  page says so until the first request reaches the site.
+
 ## 12. PHP
 
 #### 12.1 PHP versions
@@ -929,12 +1161,18 @@ Routes under `/security` and `/tokens`. Mutations here are **session-only** (an 
 
 - **Purpose:** protect sign-in with a one-time code.
 - **Who:** any plan; never while acting.
-- **Screen:** state (*enabled*, *required by policy*, *enrolment pending*); **Enable** shows the
-  secret and QR code and asks for a 6-digit code to confirm; **Disable** asks for the password or
-  a current code.
+- **Screen:** state (*enabled*, *required by policy*, *enrolment pending*); **Enable** shows a
+  QR code of the `otpauth://` link (drawn in the browser by `client/src/lib/qr.js`, byte mode,
+  error level M, versions 1–10 — nothing leaves the page), the secret key and the link to copy,
+  then asks for a 6-digit code to confirm; **Disable** asks for the password or a current code.
+  *How it works* says plainly that **recovery codes are not issued** on this server: a lost
+  authenticator is reset by the provider (C.3).
 - **Server:** `GET /security/two-factor`, `POST /security/two-factor/enroll|confirm|disable` —
-  thin proxies to the console's enrolment (`/api/auth/2fa/*` logic) for this login.
-- **Gotchas:** *Disable* answers `403` while the operator requires 2FA for account users.
+  thin proxies to the console's enrolment (`/api/auth/2fa/*` logic) for this login. The policy
+  itself is one check, `ctx.panel.assertTwoFactor(user, path)`, run by the panel middleware for
+  every scoped request and by the core password seam (`/api/auth/password`).
+- **Gotchas:** *Disable* answers `403` while the operator requires 2FA for account users. The
+  console's own enrolment page (*Security Center › Two-Factor Authentication*) shows the same QR code.
 
 #### 13.3 SSH keys
 
@@ -986,6 +1224,24 @@ Routes under `/security` and `/tokens`. Mutations here are **session-only** (an 
   session-only. A token of a panel login reaches only `/api/panel/*` (every console route needs
   root or reseller) and `/api/auth/me`.
 
+#### 13.6 IP blocker
+
+- **Purpose:** keep addresses and ranges away from your sites.
+- **Who:** feature `ipblocker`; also while acting; mutations session-only (`403 session_required`
+  over a token, reads allowed with `panel:read`).
+- **Screen:** blocked entries with their kind (one address, IPv4/IPv6 range); **Block** an
+  address or a CIDR range (`203.0.113.9`, `203.0.113.0/24`, `2001:db8::/32`); *Unblock*; the
+  result of the probe after each change.
+- **Server:** `GET /security/ip-blocker`, `POST /security/ip-blocker { ip }` (`201`, `409` when
+  already listed), `DELETE /security/ip-blocker?ip=` (`404` when not listed). The list becomes a
+  `<RequireAll>` with `Require all granted` (or `Require valid-user` when the folder is also
+  protected) and `Require not ip …` lines (16 entries per line) in `public_html/.htaccess`, so it
+  covers the main domain and every addon or subdomain served from inside `public_html`; a blocked
+  visitor gets `403`. Audit `panel.ipblocker.add|remove`.
+- **Gotchas:** at most 500 entries; link-local zone ids (`fe80::1%eth0`) are refused; blocking your
+  own address locks you out of the website, not out of the panel; the loopback probe always comes
+  from `127.0.0.1`, so it cannot tell you whether your own address is blocked.
+
 ## 14. Usage
 
 #### 14.1 Usage
@@ -1002,6 +1258,80 @@ Routes under `/security` and `/tokens`. Mutations here are **session-only** (an 
   server-wide disk-refresh job, a running one is reused).
 - **Gotchas:** a refresh is accepted once per account every 10 minutes (`429 rate_limited`);
   `501` when the account-information category is not available.
+
+## 15. Advanced
+
+Routes under `/advanced` (`services/panel-htaccess.js`). No token scope is granted for this
+group, so its mutations are session-only.
+
+#### 15.1 Error pages
+
+- **Purpose:** your own pages for 404 and the other error responses.
+- **Who:** feature `errpgs`; also while acting.
+- **Screen:** pick a domain (main, addon or subdomain); one row per response (`400`, `401`, `403`,
+  `404`, `500`, `503`) with its state — *Server default*, *Custom page* (written here), *Your own
+  file* (a hand-made `errors/<code>.html` that is switched on) or *File present, not used*;
+  **Create/Edit** a heading (one line, ≤ 120 characters) and a message (plain text ≤ 4,000
+  characters, blank line = new paragraph); *Use default* removes the page.
+- **Server:** `GET /advanced/error-pages?domain=`, `PUT /advanced/error-pages/:code { domain,
+  title, message }`, `DELETE /advanced/error-pages/:code?domain=&deleteFile=true|false`. The page
+  is rendered by the agent from a text-only template (everything escaped, no scripts, no external
+  references, a `<!-- keel-errorpage {…} -->` comment carries the fields back) into
+  `<docroot>/errors/<code>.html` (`0644`, `errors/` `0755`) as the account, then
+  `ErrorDocument <code> /errors/<code>.html` is added to the document root's managed block.
+  Audit `panel.errorpages.set|remove`.
+- **Gotchas:** a file in `errors/` the panel did not write is listed as *managed: false* and left
+  untouched (only the `ErrorDocument` line is managed); `401` pages are shown after a failed sign-in
+  to a protected folder; the probe after a change hits the document root, not the error page.
+
+---
+
+## 16. Software
+
+Routes under `/software` (`services/panel-software.js`). No token scope is granted for this
+group, so installs, updates and removals are session-only; the list is readable with `panel:read`.
+
+#### 16.1 WordPress
+
+- **Purpose:** install the current WordPress release on one of your domains with its own database,
+  see every WordPress site under your document roots, open its dashboard, update it, remove it.
+- **Who:** feature `wordpress`; also while acting.
+- **Screen:** *Install WordPress* — domain (main, addon or subdomain), an optional folder below its
+  document root (`blog` → `https://example.com/blog`), site title, administrator user name (avoid
+  `admin`), administrator e-mail (your contact address is prefilled) and either a generated
+  administrator password (shown **once**, with a copy button, when the install starts) or one you
+  type. *Your WordPress sites* lists every directory with a `wp-config.php` and
+  `wp-includes/version.php` under your document roots — including sites you uploaded yourself — with
+  its version and database; row actions **Open admin**, **Update** (WP-CLI hosts only) and
+  **Remove** (with an *also delete the database* switch when the database is one of this account's).
+  A live log follows each install or update.
+- **Server:** `GET /software/wordpress` → `{ data: [{ id, path, domain, under, url, adminUrl, version,
+  database, dbUser, tablePrefix, isDocroot, databaseOwned }], meta: { requirements, canInstall, hint,
+  updates, sites, prefix } }`; `POST /software/wordpress { domain, path?, title, adminUser, adminEmail,
+  adminPassword?, locale? }` → `202 { job, id, url, adminUrl, database, dbUser, generatedPassword,
+  adminPassword? }`; `GET /software/wordpress/jobs/:id[/stream]`; `POST /software/wordpress/:id/update`
+  → `202 { job }`; `DELETE /software/wordpress/:id?confirm=true&database=true|false`. The database
+  and its user are `<user>_wp`, `<user>_wp2`, … (first free name, plan quota and prefix rules as in
+  *Databases*; the user holds all privileges on that one database). The job then runs as the
+  account user: with WP-CLI on the server one `web.wp.install` (download, `wp config create`,
+  `wp core install`, theme check); without it the panel downloads `https://wordpress.org/latest.zip`
+  itself (root, into its scratch directory, 120 s, 96 MiB limit, SHA-1 compared with the published
+  `latest.zip.sha1`), lists and unpacks it as the account (every member must sit under `wordpress/`,
+  no links, nothing may already exist with the same name), writes `wp-config.php` (`0600`, locally
+  generated salts, `WP_DEBUG` off, `php -l` checked) and posts the WordPress installer's own step
+  over loopback to the site (`Host` header, HTTPS when the domain has a certificate — the site URL
+  WordPress records follows that). A failed install removes what it unpacked and drops the user and
+  the database again, so the retry gets the same names. Audit `panel.wp.install` (+ `.done` /
+  `.failed`), `panel.wp.update` (+ `.done`), `panel.wp.remove`; passwords never appear in the audit
+  or in the job view.
+- **Gotchas:** without WP-CLI *Update* answers `501` — update from the site's own *Dashboard › Updates*
+  (the panel says so); `wp-config.php` is readable by the account only (`0600`), which is what the
+  per-account PHP-FPM pool runs as; a site whose `wp-config.php` names another account's database is
+  listed but its database is never touched; the installer refuses a folder that already holds a
+  WordPress tree (`409`) or files named like the release's (`index.php`, `wp-admin`, …); when the host
+  lacks WP-CLI and `php-mysql` + `unzip`, the page says what to ask your provider for and the API answers
+  `501`; only `en_US` is downloaded without WP-CLI (`locale` is passed to the installer, which installs
+  the language pack later from the dashboard).
 
 ---
 
@@ -1020,7 +1350,7 @@ as history* table ([C.9.4](#c94-login-as-history)). The API is `GET/PUT /api/pan
 | Field (setting key) | Meaning |
 |---|---|
 | `enabled` (`panel.enabled`, default `true`) | Off: every `/api/panel/*` request except this one answers `403 panel_disabled` and `/panel` shows *The account panel is switched off*. Account logins are still created and kept in sync, so turning it on later needs no backfill. |
-| `require2faForUsers` (`panel.require_2fa_for_users`, default `false`) | Force account users to enrol an authenticator before using the panel ([C.3](#c3-password-and-two-factor-rules)); also blocks them from disabling it. |
+| `require2faForUsers` (`panel.require_2fa_for_users`, default `false`) | Force account users to enrol an authenticator before using the panel ([C.3](#c3-password-and-two-factor-rules)); also blocks them from disabling it. The answer carries `linkedUsers` and `usersWithoutTotp` (how many logins the switch will send to the enrolment page), the card shows the count under the toggle, and *Security Center › Security Advisor* lists the policy as `panel.2fa.policy` ("Account panel users: two-factor required/optional (N linked users without an authenticator)"). |
 | `loginAsTtlMinutes` (`panel.login_as_ttl_minutes`, default 60, 5–480) | How long a "Log in as" context lasts. |
 | `webmailUrl` (`panel.webmail_url`, default empty) | An `http(s)` URL shown as the webmail link and in client settings; empty means the webmail published under the hostname site (or otherwise detected, [6.7](#67-webmail)). |
 
@@ -1143,3 +1473,76 @@ per-field hints. Console-wide codes (`validation_failed`, `agent_unavailable`, `
   `panel.email.account.create`, `panel.cron.set`, `panel.password.change`, `panel.login_as`, …),
   visible in the console's *Audit log*; while acting, `principal` is the administrator and the
   arguments carry `actingAs` and `by`.
+
+## Appendix: Languages
+
+Every sentence the account panel prints comes from the locale catalogue, so a translation made
+under *Locales* in the console reaches the customer without a code change.
+
+- **Where the strings live.** `client/src/i18n/en.json` is the base catalogue (flat keys, English
+  values); the browser loads the active locale once per page load from `GET /api/locales/active`
+  (the viewer's own choice first, then the login's stored language from *Overview › Preferences*,
+  then the server default) and `t(key, fallback)` answers the translation, or the English text when
+  the locale has no entry for the key.
+- **Key layout.** Navigation labels and descriptions are `panel.<group>/<function>.label|description`,
+  group names `panel-category.<group>`, the shell `panel.shell.*` and `panel.home.*`, and every
+  page string `panel.<group>.<key>` (`panel.databases.*`, `panel.security.*`, `panel.logs.*`,
+  `panel.usage.*`, `panel.software.*`, `panel.advanced.*`, `panel.email.*`, …). Buttons shared by
+  many screens use `common.*` (*Refresh*, *Cancel*, *Close*, *Delete*, *Copy*, *Download*).
+- **Placeholders and plurals.** A value the page fills in is written `{name}` in the catalogue
+  (`"Delete {name}?"`, `"{count} of {max} entries"`); keep the braces and the name, move them
+  wherever the language needs them. Counted sentences have two keys, `<key>_one` for exactly one
+  and `<key>_other` for everything else (`panel.security.keys_count_one` / `_other`); both may use
+  `{count}`. Sentences that wrap a code sample are split into `<key>_before` / `<key>_after` around
+  it.
+- **What stays as the server sends it.** Error messages from the API (the text under *Not available
+  on this server*, validation details), names the host supplies (domains, files, databases, log
+  lines, error-page titles from the web server) and the keyboard hint `Alt /` are not translated
+  by the catalogue. Status pills capitalise the first letter of their text.
+- **Checking a translation.** `client/test/panel-i18n-*.test.jsx` render every page with a `t()`
+  that answers the key and fail on any English sentence left in the markup; the end-to-end sweep
+  `e2e/panel-check.cjs` repeats the walk through every panel page under a pseudo-locale that serves
+  every catalogue string as `⟦key⟧` and reports page text that did not come from the catalogue.
+  A new string must therefore be added to `en.json` together with its `t()` call.
+
+## C.11 Languages
+
+The account panel reads every label, hint, button, empty state, confirmation and toast from the
+locale catalogue (`client/src/i18n/en.json`, served by `GET /api/locales/active`); English is the
+built-in fallback for any key a locale leaves out, so a partial translation never shows a bare key.
+Keys follow the page group: `panel.<group>.<page>.<name>` for page strings and
+`panel.<group>.common.<name>` for the words a group shares (*Cancel*, *Delete*, *Status*, *Domain*).
+Values may carry `{placeholders}` (`"Mailbox {address} created"`); they are filled after the lookup,
+so a translation can reorder them. Plural forms are separate keys (`limit_text` / `limit_text_one`)
+rather than grammar in the string. Option labels of selects and radio groups are keyed by their
+value (`panel.email.routing.option_remote`, `panel.email.filters.op_contains`).
+
+- **Email** (`panel.email.*`, 517 keys): mailboxes with the *Connect* sheet (server, port and
+  certificate wording), forwarders, the default address, autoresponders (state and interval
+  labels), deliverability (check names, statuses, DKIM card, delegation banner), spam filters
+  (threshold hints and unavailable reasons), webmail, mail usage (windows, statuses, folders),
+  routing (MX summaries) and the Sieve filter builder (header, operator and action names, the
+  rule description in the list). The *DNS is managed elsewhere* banner shared with Domains and
+  DNS lives under `panel.email.delegation.*`.
+- **Overview, Domains, DNS, SSL, Files** (`panel.overview.*`, `panel.domains.*`, `panel.dns.*`,
+  `panel.ssl.*`, `panel.files.*`, 681 keys, flat `panel.<group>.<name>`): the Account details
+  page keeps its earlier `panel.account.*` keys and names each plan feature by the function it
+  gates (`panel-category.<slug>` › `panel.<group>/<function>.label`); Preferences (contact form,
+  notification switches `notify_<key>` / `notify_<key>_help`, language card); every domains page
+  with its forms, limit notices (`limit_none`, `limit_full`, `usage_of`, `allowed_of`), type and
+  filter labels (`type_<type>`, `filter_<key>`) and removal dialogs; the zone editor's record
+  form per type (CAA tags and flags keyed `caa_<tag>`, `caa_flag_<n>`), stat tiles and publish
+  states; SSL status, install and certificates (state and type pills in lower case, the kit
+  capitalises them; `kind_<kind>` tabs; generate and upload dialogs); the file manager, its
+  dialogs (name, copy, permissions `perm_<r|w|x>` / `who_<owner|group|others>`, upload, archive,
+  editor), disk usage, directory privacy and indexes (`index_<value>` / `index_<value>_help`).
+  Counted strings use a `_one` / `_other` pair chosen by the number (`n_items`, `files_uploaded`,
+  `items_deleted`, `upload_n_files`); `{count}` and the other `{placeholders}` are filled by
+  `client/src/i18n/fill.js`. Sentences that wrap a link or a `<code>` path are split into the
+  parts around it (`dp_rules_in` … `dp_between_markers` … `dp_never_inside`), so a translation
+  keeps the path where it is. The pseudo-locale pass for these five groups is
+  `client/test/panel-i18n-group1.test.jsx`.
+
+A pseudo-locale test per group (`client/test/panel-i18n-<group>.test.jsx`) renders every page with
+a catalogue that answers each key with itself and fails on any English sentence left in the
+markup; the strings of the shared kit (`components/`) are listed there and translated with it.

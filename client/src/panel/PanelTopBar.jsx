@@ -46,7 +46,7 @@ export function PanelTopBar({ onMenu }) {
             if (e.key === 'Enter') go(results[highlight]);
             if (e.key === 'Escape') setQ('');
           }} aria-label={t('panel.shell.search_tools', 'Search tools')} />
-        {!q && <kbd>Alt /</kbd>}
+        {!q && <kbd className="kbd-hint">Alt /</kbd>}
         {results.length > 0 && (
           <ul className="search-results" role="listbox">
             {results.map((f, i) => (

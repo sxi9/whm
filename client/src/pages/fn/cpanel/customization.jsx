@@ -226,7 +226,7 @@ export function AccountPanelSettingsCard() {
               <Toggle checked={draft.enabled} onChange={set('enabled')} label="Account panel enabled" description="Off: every account panel request is refused and the sign-in page says the panel is switched off. Account logins are still created and kept in sync." />
             </Field>
             <Field label="Two-factor authentication">
-              <Toggle checked={draft.require2faForUsers} onChange={set('require2faForUsers')} label="Require 2FA for account users" description="Account users must enrol an authenticator before using the panel and cannot disable it afterwards." />
+              <Toggle checked={draft.require2faForUsers} onChange={set('require2faForUsers')} label="Require 2FA for account users" description={`Account users must enrol an authenticator before using the panel and cannot disable it afterwards.${data?.usersWithoutTotp != null ? ` ${data.usersWithoutTotp} of ${data.linkedUsers ?? data.usersWithoutTotp} linked login${data.linkedUsers === 1 ? '' : 's'} ${data.usersWithoutTotp === 1 ? 'has' : 'have'} no authenticator yet${draft.require2faForUsers && !data.require2faForUsers ? ' and will be asked to enrol at the next sign-in' : ''}.` : ''}`} />
             </Field>
             <Field label="Log in as window (minutes)" required error={errors.loginAsTtlMinutes} help={`How long a “Log in as” context lasts before it ends on its own (${LOGIN_AS_TTL.min}–${LOGIN_AS_TTL.max}).`}>
               <NumberInput value={draft.loginAsTtlMinutes} onChange={set('loginAsTtlMinutes')} min={LOGIN_AS_TTL.min} max={LOGIN_AS_TTL.max} step={1} nullable />
@@ -258,6 +258,8 @@ export function webmailState(s) {
   if (s.site && (!s.site.exists || !s.site.enabled)) return { status: 'warning', label: 'Hostname site missing', detail: 'The drop-in exists but the hostname site is absent or disabled; apply the hostname site (Manage Service SSL Certificates).' };
   if (s.site && !s.site.ssl) return { status: 'warning', label: 'Published without HTTPS', detail: 'The hostname site has no service certificate yet; install one (AutoSSL for the hostname) and publish again.' };
   if (s.config && s.config.exists && !s.config.inSync) return { status: 'warning', label: 'Mail hosts out of date', detail: 'config.inc.php does not carry the current hostname or company name; publish again to rewrite the Keel block.' };
+  // Apache loading the drop-in is not the webmail answering: the status carries a loopback probe of the URL.
+  if (s.http && s.http.ok === false) return { status: 'failed', label: `Published but answering ${s.http.status ?? 'nothing'}`, detail: s.warning || `https://${s.hostname}/webmail/ does not answer with a page.` };
   return { status: 'active', label: 'Published', detail: null };
 }
 
@@ -273,7 +275,7 @@ export function WebmailPublishCard() {
     setActionError(null);
     try { const r = await fn(); toast.success(done(r.data)); refetch(); } catch (err) { setActionError(err); toast.error(err); } finally { setBusy(false); }
   };
-  const publish = () => run(() => api.post('/service-config/webmail/publish', {}), (d) => `Webmail published at ${d.url}`);
+  const publish = () => run(() => api.post('/service-config/webmail/publish', {}), (d) => (d.warning ? `Webmail published at ${d.url} — ${d.warning}` : `Webmail published at ${d.url}`));
   const unpublish = async () => {
     if (!(await confirm({ title: 'Unpublish webmail?', message: `${data?.url || 'The webmail URL'} stops answering and the Keel block is removed from config.inc.php; the application stays installed.`, confirmLabel: 'Unpublish', danger: true }))) return;
     return run(() => api.delete('/service-config/webmail'), () => 'Webmail unpublished');
@@ -296,12 +298,91 @@ export function WebmailPublishCard() {
             ['Application', data.installed ? `${data.flavor}${data.version ? ` ${data.version}` : ''} (${data.root || data.path})` : '—'],
             ['Address', data.url ? <a key="u" href={data.url} target="_blank" rel="noopener noreferrer">{data.url}</a> : '—'],
             data.published && ['Apache', <code key="f">{data.published.file}</code>],
+            data.http && ['Answers', data.http.status == null ? <StatusPill key="h" status="unknown">not probed: {data.http.error || 'no answer'}</StatusPill> : <StatusPill key="h" status={data.http.ok ? 'ok' : 'failed'}>HTTP {data.http.status}</StatusPill>],
             data.config && ['Mail hosts', data.config.exists ? (data.config.managed ? `${data.config.managed.imapHost} · ${data.config.managed.smtpHost} · "${data.config.managed.productName}"` : 'Distribution defaults (localhost:143, no TLS)') : 'config.inc.php missing'],
             data.lastApply && ['Last publish', `${formatDate(data.lastApply.at)}${data.lastApply.ok ? '' : ` — failed: ${data.lastApply.error}`}`],
           ]} />
           {state.detail && <p className="muted">{state.detail}</p>}
           {data.globalAlias && <p className="muted">The distribution also serves it as <code>{data.globalAlias.alias}</code> on every site (<code>{data.globalAlias.file}</code>); run <code>a2disconf</code> on that fragment so customer sites do not answer for it.</p>}
           {data.config?.ok === false && <p className="muted">PHP reports a syntax error in <code>{data.config.path}</code>; the webmail cannot start until it is fixed.</p>}
+          {data.sso && data.flavor === 'roundcube' && <WebmailSsoSettings sso={data.sso} published={Boolean(data.published?.managed)} busy={busy} run={run} />}
+        </>
+      )}
+      <ErrorBanner error={actionError} />
+    </Card>
+  );
+}
+
+// What the SSO rows say about GET /service-config/webmail → sso.
+export function webmailSsoState(sso, published) {
+  if (!sso?.enabled) return { status: 'disabled', label: 'Off', detail: null };
+  if (!sso.masterConfigured) return { status: 'warning', label: 'No master credential', detail: 'The master password was never generated; switch single sign-on off and on again.' };
+  if (sso.dovecot && !sso.dovecot.rendered) return { status: 'warning', label: 'Dovecot not updated', detail: 'The virtual-mail include does not carry the master passdb yet; apply the virtual mail configuration (Service Configuration › Exim Configuration Manager) or restart the panel so the boot job renders it.' };
+  if (!published) return { status: 'pending', label: 'Waiting for publish', detail: 'Single sign-on works once the webmail is published here (the plugin is installed by the publish).' };
+  if (!sso.plugin?.installed || !sso.plugin?.loaded) return { status: 'warning', label: 'Plugin not loaded', detail: `The ${sso.plugin?.name || 'keel_sso'} plugin is not ${sso.plugin?.installed ? 'listed in config.inc.php' : 'installed'}; publish again to copy it from the deployed tree and enable it.` };
+  return { status: 'active', label: 'On', detail: null };
+}
+
+// Single sign-on toggle (PUT /panel/admin/webmail/sso): the Dovecot master
+// user, the Roundcube plugin and the "while logged in as" allowance.
+export function WebmailSsoSettings({ sso, published, busy, run }) {
+  const state = webmailSsoState(sso, published);
+  const set = (body, done) => run(() => api.put('/panel/admin/webmail/sso', body), () => done);
+  return (
+    <div style={{ marginTop: 16 }}>
+      <h3>Single sign-on</h3>
+      <KeyValue items={[
+        ['Status', <StatusPill key="s" status={state.status}>{state.label}</StatusPill>],
+        sso.enabled && ['Master user', <code key="m">{sso.masterUser}</code>],
+        sso.enabled && ['Plugin', sso.plugin?.installed ? `${sso.plugin.name} installed${sso.plugin.loaded ? ' and enabled' : ', not enabled'}` : 'not installed'],
+      ]} />
+      {state.detail && <p className="muted">{state.detail}</p>}
+      <Toggle checked={Boolean(sso.enabled)} disabled={busy} onChange={(on) => set({ enabled: on }, on ? 'Webmail single sign-on enabled' : 'Webmail single sign-on disabled')} label="Open webmail from the account panel without a password" description="Adds a Dovecot master user (keel-master, password generated once and stored encrypted) and the keel_sso Roundcube plugin; the account panel then opens a mailbox with a one-minute single-use link. Account users keep their mailbox passwords for mail apps." />
+      {sso.enabled && <Toggle checked={Boolean(sso.loginAs)} disabled={busy} onChange={(on) => set({ loginAs: on }, on ? 'Single sign-on allowed while logged in as an account' : 'Single sign-on refused while logged in as an account')} label="Allow while logged in as an account" description="Off: an administrator acting as the account sees the webmail link but cannot open a mailbox with it (403, audited). On: the sign-on is audited with the administrator's name." />}
+    </div>
+  );
+}
+
+// What the phpMyAdmin single sign-on card says about GET /databases/phpmyadmin/sso.
+export function phpMyAdminSsoState(s) {
+  if (!s) return null;
+  if (!s.installed) return { status: 'not-installed', label: 'phpMyAdmin not installed', detail: 'Install phpMyAdmin from the distribution and publish it under Database Services › phpMyAdmin first.' };
+  if (!s.enabled) return { status: 'disabled', label: 'Off', detail: s.published ? null : 'Publish phpMyAdmin under the hostname site (Database Services › phpMyAdmin) before switching single sign-on on.' };
+  if (!s.published) return { status: 'warning', label: 'Waiting for publish', detail: 'Single sign-on works once phpMyAdmin is published under the hostname site; the publish applies the signon pieces.' };
+  if (!s.conf?.managed) return { status: 'warning', label: 'Drop-in missing', detail: `${s.conf?.path || 'The conf.d drop-in'} is not in place; switch single sign-on off and on again to rewrite it.` };
+  if (!s.script?.published) return { status: 'warning', label: 'Signon script not published', detail: `The signon script is not served as ${s.script?.alias || '/keel'}; switch single sign-on off and on again to publish it.` };
+  if (!s.available) return { status: 'warning', label: 'Not available', detail: s.hints?.[0]?.message || 'The account panel cannot offer single sign-on with the current phpMyAdmin configuration.' };
+  return { status: 'active', label: 'On', detail: null };
+}
+
+// Single sign-on into phpMyAdmin (PUT /databases/phpmyadmin/sso): the hidden
+// <account>_pma users, the Keel signon script as /keel and the conf.d drop-in.
+export function PhpMyAdminSsoCard() {
+  const toast = useToast();
+  const { data, loading, error, refetch } = useApi('/databases/phpmyadmin/sso');
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState(null);
+  const state = phpMyAdminSsoState(data);
+  const set = async (on) => {
+    setBusy(true);
+    setActionError(null);
+    try { await api.put('/databases/phpmyadmin/sso', { enabled: on }); toast.success(on ? 'phpMyAdmin single sign-on enabled' : 'phpMyAdmin single sign-on disabled'); refetch(); } catch (err) { setActionError(err); toast.error(err); } finally { setBusy(false); }
+  };
+  return (
+    <Card title="phpMyAdmin" subtitle="Single sign-on from the account panel into the phpMyAdmin published under the server hostname site">
+      {loading && !data && <Loading />}
+      <ErrorBanner error={error} onRetry={refetch} />
+      {data && state && (
+        <>
+          <KeyValue items={[
+            ['Status', <StatusPill key="s" status={state.status}>{state.label}</StatusPill>],
+            data.url && ['Address', <a key="u" href={data.url} target="_blank" rel="noopener noreferrer">{data.url}</a>],
+            data.enabled && ['Signon script', data.signonUrl ? <code key="p">{data.signonUrl}</code> : 'not published'],
+            data.enabled && ['Drop-in', <code key="c">{data.conf?.path}</code>],
+            data.enabled && ['Hidden users', <span key="h">one <code>{`<account>${data.userSuffix}`}</code> user per account, password rotated for every sign-on</span>],
+          ]} />
+          {state.detail && <p className="muted">{state.detail}</p>}
+          <Toggle checked={Boolean(data.enabled)} disabled={busy || (!data.enabled && !data.published)} onChange={set} label="Open phpMyAdmin from the account panel without a password" description="Writes /etc/phpmyadmin/conf.d/keel-signon.php (server 1 signs on through the Keel script served as /keel; server 2 keeps the cookie login for database users) and gives every account a hidden <account>_pma user with ALL PRIVILEGES on its <account>_* databases. Off removes the drop-in and the script; the hidden users stay until the account is terminated." />
         </>
       )}
       <ErrorBanner error={actionError} />
@@ -343,6 +424,7 @@ export function AccountPanelTab() {
     <>
       <AccountPanelSettingsCard />
       <WebmailPublishCard />
+      <PhpMyAdminSsoCard />
       <LoginAsHistoryCard />
     </>
   );

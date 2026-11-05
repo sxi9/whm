@@ -1,6 +1,8 @@
-import { validate, z } from '../../lib/validate.js';
-import { panelRouter, wrap } from './index.js';
-import { createPanelLogsService, MAX_TAIL_BYTES } from '../../services/panel-logs.js';
+import { validate, z, fields } from '../../lib/validate.js';
+import { panelRouter, wrap, accepted } from './index.js';
+import { createPanelLogsService, MAX_TAIL_BYTES, STATS_JOB, STATS_SCHEDULE } from '../../services/panel-logs.js';
+
+const statsDomain = z.object({ domain: fields.domain });
 
 const kind = z.enum(['apache', 'nginx']).default('apache');
 // The name must come from the listing; the shape alone keeps "/" and ".." out of the query.
@@ -18,6 +20,14 @@ export async function register(ctx) {
   r.get('/bandwidth', validate({ query: z.object({ months: z.coerce.number().int().min(1).max(24).default(12) }) }), wrap((req) => s.bandwidth(req.panel, req.query)));
   r.get('/retention', wrap((req) => s.retention(req.panel)));
   r.put('/retention', validate({ body: z.object({ archiveLogs: z.boolean().optional(), removeOldArchives: z.boolean().optional() }).strict() }), wrap((req) => s.setRetention(req.panel, req.body, req)));
+
+  // Visitors (GoAccess): summaries from the account's own stats directory, on-demand generation as a job,
+  // and the full HTML report streamed with a sandbox CSP for the page's iframe.
+  ctx.jobs.register(STATS_JOB, (job) => s.stats.run(job));
+  try { ctx.scheduler?.ensure?.(STATS_SCHEDULE.name, STATS_SCHEDULE.cron, STATS_JOB); } catch (err) { ctx.logger?.warn?.({ err }, 'panel logs: statistics schedule not registered'); }
+  r.get('/stats', wrap((req) => s.stats.summary(req.panel)));
+  r.post('/stats/:domain/generate', validate({ params: statsDomain }), accepted((req) => s.stats.generate(req.panel, req.params.domain, req)));
+  r.get('/stats/:domain/report', validate({ params: statsDomain }), (req, res, next) => s.stats.report(req.panel, req.params.domain, req, res).catch(next));
 
   return { path: '/logs', router: r };
 }

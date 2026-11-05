@@ -2,8 +2,8 @@ import { Link } from 'react-router-dom';
 import { KeyRound, ShieldCheck } from 'lucide-react';
 import { Card, KeyValue, StatusPill, Loading, formatMb, formatDate } from '../../../components/Common.jsx';
 import { PanelPage } from '../../../panel/PanelPage.jsx';
-import { useT } from '../../../i18n/useT.js';
-import { PANEL_PATHS, PANEL_FUNCTIONS, featureEnabled } from '../../../panel/nav.js';
+import { useT, translate } from '../../../i18n/useT.js';
+import { PANEL_PATHS, PANEL_FUNCTIONS, featureEnabled, panelId } from '../../../panel/nav.js';
 import { usePanelMe } from '../../../panel/hooks/usePanel.js';
 
 const LIMIT_LABELS = [
@@ -14,8 +14,8 @@ const LIMIT_LABELS = [
 // Plan limits as the server enforces them (assertLimit): null is unlimited, 0 is
 // a closed door, any other value is the cap.
 export function limitText(value, format) {
-  if (value == null) return 'Unlimited';
-  if (value === 0) return 'Not included';
+  if (value == null) return translate('panel.overview.limit_unlimited', 'Unlimited');
+  if (value === 0) return translate('panel.overview.limit_not_included', 'Not included');
   return format ? format(value) : String(value);
 }
 
@@ -23,7 +23,12 @@ export function limitText(value, format) {
 // without a function (cPanel compatibility flags) are listed by key.
 export function featureRows(features) {
   const named = new Map();
-  for (const fn of PANEL_FUNCTIONS) if (fn.feature && !named.has(fn.feature)) named.set(fn.feature, fn.category === fn.label ? fn.label : `${fn.category} › ${fn.label}`);
+  for (const fn of PANEL_FUNCTIONS) {
+    if (!fn.feature || named.has(fn.feature)) continue;
+    const category = translate(`panel-category.${fn.categorySlug}`, fn.category);
+    const label = translate(`panel.${panelId(fn)}.label`, fn.label);
+    named.set(fn.feature, fn.category === fn.label ? label : `${category} › ${label}`);
+  }
   const keys = new Set([...named.keys(), ...Object.keys(features || {})]);
   return [...keys].sort().map((key) => ({ key, label: named.get(key) || key, enabled: featureEnabled(features, key) }));
 }
@@ -55,7 +60,7 @@ export default function AccountDetails({ fn }) {
               [t('panel.account.server', 'Server'), me.hostname],
               [t('panel.account.created', 'Created'), a.createdAt && formatDate(a.createdAt)],
               [t('panel.account.status', 'Status'), <StatusPill key="s" status={a.suspended ? 'suspended' : 'active'} />],
-              a.demoMode && [t('panel.shell.demo_title', 'Demo mode'), <StatusPill key="d" status="warning">read-only</StatusPill>],
+              a.demoMode && [t('panel.shell.demo_title', 'Demo mode'), <StatusPill key="d" status="warning">{t('panel.overview.read_only', 'read-only')}</StatusPill>],
             ]} />
           </Card>
           <Card title={t('panel.account.limits', 'Plan limits')} subtitle={t('panel.account.limits_help', 'What this plan allows on the account.')}>
@@ -78,8 +83,8 @@ export default function AccountDetails({ fn }) {
               [t('panel.account.login_name', 'Login'), me.user?.username],
               [t('panel.account.email', 'Email'), me.user?.email],
               [t('panel.security/two-factor.label', 'Two-factor authentication'), <StatusPill key="t" status={me.user?.totpEnabled ? 'enabled' : 'disabled'} />],
-              me.policy?.require2fa && [t('panel.account.required_2fa', 'Two-factor required'), <StatusPill key="r" status="warning">required</StatusPill>],
-              me.policy && !me.actingAs && [t('panel.account.password_synced', 'Password in sync with the server'), me.policy.passwordSynced ? <StatusPill key="p" status="ok" /> : <StatusPill key="p" status="warning">not yet</StatusPill>],
+              me.policy?.require2fa && [t('panel.account.required_2fa', 'Two-factor required'), <StatusPill key="r" status="warning">{t('panel.overview.required', 'required')}</StatusPill>],
+              me.policy && !me.actingAs && [t('panel.account.password_synced', 'Password in sync with the server'), me.policy.passwordSynced ? <StatusPill key="p" status="ok" /> : <StatusPill key="p" status="warning">{t('panel.overview.not_yet', 'not yet')}</StatusPill>],
             ]} />
           </Card>
         </div>

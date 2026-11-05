@@ -1,5 +1,5 @@
 import { notFound, badRequest, HttpError, CapabilityError } from '../lib/errors.js';
-import { PRIVILEGES, PG_PRIVILEGES } from './database-services.js';
+import { PRIVILEGES, PG_PRIVILEGES, signonUserFor } from './database-services.js';
 
 // Customer panel: databases, users, grants and remote hosts of exactly one
 // hosting account. Every method takes the pinned scope from ctx.panel.scope(req)
@@ -77,9 +77,11 @@ export function createPanelDatabasesService(ctx) {
     return row;
   }
 
+  // The phpMyAdmin signon user is the panel's own (hidden, rotated per
+  // sign-on): to the account it does not exist.
   function ownedUser(scope, name) {
     const row = stmts.userByName.get(name, scope.accountId);
-    if (!row) throw notFound(`Database user "${name}"`);
+    if (!row || name === signonUserFor(scope.username)) throw notFound(`Database user "${name}"`);
     return row;
   }
 
@@ -138,6 +140,32 @@ export function createPanelDatabasesService(ctx) {
     const created = await databases().createDatabase(args, scope.ownerPrincipal, req);
     audit(req, scope, { action: 'panel.db.create', args: { database: name } });
     return { name: created.name, account: scope.username, quota: quota(scope) };
+  }
+
+  // A database plus a user of the same name for an application the panel
+  // installs (WordPress): the first free <user>_<base>, <user>_<base>2, …
+  // across both namespaces, through create/createUser so the plan quota,
+  // the prefix rules and the audit apply; a user that cannot be created
+  // takes the database with it. The password is returned once to the caller.
+  async function createForApp(scope, { base = 'app', password } = {}, req) {
+    requireFeature(scope);
+    if (!/^[a-z][a-z0-9]{0,15}$/.test(base)) throw badRequest('Invalid application name');
+    const taken = new Set([...stmts.dbsFor.all(scope.accountId).map((d) => d.name), ...databases().forAccount(scope.username, SYSTEM_ROOT).users.map((u) => u.name)]);
+    let short = null;
+    for (let n = 1; n <= 99 && short === null; n++) {
+      const candidate = n === 1 ? base : `${base}${n}`;
+      if (!taken.has(ensurePrefixed(scope.username, candidate))) short = candidate;
+    }
+    if (short === null) throw new HttpError(409, 'conflict', `No free database name of the form ${scope.username}_${base}N`);
+    const secret = password || ctx.crypto.randomPassword(24);
+    const created = await create(scope, { name: short }, req);
+    try {
+      const user = await createUser(scope, { name: short, password: secret, databases: [created.name] }, req);
+      return { database: created.name, user: user.name, password: secret, hosts: user.hosts ?? [] };
+    } catch (err) {
+      try { await drop(scope, created.name, req); } catch (dropErr) { ctx.logger?.warn?.({ err: dropErr, database: created.name }, 'could not drop the database after its user failed'); }
+      throw err;
+    }
   }
 
   async function drop(scope, name, req) {
@@ -232,11 +260,38 @@ export function createPanelDatabasesService(ctx) {
 
   async function phpMyAdmin(scope) {
     if (!featureOn(scope, 'phpmyadmin')) throw featureDisabled('phpmyadmin');
-    if (isPg()) return { installed: false, url: null, featureEnabled: false, engine: 'postgres', users: [] };
+    if (isPg()) return { installed: false, url: null, featureEnabled: false, engine: 'postgres', users: [], sso: false };
     const r = await databases().phpMyAdmin(scope.ownerPrincipal);
     const featureEnabled = Boolean(settings.get('db.phpmyadmin.enabled', true)) && Boolean(r.featureEnabled);
     const users = databases().forAccount(scope.username, SYSTEM_ROOT).users.map((u) => u.name);
-    return { installed: Boolean(r.installed), url: featureEnabled ? r.url ?? null : null, featureEnabled, version: r.version ?? null, users };
+    return { installed: Boolean(r.installed), url: featureEnabled ? r.url ?? null : null, featureEnabled, version: r.version ?? null, users, sso: Boolean(featureEnabled && r.url && r.sso) };
+  }
+
+  // POST /databases/phpmyadmin/sso: the hidden <account>_pma user gets a fresh
+  // password, which travels only inside the encrypted token payload; the
+  // loopback exchange (contract §44, phpMyAdmin kind) hands it to the signon
+  // script once within 60 s. Audited without the password.
+  async function phpMyAdminSso(scope, req) {
+    requireFeature(scope);
+    const info = await phpMyAdmin(scope);
+    if (!info.sso) throw new HttpError(409, 'sso_unavailable', 'phpMyAdmin single sign-on is not available on this server');
+    if (!ctx.panelSso) throw new HttpError(409, 'sso_unavailable', 'phpMyAdmin single sign-on is not available on this server');
+    const cred = await databases().phpmyadmin.sso.signon(scope.username, req);
+    const { token, expiresAt } = ctx.panelSso.issue({ kind: 'phpmyadmin', userId: scope.actor?.id || null, account: scope.username, payload: { user: cred.user, password: cred.password, host: cred.host } });
+    const url = `${databases().phpmyadmin.sso.signonUrl(info.url)}?_keel=${token}`;
+    audit(req, scope, { action: 'panel.db.phpmyadmin.sso', args: { user: cred.user, expiresAt } });
+    return { url, user: cred.user, expiresAt };
+  }
+
+  // The loopback exchange (GET /api/panel/sso/phpmyadmin/:token): the payload
+  // the sign-on stored, once, and only while the switch is still on.
+  function registerSso() {
+    ctx.panelSso?.register('phpmyadmin', (claim) => {
+      const p = claim.payload;
+      if (!p || typeof p.user !== 'string' || typeof p.password !== 'string' || typeof p.host !== 'string') throw new HttpError(404, 'sso_token_invalid', 'This sign-on link is invalid, already used or has expired');
+      if (!databases().phpmyadmin?.sso?.enabled?.()) throw new HttpError(409, 'sso_unavailable', 'phpMyAdmin single sign-on is not enabled on this server');
+      return { user: p.user, password: p.password, host: p.host };
+    });
   }
 
   // Dumps go through a root-only staging directory under /var/lib/whm (never a
@@ -330,9 +385,9 @@ export function createPanelDatabasesService(ctx) {
   }
 
   return {
-    engine, list, create, drop, check,
+    engine, list, create, createForApp, drop, check,
     listUsers, createUser, setUserPassword, dropUser, grantsFor, setGrants,
     listAccessHosts, addAccessHost, removeAccessHost,
-    phpMyAdmin, enqueueDump, runDump, getJob, streamJob, quota, ensurePrefixed,
+    phpMyAdmin, phpMyAdminSso, registerSso, enqueueDump, runDump, getJob, streamJob, quota, ensurePrefixed,
   };
 }

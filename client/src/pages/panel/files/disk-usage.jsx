@@ -6,6 +6,8 @@ import { DataTable } from '../../../components/DataTable.jsx';
 import { Button } from '../../../components/Form.jsx';
 import { PanelPage, PanelCapabilityState, FeatureDisabledState } from '../../../panel/PanelPage.jsx';
 import { usePanelApi, usePanelMe, percentOf, meterTone } from '../../../panel/hooks/usePanel.js';
+import { useT } from '../../../i18n/useT.js';
+import { fill } from '../../../i18n/fill.js';
 import { RequestError, PathBar } from './parts/common.jsx';
 import { normalizeRel, duPath, managerHref, diskUsageHref, isCapabilityError, isFeatureDisabled, baseName } from './parts/paths.js';
 
@@ -34,6 +36,7 @@ export function shapeRows(entries, dir, totalKb) {
 }
 
 export default function DiskUsage({ fn }) {
+  const { t } = useT();
   const { me } = usePanelMe();
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
@@ -51,44 +54,44 @@ export default function DiskUsage({ fn }) {
   if (isFeatureDisabled(error)) return <PanelPage fn={fn}><FeatureDisabledState fn={fn} /></PanelPage>;
 
   return (
-    <PanelPage fn={fn} actions={<Button icon={RefreshCw} onClick={() => refetch()}>Refresh</Button>}>
+    <PanelPage fn={fn} actions={<Button icon={RefreshCw} onClick={() => refetch()}>{t('panel.files.refresh', 'Refresh')}</Button>}>
       <div className="stat-grid" style={{ marginBottom: 18 }}>
         <div className="stat" data-stat="folder">
-          <div className="label">{dir ? <><code>~/{dir}</code> uses</> : 'Your home directory uses'}</div>
+          <div className="label">{dir ? <><code>~/{dir}</code> {t('panel.files.uses', 'uses')}</> : t('panel.files.home_uses', 'Your home directory uses')}</div>
           <div className="value">{data ? formatBytes(folderBytes) : '—'}</div>
           <div className={`meter ${meterTone(folderPercent)}`}><span style={{ width: `${folderPercent ?? 0}%` }} /></div>
-          <div className="muted small" style={{ marginTop: 6 }}>{folderPercent != null ? `${folderPercent}% of the plan's ${formatMb(usage.diskQuotaMb)}` : 'No disk limit on this plan'}</div>
+          <div className="muted small" style={{ marginTop: 6 }}>{folderPercent != null ? fill(t('panel.files.percent_of_plan', '{percent}% of the plan\'s {quota}'), { percent: folderPercent, quota: formatMb(usage.diskQuotaMb) }) : t('panel.files.no_disk_limit', 'No disk limit on this plan')}</div>
         </div>
         <div className="stat" data-stat="account">
-          <div className="label">Whole account</div>
+          <div className="label">{t('panel.files.whole_account', 'Whole account')}</div>
           <div className="value">{formatMb(usage.diskUsedMb ?? 0)}</div>
           <div className={`meter ${meterTone(quotaPercent)}`}><span style={{ width: `${quotaPercent ?? 0}%` }} /></div>
-          <div className="muted small" style={{ marginTop: 6 }}>{usage.diskQuotaMb ? `of ${formatMb(usage.diskQuotaMb)} · includes mail and databases` : 'Unlimited · includes mail and databases'}</div>
+          <div className="muted small" style={{ marginTop: 6 }}>{usage.diskQuotaMb ? fill(t('panel.files.of_quota_includes', 'of {quota} · includes mail and databases'), { quota: formatMb(usage.diskQuotaMb) }) : t('panel.files.unlimited_includes', 'Unlimited · includes mail and databases')}</div>
         </div>
         <div className="stat" data-stat="measured">
-          <div className="label">Sub-folders</div>
+          <div className="label">{t('panel.files.sub_folders', 'Sub-folders')}</div>
           <div className="value">{data ? rows.filter((r) => r.depth <= 1).length : '—'}</div>
-          <div className="muted small" style={{ marginTop: 6 }}>{data?.measuredAt ? <>Measured <time dateTime={data.measuredAt}>{formatDate(data.measuredAt)}</time>{data.cached ? '; the figures are kept for five minutes' : ''}</> : data ? 'Fresh figures from the server' : 'Measuring…'}</div>
+          <div className="muted small" style={{ marginTop: 6 }}>{data?.measuredAt ? <>{t('panel.files.measured', 'Measured')} <time dateTime={data.measuredAt}>{formatDate(data.measuredAt)}</time>{data.cached ? t('panel.files.figures_cached', '; the figures are kept for five minutes') : ''}</> : data ? t('panel.files.fresh_figures', 'Fresh figures from the server') : t('panel.files.measuring', 'Measuring…')}</div>
         </div>
       </div>
 
       <Card padded={false}>
         <div className="card-body" style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <PathBar path={dir} hrefFor={(p) => diskUsageHref(p)} homeDir={me?.account?.homeDir} />
-          <div className="segmented" style={{ marginLeft: 'auto' }} role="group" aria-label="Depth">
-            <button type="button" className={depth === 1 ? 'active' : ''} onClick={() => setDepth(1)}>One level</button>
-            <button type="button" className={depth === 2 ? 'active' : ''} onClick={() => setDepth(2)}>Two levels</button>
+          <div className="segmented" style={{ marginLeft: 'auto' }} role="group" aria-label={t('panel.files.depth', 'Depth')}>
+            <button type="button" className={depth === 1 ? 'active' : ''} onClick={() => setDepth(1)}>{t('panel.files.one_level', 'One level')}</button>
+            <button type="button" className={depth === 2 ? 'active' : ''} onClick={() => setDepth(2)}>{t('panel.files.two_levels', 'Two levels')}</button>
           </div>
         </div>
         {capability && <div className="card-body"><PanelCapabilityState error={error} onRetry={refetch} /></div>}
         {!capability && error && <div className="card-body"><RequestError error={error} onRetry={refetch} /></div>}
-        {data?.partial && <div className="card-body"><div className="banner banner-warning" style={{ marginBottom: 0 }}><AlertTriangle size={18} /><div><strong>Some folders could not be measured</strong><p>The totals leave out what the account is not allowed to read.</p></div></div></div>}
+        {data?.partial && <div className="card-body"><div className="banner banner-warning" style={{ marginBottom: 0 }}><AlertTriangle size={18} /><div><strong>{t('panel.files.partial_title', 'Some folders could not be measured')}</strong><p>{t('panel.files.partial_help', 'The totals leave out what the account is not allowed to read.')}</p></div></div></div>}
         <DataTable
           dense
           columns={[
-            { key: 'name', label: 'Folder', render: (r) => <Link to={diskUsageHref(r.path)} style={r.depth > 1 ? { paddingLeft: `${(r.depth - 1) * 18}px` } : undefined}><FolderOpen size={15} className="muted" aria-hidden="true" style={{ verticalAlign: '-3px' }} /> {r.name}</Link> },
-            { key: 'kb', label: 'Size', align: 'right', render: (r) => formatBytes(r.kb * 1024) },
-            { key: 'percent', label: 'Share of this folder', width: 260, render: (r) => (
+            { key: 'name', label: t('panel.files.folder', 'Folder'), render: (r) => <Link to={diskUsageHref(r.path)} style={r.depth > 1 ? { paddingLeft: `${(r.depth - 1) * 18}px` } : undefined}><FolderOpen size={15} className="muted" aria-hidden="true" style={{ verticalAlign: '-3px' }} /> {r.name}</Link> },
+            { key: 'kb', label: t('panel.files.col_size', 'Size'), align: 'right', render: (r) => formatBytes(r.kb * 1024) },
+            { key: 'percent', label: t('panel.files.share_of_folder', 'Share of this folder'), width: 260, render: (r) => (
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <div className="meter" style={{ flex: 1, marginTop: 0 }}><span style={{ width: `${r.percent ?? 0}%` }} /></div>
                 <span className="muted small" style={{ minWidth: 48, textAlign: 'right' }}>{r.percent == null ? '—' : `${r.percent}%`}</span>
@@ -97,13 +100,13 @@ export default function DiskUsage({ fn }) {
           ]}
           rows={rows} loading={loading} error={null} rowKey={(r) => r.path}
           rowActions={(r) => [
-            { label: 'Look inside', primary: true, onClick: () => setParams({ path: r.path, depth: String(depth) }) },
-            { label: 'Open in file manager', onClick: () => navigate(managerHref(r.path)) },
+            { label: t('panel.files.look_inside', 'Look inside'), primary: true, onClick: () => setParams({ path: r.path, depth: String(depth) }) },
+            { label: t('panel.files.open_in_file_manager', 'Open in file manager'), onClick: () => navigate(managerHref(r.path)) },
           ]}
-          emptyText={capability ? 'Folder sizes appear here once the file manager is available on this server.' : error ? 'This folder could not be measured.' : dir ? `${baseName(dir)} holds no sub-folders; its files make up the size above.` : 'No sub-folders yet. Once you upload files, the folders of your home directory are listed here, largest first.'}
+          emptyText={capability ? t('panel.files.du_empty_capability', 'Folder sizes appear here once the file manager is available on this server.') : error ? t('panel.files.du_empty_error', 'This folder could not be measured.') : dir ? fill(t('panel.files.du_no_subfolders', '{folder} holds no sub-folders; its files make up the size above.'), { folder: baseName(dir) }) : t('panel.files.du_empty_home', 'No sub-folders yet. Once you upload files, the folders of your home directory are listed here, largest first.')}
         />
         <div className="card-body muted small">
-          Files directly in {dir ? <code>~/{dir}</code> : 'the home directory'} count towards its size but are not listed. Mailboxes live under <Link to={diskUsageHref('mail')}>mail</Link>, your website under <Link to={diskUsageHref('public_html')}>public_html</Link>; delete what you no longer need in the <Link to={managerHref(dir)}>file manager</Link>.
+          {t('panel.files.files_directly_in', 'Files directly in')} {dir ? <code>~/{dir}</code> : t('panel.files.the_home_directory', 'the home directory')} {t('panel.files.count_not_listed', 'count towards its size but are not listed.')} {t('panel.files.mailboxes_under', 'Mailboxes live under')} <Link to={diskUsageHref('mail')}>mail</Link>, {t('panel.files.website_under', 'your website under')} <Link to={diskUsageHref('public_html')}>public_html</Link>; {t('panel.files.delete_in', 'delete what you no longer need in the')} <Link to={managerHref(dir)}>{t('panel.files.file_manager_link', 'file manager')}</Link>.
         </div>
       </Card>
     </PanelPage>

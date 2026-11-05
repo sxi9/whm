@@ -9,6 +9,8 @@ import { PanelPage, PendingPill } from '../../../panel/PanelPage.jsx';
 import { usePanelApi, usePanelMe, panelApi } from '../../../panel/hooks/usePanel.js';
 import { PANEL_FUNCTION_BY_KEY } from '../../../panel/nav.js';
 import { DelegationBanners } from '../../../panel/DelegationBanner.jsx';
+import { useT } from '../../../i18n/useT.js';
+import { fill } from '../../../i18n/fill.js';
 import { RequestError, JobProgress, ExpiryPill, StatePill, TypePill, CertificateSummary, isCapabilityError, webResult } from './parts/Shared.jsx';
 
 const INSTALL_PATH = PANEL_FUNCTION_BY_KEY['panel:ssl/install']?.path || '/panel/ssl/install';
@@ -28,25 +30,29 @@ export function sslSummary(domains) {
 }
 
 export function AutoSslPill({ entry }) {
+  const { t } = useT();
   if (!entry) return <span className="muted">—</span>;
   const tone = entry.action === 'failed' || entry.status === 'failed' ? 'failed' : entry.action === 'issued' || entry.action === 'renewed' ? 'ok' : 'inactive';
   const when = entry.finishedAt || entry.startedAt;
-  return <span title={entry.message || ''}><StatusPill status={tone}>{entry.action || entry.status}</StatusPill>{when && <span className="muted small"> {formatDate(when).split(',')[0]}</span>}</span>;
+  const action = entry.action || entry.status;
+  const label = { issued: t('panel.ssl.autossl_issued', 'issued'), renewed: t('panel.ssl.autossl_renewed', 'renewed'), failed: t('panel.ssl.autossl_failed', 'failed'), skipped: t('panel.ssl.autossl_skipped', 'skipped') }[action] || action;
+  return <span title={entry.message || ''}><StatusPill status={tone}>{label}</StatusPill>{when && <span className="muted small"> {formatDate(when).split(',')[0]}</span>}</span>;
 }
 
 function DomainDetails({ domain, onClose }) {
+  const { t } = useT();
   const { data, error, loading, refetch } = usePanelApi(domain ? `/ssl/domains/${encodeURIComponent(domain)}` : null);
   return (
     <Modal open={Boolean(domain)} title={domain || ''} onClose={onClose} size="md">
       {loading && !data && <Loading />}
-      {error && error.status === 404 && <EmptyState icon={Info} title="No certificate installed"><p>Nothing is installed on {domain} yet.</p><p><Link className="btn btn-sm" to={`${INSTALL_PATH}?domain=${encodeURIComponent(domain)}`}>Install a certificate</Link></p></EmptyState>}
+      {error && error.status === 404 && <EmptyState icon={Info} title={t('panel.ssl.no_cert_installed', 'No certificate installed')}><p>{fill(t('panel.ssl.nothing_installed_on', 'Nothing is installed on {domain} yet.'), { domain })}</p><p><Link className="btn btn-sm" to={`${INSTALL_PATH}?domain=${encodeURIComponent(domain)}`}>{t('panel.ssl.install_a_certificate', 'Install a certificate')}</Link></p></EmptyState>}
       {error && error.status !== 404 && <RequestError error={error} onRetry={refetch} inline />}
       {data && (
         <>
           <KeyValue items={[
-            ['State', <StatePill key="s" state={data.state} />],
-            data.files?.exists != null && ['Files on the server', data.files.exists ? <StatusPill key="f" status="ok">present</StatusPill> : <StatusPill key="f" status="warning">missing</StatusPill>],
-            data.files?.hasChain != null && ['Chain', data.files.hasChain ? 'included' : 'none'],
+            [t('panel.ssl.state', 'State'), <StatePill key="s" state={data.state} />],
+            data.files?.exists != null && [t('panel.ssl.files_on_server', 'Files on the server'), data.files.exists ? <StatusPill key="f" status="ok">{t('panel.ssl.files_present', 'present')}</StatusPill> : <StatusPill key="f" status="warning">{t('panel.ssl.files_missing', 'missing')}</StatusPill>],
+            data.files?.hasChain != null && [t('panel.ssl.chain', 'Chain'), data.files.hasChain ? t('panel.ssl.chain_included', 'included') : t('panel.ssl.chain_none', 'none')],
           ]} />
           <div style={{ marginTop: 12 }}><CertificateSummary certificate={data.certificate} chain={data.chain} /></div>
         </>
@@ -56,6 +62,7 @@ function DomainDetails({ domain, onClose }) {
 }
 
 export default function SslStatus({ fn }) {
+  const { t } = useT();
   const toast = useToast();
   const confirm = useConfirm();
   const navigate = useNavigate();
@@ -87,90 +94,90 @@ export default function SslStatus({ fn }) {
     try {
       const { data: res } = await panelApi.post(`/ssl/domains/${encodeURIComponent(domain)}/issue`, {});
       setJob({ id: res.job?.id, domain });
-      toast.success(`Issuing a certificate for ${domain}`);
+      toast.success(fill(t('panel.ssl.issuing_for', 'Issuing a certificate for {domain}'), { domain }));
     } catch (err) {
       if (isCapabilityError(err)) setIssueError(err); else toast.error(err);
     } finally { setBusy(null); }
   };
 
   const remove = async (domain) => {
-    const ok = await confirm({ title: `Remove the certificate from ${domain}?`, message: 'Visitors will see a browser warning on https:// until a new certificate is installed. The stored copy stays under Certificates.', confirmLabel: 'Remove', danger: true });
+    const ok = await confirm({ title: fill(t('panel.ssl.remove_title', 'Remove the certificate from {domain}?'), { domain }), message: t('panel.ssl.remove_help', 'Visitors will see a browser warning on https:// until a new certificate is installed. The stored copy stays under Certificates.'), confirmLabel: t('panel.ssl.remove', 'Remove'), danger: true });
     if (!ok) return;
     setBusy(domain);
     try {
       const { data: res } = await panelApi.delete(`/ssl/domains/${encodeURIComponent(domain)}`);
       const w = webResult(res.web);
       setPending((p) => ({ ...p, [domain]: w.applied ? null : w }));
-      toast.success(w.applied ? `Certificate removed from ${domain}` : `Certificate files removed from ${domain}; the web server picks it up once it is available`);
+      toast.success(w.applied ? fill(t('panel.ssl.removed_from', 'Certificate removed from {domain}'), { domain }) : fill(t('panel.ssl.removed_files_from', 'Certificate files removed from {domain}; the web server picks it up once it is available'), { domain }));
       refetch();
     } catch (err) { toast.error(err); } finally { setBusy(null); }
   };
 
   const columns = [
-    { key: 'domain', label: 'Domain', render: (r) => <><strong>{r.domain}</strong> <TypePill type={r.type} /></> },
-    { key: 'state', label: 'Certificate', render: (r) => (r.certificate ? <><StatePill state={r.certificate.state} />{pending[r.domain] && <> <PendingPill result={pending[r.domain]} /></>}</> : <StatusPill status="warning">none</StatusPill>) },
-    { key: 'issuer', label: 'Issued by', render: (r) => (r.certificate ? (r.certificate.selfSigned ? 'Self-signed' : r.certificate.issuer || '—') : <span className="muted">—</span>) },
-    { key: 'expires', label: 'Expires', render: (r) => <ExpiryPill notAfter={r.certificate?.notAfter} daysRemaining={r.certificate?.daysRemaining} /> },
-    { key: 'autossl', label: 'Last AutoSSL run', render: (r) => <AutoSslPill entry={r.autossl} /> },
+    { key: 'domain', label: t('panel.ssl.col_domain', 'Domain'), render: (r) => <><strong>{r.domain}</strong> <TypePill type={r.type} /></> },
+    { key: 'state', label: t('panel.ssl.col_certificate', 'Certificate'), render: (r) => (r.certificate ? <><StatePill state={r.certificate.state} />{pending[r.domain] && <> <PendingPill result={pending[r.domain]} /></>}</> : <StatusPill status="warning">{t('panel.ssl.none', 'none')}</StatusPill>) },
+    { key: 'issuer', label: t('panel.ssl.issued_by', 'Issued by'), render: (r) => (r.certificate ? (r.certificate.selfSigned ? t('panel.ssl.self_signed', 'Self-signed') : r.certificate.issuer || '—') : <span className="muted">—</span>) },
+    { key: 'expires', label: t('panel.ssl.expires', 'Expires'), render: (r) => <ExpiryPill notAfter={r.certificate?.notAfter} daysRemaining={r.certificate?.daysRemaining} /> },
+    { key: 'autossl', label: t('panel.ssl.col_last_autossl', 'Last AutoSSL run'), render: (r) => <AutoSslPill entry={r.autossl} /> },
   ];
 
   const unavailable = isCapabilityError(error);
 
   return (
     <PanelPage fn={fn} actions={unavailable
-      ? <button type="button" className="btn btn-primary" disabled><ShieldCheck size={16} /> Install certificate</button>
-      : <Link className="btn btn-primary" to={INSTALL_PATH}><ShieldCheck size={16} /> Install certificate</Link>}>
+      ? <button type="button" className="btn btn-primary" disabled><ShieldCheck size={16} /> {t('panel.ssl.install_certificate', 'Install certificate')}</button>
+      : <Link className="btn btn-primary" to={INSTALL_PATH}><ShieldCheck size={16} /> {t('panel.ssl.install_certificate', 'Install certificate')}</Link>}>
       {error && <RequestError error={error} fn={fn} onRetry={refetch} />}
       {!error && (
         <>
           <div className="stat-grid" style={{ marginBottom: 18 }}>
-            <div className="stat" data-stat="domains"><div className="label">Domains</div><div className="value">{summary.domains}</div></div>
-            <div className="stat" data-stat="secured"><div className="label">Secured</div><div className="value">{summary.secured}</div></div>
-            <div className="stat" data-stat="expiring"><div className="label">Expiring within 30 days</div><div className="value">{summary.expiring}</div></div>
-            <div className="stat" data-stat="unsecured"><div className="label">Without a certificate</div><div className="value">{summary.unsecured}</div></div>
+            <div className="stat" data-stat="domains"><div className="label">{t('panel.ssl.stat_domains', 'Domains')}</div><div className="value">{summary.domains}</div></div>
+            <div className="stat" data-stat="secured"><div className="label">{t('panel.ssl.stat_secured', 'Secured')}</div><div className="value">{summary.secured}</div></div>
+            <div className="stat" data-stat="expiring"><div className="label">{t('panel.ssl.stat_expiring', 'Expiring within 30 days')}</div><div className="value">{summary.expiring}</div></div>
+            <div className="stat" data-stat="unsecured"><div className="label">{t('panel.ssl.stat_unsecured', 'Without a certificate')}</div><div className="value">{summary.unsecured}</div></div>
           </div>
 
           {autossl && (
             <div className={`banner ${autossl.enabled ? 'banner-success' : 'banner-info'}`}>
               <Sparkles size={18} />
               <div>
-                <strong>{autossl.enabled ? 'Free certificates are issued automatically' : 'Automatic certificates are not enabled on this server'}</strong>
-                <p className="muted">{autossl.enabled ? `Every domain here is checked daily and renewed before it expires (${autossl.provider}${autossl.includeWww ? ', including www.' : ''}). Use "Issue now" to get a certificate right away.` : 'Ask your hosting provider to turn on AutoSSL, or install a certificate you bought from a certificate authority.'}</p>
+                <strong>{autossl.enabled ? t('panel.ssl.autossl_on', 'Free certificates are issued automatically') : t('panel.ssl.autossl_off', 'Automatic certificates are not enabled on this server')}</strong>
+                <p className="muted">{autossl.enabled ? fill(t('panel.ssl.autossl_on_help', 'Every domain here is checked daily and renewed before it expires ({provider}). Use "Issue now" to get a certificate right away.'), { provider: `${autossl.provider}${autossl.includeWww ? t('panel.ssl.including_www', ', including www.') : ''}` }) : t('panel.ssl.autossl_off_help', 'Ask your hosting provider to turn on AutoSSL, or install a certificate you bought from a certificate authority.')}</p>
               </div>
             </div>
           )}
 
-          <DelegationBanners domains={delegated} recordsFor={addressRecords} title="Certificates need the name to resolve to this server" />
+          <DelegationBanners domains={delegated} recordsFor={addressRecords} title={t('panel.ssl.delegation_title', 'Certificates need the name to resolve to this server')} />
 
           {issueError && <RequestError error={issueError} onRetry={() => setIssueError(null)} />}
 
           {job && (
-            <Card title={`Issuing a certificate for ${job.domain}`} actions={<button className="btn btn-sm" onClick={() => { setJob(null); refetch(); }}>Close</button>}>
-              <JobProgress jobId={job.id} onFinished={refetch} message={`Issuing a certificate for ${job.domain}; the table updates in a minute.`} />
+            <Card title={fill(t('panel.ssl.issuing_for', 'Issuing a certificate for {domain}'), { domain: job.domain })} actions={<button className="btn btn-sm" onClick={() => { setJob(null); refetch(); }}>{t('panel.ssl.close', 'Close')}</button>}>
+              <JobProgress jobId={job.id} onFinished={refetch} message={fill(t('panel.ssl.issuing_progress', 'Issuing a certificate for {domain}; the table updates in a minute.'), { domain: job.domain })} />
             </Card>
           )}
 
           <Card padded={false}>
             {!loading && domains.length === 0 ? (
-              <EmptyState icon={ShieldCheck} title="No domains to secure yet">
-                <p>Each domain of this account appears here with its certificate, issuer and expiry date.</p>
-                <p className="muted">Add a domain under Domains first; the main domain shows up as soon as the account is provisioned.</p>
+              <EmptyState icon={ShieldCheck} title={t('panel.ssl.no_domains', 'No domains to secure yet')}>
+                <p>{t('panel.ssl.no_domains_help', 'Each domain of this account appears here with its certificate, issuer and expiry date.')}</p>
+                <p className="muted">{t('panel.ssl.no_domains_hint', 'Add a domain under Domains first; the main domain shows up as soon as the account is provisioned.')}</p>
               </EmptyState>
             ) : (
               <DataTable
                 columns={columns} rows={rows} loading={loading} rowKey={(r) => r.domain}
-                searchable q={q} onSearch={setQ} searchPlaceholder="Search domains…"
-                emptyText="No domain matches that search"
+                searchable q={q} onSearch={setQ} searchPlaceholder={t('panel.ssl.search_domains', 'Search domains…')}
+                emptyText={t('panel.ssl.search_empty', 'No domain matches that search')}
                 rowActions={(r) => [
-                  autossl?.enabled && { label: busy === r.domain ? 'Working…' : 'Issue now', primary: true, disabled: busy === r.domain, onClick: () => issue(r.domain) },
-                  { label: 'Details', primary: !autossl?.enabled, onClick: () => setDetails(r.domain) },
-                  { label: r.certificate ? 'Replace certificate' : 'Install certificate', onClick: () => navigate(`${INSTALL_PATH}?domain=${encodeURIComponent(r.domain)}`) },
-                  r.certificate && r.certificate.state !== 'stored' && { label: 'Remove certificate', danger: true, disabled: busy === r.domain, onClick: () => remove(r.domain) },
+                  autossl?.enabled && { label: busy === r.domain ? t('panel.ssl.working', 'Working…') : t('panel.ssl.issue_now', 'Issue now'), primary: true, disabled: busy === r.domain, onClick: () => issue(r.domain) },
+                  { label: t('panel.ssl.details', 'Details'), primary: !autossl?.enabled, onClick: () => setDetails(r.domain) },
+                  { label: r.certificate ? t('panel.ssl.replace_certificate', 'Replace certificate') : t('panel.ssl.install_certificate', 'Install certificate'), onClick: () => navigate(`${INSTALL_PATH}?domain=${encodeURIComponent(r.domain)}`) },
+                  r.certificate && r.certificate.state !== 'stored' && { label: t('panel.ssl.remove_certificate', 'Remove certificate'), danger: true, disabled: busy === r.domain, onClick: () => remove(r.domain) },
                 ]}
               />
             )}
           </Card>
-          <p className="muted small">Stored certificates, keys and signing requests live under <Link to={CERTS_PATH}>Certificates</Link>.</p>
+          <p className="muted small">{t('panel.ssl.stored_live_under', 'Stored certificates, keys and signing requests live under')} <Link to={CERTS_PATH}>{t('panel.ssl/certificates.label', 'Certificates')}</Link>.</p>
         </>
       )}
       <DomainDetails domain={details} onClose={() => setDetails(null)} />

@@ -888,3 +888,208 @@ describe('Customer panel: email', () => {
     });
   });
 });
+
+describe('Customer panel: email routing (P1-4)', () => {
+  let app;
+  let csrf;
+  let alice;
+  let bob;
+  const db = () => app.ctx.db;
+  const row = (sql, ...args) => db().prepare(sql).get(...args);
+  const accountId = (username) => row('SELECT id FROM accounts WHERE username = ?', username).id;
+  // Public DNS as the page would see it: alice.com's MX lands on this server, shop.alice.com's elsewhere.
+  const resolver = {
+    resolveMx: async (domain) => (domain === 'alice.com' ? [{ exchange: 'mail.alice.com', priority: 10 }] : domain === 'shop.alice.com' ? [{ exchange: 'aspmx.l.google.com', priority: 1 }, { exchange: 'alt1.aspmx.l.google.com', priority: 5 }] : []),
+    resolve4: async (name) => (name === 'mail.alice.com' ? ['203.0.113.5'] : name.endsWith('google.com') ? ['142.250.0.27'] : []),
+    resolveTxt: async () => [], reverse: async () => [],
+  };
+
+  beforeAll(async () => {
+    app = await createTestApp({ agent: hostAgent() });
+    csrf = await app.login();
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice', domain: 'alice.com', ip: '203.0.113.5', provision: { mail: false } }).expect(201);
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'bob', domain: 'bob.com', ip: '203.0.113.6', provision: { mail: false } }).expect(201);
+    db().prepare("INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'shop.alice.com', 'sub', '/home/alice/public_html/shop')").run(accountId('alice'));
+    app.ctx.settings.set('basic.main_ip', '203.0.113.5');
+    app.ctx.mail.deliverability.useResolver(resolver);
+    alice = await panelLogin(app, 'alice');
+    bob = await panelLogin(app, 'bob');
+  });
+  afterAll(() => { app.ctx.mail?.deliverability?.useResolver(null); app.close(); });
+  beforeEach(() => restoreAgent(app.agent));
+
+  it('lists every domain of the account with its routing, the public MX and whether it points here', async () => {
+    const res = await alice.get('/email/routing').expect(200);
+    expect(res.body.meta).toMatchObject({ hostname: expect.any(String), values: ['auto', 'local', 'remote'] });
+    expect(res.body.data.map((r) => r.domain)).toEqual(['alice.com', 'shop.alice.com']);
+    const [main, shop] = res.body.data;
+    expect(main).toMatchObject({ type: 'main', routing: 'auto', effective: 'local', mailboxes: 0, canRemote: true, mx: { ok: true, pointsHere: true, exchanges: ['mail.alice.com'], records: [{ exchange: 'mail.alice.com', priority: 10 }] }, hints: [] });
+    expect(shop).toMatchObject({ type: 'sub', routing: 'auto', effective: 'local', mx: { ok: true, pointsHere: false, exchanges: ['aspmx.l.google.com', 'alt1.aspmx.l.google.com'] } });
+    expect(shop.hints[0]).toMatch(/MX records of shop\.alice\.com point at another server/);
+    expect(shop).toHaveProperty('delegation');
+    expect(app.agent.calls.map((c) => c.name)).not.toContain('mail.test_delivery');
+    expect((await alice.get('/email/domains/shop.alice.com/routing').expect(200)).body.data.domain).toBe('shop.alice.com');
+  });
+
+  it('only the account\'s own domains: a foreign domain is 404, never 403', async () => {
+    expect((await bob.get('/email/domains/alice.com/routing')).status).toBe(404);
+    expect((await bob.put('/email/domains/alice.com/routing', { routing: 'remote' })).status).toBe(404);
+    expect((await alice.get('/email/domains/nope.example/routing')).status).toBe(404);
+    expect(row('SELECT * FROM mail_domains WHERE domain = ?', 'alice.com')).toBeUndefined();
+  });
+
+  it('PUT routing claims the mail domain, writes the Exim lists through the Email category and reports applied/remote', async () => {
+    const res = await alice.put('/email/domains/shop.alice.com/routing', { routing: 'remote' }).expect(200);
+    expect(res.body.data).toMatchObject({ domain: 'shop.alice.com', routing: 'remote', effective: 'remote', applied: true, mailboxes: 0 });
+    expect(res.body.data.hints).toEqual([]);
+    expect(row('SELECT * FROM mail_domains WHERE domain = ?', 'shop.alice.com')).toMatchObject({ account_id: accountId('alice'), routing: 'remote' });
+    const writes = app.agent.callsTo('mail.config.include.write');
+    expect(writes.map((w) => w.args.name)).toEqual(['local_domains.lst', 'relay_domains.lst']);
+    expect(writes[0].args.content).not.toContain('shop.alice.com');
+    expect(writes[0].args.content).toContain('alice.com\n');
+    expect(row("SELECT * FROM audit_log WHERE action = 'panel.email.routing.set' ORDER BY id DESC LIMIT 1")).toMatchObject({ principal: 'alice', target: 'alice' });
+    // Back to local: the domain is listed again and the MX-elsewhere hint returns.
+    const back = await alice.put('/email/domains/shop.alice.com/routing', { routing: 'local' }).expect(200);
+    expect(back.body.data).toMatchObject({ routing: 'local', effective: 'local', applied: true });
+    expect(back.body.data.hints[0]).toMatch(/point at another server/);
+    expect(app.agent.callsTo('mail.config.include.write').filter((w) => w.args.name === 'local_domains.lst').pop().args.content).toContain('shop.alice.com');
+  });
+
+  it('Exim not reading the lists is reported as applied:false with the hint, not as a failure', async () => {
+    app.agent.set('mail.config.include.write', () => ({ domainListsHooked: false, domainListsDetail: 'local_domains list does not read the file', hint: 'run update-exim4.conf', path: '/etc/exim4/whm/x.lst' }));
+    const res = await alice.put('/email/domains/alice.com/routing', { routing: 'local' }).expect(200);
+    expect(res.body.data).toMatchObject({ routing: 'local', applied: false, hint: 'run update-exim4.conf' });
+    expect(res.body.data.reason).toMatch(/does not read the panel's domain lists/);
+    expect(row('SELECT routing FROM mail_domains WHERE domain = ?', 'alice.com').routing).toBe('local');
+  });
+
+  it('refuses remote while mailboxes exist (409), refuses mailboxes on a remote domain (409), validates the value', async () => {
+    expect((await alice.put('/email/domains/alice.com/routing', { routing: 'backup' })).status).toBe(422);
+    expect((await alice.put('/email/domains/alice.com/routing', { routing: 'remote', force: true })).status).toBe(422);
+    const created = await alice.post('/email/accounts', { localPart: 'info', domain: 'alice.com', password: 'Str0ng-Passw0rd!' });
+    expect(created.status).toBe(201);
+    const refused = await alice.put('/email/domains/alice.com/routing', { routing: 'remote' });
+    expect(refused.status).toBe(409);
+    expect(refused.body.error.code).toBe('mailboxes_exist');
+    expect((await alice.get('/email/domains/alice.com/routing').expect(200)).body.data).toMatchObject({ mailboxes: 1, canRemote: false, routing: 'local' });
+    // An explicitly remote domain never flips back silently: the mailbox is refused before anything is written.
+    await alice.put('/email/domains/shop.alice.com/routing', { routing: 'remote' }).expect(200);
+    app.agent.calls.length = 0;
+    const blocked = await alice.post('/email/accounts', { localPart: 'sales', domain: 'shop.alice.com', password: 'Str0ng-Passw0rd!' });
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.error.code).toBe('routing_remote');
+    expect(app.agent.calls.map((c) => c.name).filter((n) => /^(vmail|files)\./.test(n))).toEqual([]);
+    expect(row('SELECT routing FROM mail_domains WHERE domain = ?', 'shop.alice.com').routing).toBe('remote');
+    await alice.put('/email/domains/shop.alice.com/routing', { routing: 'auto' }).expect(200);
+    expect((await alice.post('/email/accounts', { localPart: 'sales', domain: 'shop.alice.com', password: 'Str0ng-Passw0rd!' })).status).toBe(201);
+    expect(row('SELECT routing FROM mail_domains WHERE domain = ?', 'shop.alice.com').routing).toBe('local');
+  });
+});
+
+describe('Customer panel: delivery tracking and mailbox folders (P1-12)', () => {
+  let app;
+  let csrf;
+  let alice;
+  let bob;
+  let mailboxId;
+  const db = () => app.ctx.db;
+  const calls = (name) => app.agent.calls.filter((c) => c.name === name);
+  const report = [
+    { key: '1:0', id: 'A1', arrivedAt: '2026-11-03T10:00:00Z', sender: 'info@alice.com', recipient: 'x@example.org', status: 'delivered', subject: 'Invoice 42', size: 2048 },
+    { key: '2:0', id: 'A2', arrivedAt: '2026-11-03T10:01:00Z', sender: 'y@example.org', recipient: 'info@alice.com', status: 'delivered', subject: 'Re: hello' },
+    { key: '3:0', id: 'A3', arrivedAt: '2026-11-03T10:02:00Z', sender: 'z@notalice.com', recipient: 'q@notexample.com', status: 'failed', subject: 'Invoice 42' },
+    { key: '4:0', id: 'A4', arrivedAt: '2026-11-03T10:03:00Z', sender: 'bob@bob.com', recipient: 'w@example.org', status: 'failed' },
+    { key: '5:0', id: 'A5', arrivedAt: '2026-11-03T10:04:00Z', sender: 'info@alice.com', recipient: 'nope@example.org', status: 'failed', detail: 'Unrouteable address' },
+    { key: '6:0', id: 'A6', arrivedAt: '2026-11-03T10:05:00Z', sender: 'news@example.org', recipient: 'info@alice.com', status: 'deferred', detail: 'Quota exceeded' },
+  ];
+
+  beforeAll(async () => {
+    app = await createTestApp({ agent: hostAgent() });
+    csrf = await app.login();
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice', domain: 'alice.com', ip: '203.0.113.5', provision: { mail: false } }).expect(201);
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'bob', domain: 'bob.com', ip: '203.0.113.6', provision: { mail: false } }).expect(201);
+    alice = await panelLogin(app, 'alice');
+    bob = await panelLogin(app, 'bob');
+    app.ctx.mail.reports.delivery = async () => ({ data: report, meta: { logFrom: null, logTruncated: false, logExists: true } });
+    const created = await alice.post('/email/accounts', { localPart: 'info', domain: 'alice.com', password: 'Str0ng-Passw0rd!' });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    mailboxId = created.body.data.id;
+  });
+  afterAll(() => app.close());
+  beforeEach(() => {
+    restoreAgent(app.agent);
+    app.agent.set('vmail.mailbox.status', ({ user }) => ({ user, folders: [{ name: 'INBOX', messages: 12, bytes: 40960, unseen: 3 }, { name: 'Trash', messages: 4, bytes: 2048, unseen: 0 }, { name: 'Archive.2025', messages: 100, bytes: 1048576, unseen: 0 }] }));
+    app.agent.set('vmail.mailbox.expunge', ({ user, folder, olderThanDays }) => ({ user, folder, olderThanDays: olderThanDays ?? null, before: 4, after: 0, removed: 4 }));
+  });
+
+  it('GET /email/usage/messages pages the account rows and filters by status and text', async () => {
+    const all = await alice.get('/email/usage/messages?sinceHours=48').expect(200);
+    expect(all.body.data.map((r) => r.id)).toEqual(['A1', 'A2', 'A5', 'A6']);
+    expect(all.body.meta).toMatchObject({ page: 1, pageSize: 25, total: 4, hours: 48, q: null, status: null, log: { exists: true } });
+    const failed = await alice.get('/email/usage/messages?status=failed').expect(200);
+    expect(failed.body.data.map((r) => r.id)).toEqual(['A5']);
+    expect(failed.body.data[0]).toMatchObject({ detail: 'Unrouteable address', recipient: 'nope@example.org' });
+    const text = await alice.get('/email/usage/messages?q=invoice').expect(200);
+    expect(text.body.data.map((r) => r.id)).toEqual(['A1']);
+    const byDetail = await alice.get('/email/usage/messages?q=quota').expect(200);
+    expect(byDetail.body.data.map((r) => r.id)).toEqual(['A6']);
+    const paged = await alice.get('/email/usage/messages?pageSize=2&page=2').expect(200);
+    expect(paged.body.data.map((r) => r.id)).toEqual(['A5', 'A6']);
+    expect(paged.body.meta).toMatchObject({ page: 2, pageSize: 2, total: 4 });
+    const bobs = await bob.get('/email/usage/messages').expect(200);
+    expect(bobs.body.data.map((r) => r.id)).toEqual(['A4']);
+    for (const q of ['status=lost', 'pageSize=0', 'pageSize=101', 'page=0', 'sinceHours=169']) expect((await alice.get(`/email/usage/messages?${q}`)).status, q).toBe(422);
+  });
+
+  it('lists the folders of an owned mailbox through vmail.mailbox.status, marking Trash and Junk', async () => {
+    const res = await alice.get(`/email/accounts/${mailboxId}/folders`).expect(200);
+    expect(res.body.data).toEqual([
+      { name: 'INBOX', messages: 12, bytes: 40960, unseen: 3, emptiable: false },
+      { name: 'Trash', messages: 4, bytes: 2048, unseen: 0, emptiable: true },
+      { name: 'Archive.2025', messages: 100, bytes: 1048576, unseen: 0, emptiable: false },
+    ]);
+    expect(res.body.meta).toMatchObject({ mailbox: { id: mailboxId, address: 'info@alice.com' }, usage: { source: 'dovecot' }, minOlderThanDays: 7 });
+    expect(calls('vmail.mailbox.status').map((c) => c.args)).toEqual([{ user: 'info@alice.com' }]);
+    expect((await bob.get(`/email/accounts/${mailboxId}/folders`)).status).toBe(404);
+    expect((await alice.get('/email/accounts/999999/folders')).status).toBe(404);
+  });
+
+  it('empties Trash outright, needs olderThanDays >= 7 for any other folder, and audits', async () => {
+    const trash = await alice.post(`/email/accounts/${mailboxId}/folders/Trash/empty`, {}).expect(200);
+    expect(trash.body.data).toMatchObject({ mailbox: { address: 'info@alice.com' }, folder: 'Trash', olderThanDays: null, removed: 4 });
+    expect(calls('vmail.mailbox.expunge').map((c) => c.args)).toEqual([{ user: 'info@alice.com', folder: 'Trash' }]);
+    const refused = await alice.post(`/email/accounts/${mailboxId}/folders/INBOX/empty`, {});
+    expect(refused.status).toBe(422);
+    expect(refused.body.error.fields).toHaveProperty('olderThanDays');
+    expect((await alice.post(`/email/accounts/${mailboxId}/folders/INBOX/empty`, { olderThanDays: 6 })).status).toBe(422);
+    expect((await alice.post(`/email/accounts/${mailboxId}/folders/INBOX/empty`, { olderThanDays: 30, extra: true })).status).toBe(422);
+    expect(calls('vmail.mailbox.expunge')).toHaveLength(1);
+    const old = await alice.post(`/email/accounts/${mailboxId}/folders/Archive.2025/empty`, { olderThanDays: 30 }).expect(200);
+    expect(old.body.data).toMatchObject({ folder: 'Archive.2025', olderThanDays: 30 });
+    expect(calls('vmail.mailbox.expunge').at(-1).args).toEqual({ user: 'info@alice.com', folder: 'Archive.2025', olderThanDays: 30 });
+    for (const folder of ['..', '.hidden', 'a%2Fb', 'INBOX.', 'a..b', 'x"y', 'a*']) {
+      const res = await alice.post(`/email/accounts/${mailboxId}/folders/${encodeURIComponent(folder)}/empty`, { olderThanDays: 30 });
+      expect([404, 422], folder).toContain(res.status);
+    }
+    expect(calls('vmail.mailbox.expunge')).toHaveLength(2);
+    expect((await bob.post(`/email/accounts/${mailboxId}/folders/Trash/empty`, {})).status).toBe(404);
+    const audit = db().prepare("SELECT * FROM audit_log WHERE action = 'panel.email.folder.empty' ORDER BY id").all();
+    expect(audit).toHaveLength(2);
+    expect(JSON.parse(audit[0].args_redacted)).toMatchObject({ mailbox: 'info@alice.com', folder: 'Trash', olderThanDays: null, removed: 4 });
+  });
+
+  it('answers 501 for folders without Dovecot and 404 for a folder the mailbox does not have', async () => {
+    app.agent.fail('vmail.mailbox.expunge', 'not_found', 'Folder Gone does not exist');
+    expect((await alice.post(`/email/accounts/${mailboxId}/folders/Gone/empty`, { olderThanDays: 30 })).status).toBe(404);
+    app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, n !== 'doveadm' && n !== 'dovecot' && PRESENT.has(n)])));
+    await app.ctx.capabilities.refresh();
+    try {
+      const res = await alice.get(`/email/accounts/${mailboxId}/folders`);
+      expect(res.status).toBe(501);
+      expect((await alice.post(`/email/accounts/${mailboxId}/folders/Trash/empty`, {})).status).toBe(501);
+    } finally {
+      restoreAgent(app.agent);
+      await app.ctx.capabilities.refresh();
+    }
+  });
+});

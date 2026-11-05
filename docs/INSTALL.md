@@ -153,14 +153,34 @@ Other functions check for their binary at call time: `agent/src/exec.js` resolve
 in `/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin` and rejects with
 `binary_not_found` when it is absent.
 
+The account panel's `.htaccess` functions (Directory privacy, Indexes, IP blocker, Error pages;
+`MANUAL-partC.md` §5.3, §5.4, §13.6, §15.1) need the Apache modules `authz_core`, `authz_host`,
+`auth_basic` and `authn_file` (all enabled by default on Debian/Ubuntu and RHEL builds — check with
+`apachectl -M`) and `AllowOverride All` on each document root, which the account vhost template
+grants. Apache only reads `.htaccess` on a request, so the panel verifies a change with a loopback
+`GET` of the folder (`Host` header against `127.0.0.1`) and rolls it back on a `500`.
+
 **When a daemon is absent** nothing crashes: the agent answers `capability_missing` or
 `binary_not_found`, `server/src/middleware/error.js` maps both to **HTTP 501**, and the page shows an
 install prompt for the missing service instead of its controls. Features whose daemon exists work
 fully. The agent also confines every path argument to an allowlist of roots
 (`DEFAULT_ALLOWED_ROOTS` in `agent/src/lib.js`: `/home`, `/var/lib/whm`, `/etc/whm`, `/var/log/whm`,
 `/etc/apache2`, `/etc/httpd`, `/etc/nginx`, `/var/www`, `/etc/bind`, `/var/named`, `/etc/exim*`,
-`/etc/dovecot`, `/etc/mysql`, `/etc/letsencrypt`, `/backup`, `/var/backups/whm`, …); it can be widened
-with `extraAllowedRoots` in `/etc/whm/agent.conf`.
+`/etc/dovecot`, `/etc/mysql`, `/etc/letsencrypt`, `/backup`, `/var/backups/whm`, …, plus `deploy/roundcube`
+and `deploy/phpmyadmin` both under `/opt/whm` and under the tree the agent runs from, so a different
+`APP_DIR` or a dev checkout still ships its Roundcube plugin and phpMyAdmin signon script); it can be
+widened with `extraAllowedRoots` in `/etc/whm/agent.conf`.
+
+**Cloud hosts and outbound mail (EC2 and most providers block outbound port 25).** Exim can accept
+mail and deliver locally, but every message to the internet stays in the queue until the provider
+lifts the restriction (AWS: the "port 25 throttle removal" request) or Exim relays through a
+smarthost. Configure the relay under *Service Configuration › Exim Configuration Manager › Outbound
+and IPv6* (host, port 587, TLS, login); on an **unsplit** Debian/Ubuntu Exim add the one line the card
+prints — `.include_if_exists /etc/exim4/whm/router_whm_smarthost.conf` directly after `begin routers`
+in `/etc/exim4/exim4.conf.template` — then `update-exim4.conf` and reload Exim. The Security Advisor
+reports `mail.outbound.port25` while port 25 is blocked and no relay is set. A host without a global
+IPv6 route (typical EC2 default) gets `disable_ipv6 = true` rendered automatically (IPv6 setting
+*Automatic*), so Exim stops trying AAAA mail exchangers first.
 
 ---
 
@@ -350,6 +370,51 @@ with its certificate (above), `php-cli` (a Roundcube dependency) and the virtual
 mailbox logins (MANUAL-partC §6.7). Never enable the distribution's global alias (`a2enconf
 roundcube` with the alias uncommented): it would answer on every customer site.
 
+*Webmail single sign-on* (optional, Panel › Customization › Account panel › Webmail › *Single sign-on*):
+needs the virtual-mail wiring live, Roundcube published as above, `php-curl` (Debian's `roundcube-core`
+depends on it) and the Keel plugin in the deployed tree — `install.sh` (and `--upgrade`) rsyncs the
+repository's `deploy/` directory into `/opt/whm`, so `/opt/whm/deploy/roundcube/keel_sso/` exists after
+every deploy; the publish step copies it into `/var/lib/roundcube/plugins/keel_sso` (Debian) as root. The
+switch writes `/etc/dovecot/whm/master-users` and reloads Dovecot; verify with
+`doveadm auth test 'user@example.com*keel-master' <master password>` (the password is only ever in the
+panel's encrypted settings). The plugin talks to the panel's own listener on `127.0.0.1` (the HTTPS port
+with TLS, the plain port without) without peer verification (loopback only); the Keel block of
+`config.inc.php` carries that address as `$config['keel_sso_endpoint']`, so a changed panel port is picked
+up by switching single sign-on off and on (or publishing the webmail again). Signed-on sessions use the
+mailbox as the Roundcube user (SASL authorization identity) and the master user as the authentication
+identity, so SMTP AUTH through Exim must reach Dovecot (the virtual-mail `dovecot` authenticators).
+
+**Mail filters (Sieve).** The account panel's *Email filters* need Pigeonhole: `apt install
+dovecot-sieve` (RHEL: `dovecot-pigeonhole`). While `sievec` is present the virtual-mail fragment
+`98-whm-virtual-auth.conf` loads the `sieve` plugin for LMTP and points Dovecot at
+`~/mail/<domain>/<local>/sieve/` (active `.dovecot.sieve`) and the account-wide
+`~/mail/sieve-global/keel.sieve` (`sieve_before`); without it the fragment carries no Sieve lines at
+all (Dovecot would otherwise refuse every LMTP delivery for the missing plugin). So re-apply the
+wiring after installing the package (*Service Configuration › Exim Configuration Manager › virtual
+mail*, or `POST /api/service-config/virtual-mail/apply`; the boot job does it on the next restart of
+the panel too) and restart Dovecot. Without `sievec` the filter pages answer `501 sieve`. ManageSieve
+is not needed and stays off.
+
+**WordPress (account panel › Software).** The installer needs PHP with its MySQL driver and `unzip`
+on the host — Debian/Ubuntu `apt install php8.5-mysql unzip` (the `php<version>-mysql` package of the
+PHP the sites run; RHEL `php-mysqlnd unzip`) — plus `setpriv`/`runuser` (util-linux, always present).
+With that the panel downloads `https://wordpress.org/latest.zip` (the host needs outbound HTTPS to
+wordpress.org), checks it against the published SHA-1 and finishes the install through the WordPress
+installer over loopback. **WP-CLI is optional** but recommended: with `wp` in `PATH`
+(`curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x
+wp-cli.phar && mv wp-cli.phar /usr/local/bin/wp`) the install goes through `wp core download/install`,
+and the page's **Update** action (`wp core update` as the account) becomes available; without it
+the action answers `501` and the page points customers at the WordPress dashboard. The page tells
+the customer what is missing; the API answers `501` until one of the two paths is complete.
+
+**Visitors (web statistics).** The account panel's *Logs › Visitors* page renders GoAccess reports:
+`apt install goaccess` (RHEL: `goaccess` from EPEL). Nothing else to configure — the agent runs it
+as each account (`setpriv`, lowest `nice`/`ionice` priority, 120 s per domain) over the per-domain
+logs under `/var/log/whm/domlogs/<user>/` and writes `~/.keel/stats/<domain>.html` plus a JSON
+summary; the nightly schedule `panel-stats-generate` (01:50) covers every active account whose plan
+has the `webstats` feature. Without the binary the page answers `501` with the package name. A GeoIP
+database is optional (GoAccess adds the countries panel when one is configured system-wide).
+
 **phpMyAdmin** comes from the distribution: `apt install phpmyadmin` (choose *apache2*, let dbconfig-common
 create the control user — it writes `/etc/phpmyadmin/config-db.php`). The package enables a *global*
 `conf-enabled/phpmyadmin.conf`, which serves `/phpmyadmin` on every customer site with that site's certificate;
@@ -357,6 +422,18 @@ do not leave it that way. In the console open *Database Services › phpMyAdmin*
 `POST /api/databases/phpmyadmin/publish`): the panel writes `keel-host.d/phpmyadmin.conf` under the hostname
 site, validates and reloads Apache, then runs `a2disconf phpmyadmin`. The account panel links to
 `https://<hostname>/phpmyadmin/` only once that is done (MANUAL-partB.md §20.9).
+
+*phpMyAdmin single sign-on* (optional, Panel › Customization › Account panel › phpMyAdmin): needs the publication
+above, `php-curl` and the Keel signon script in the deployed tree — `install.sh` rsyncs `deploy/` into `/opt/whm`, so
+`/opt/whm/deploy/phpmyadmin/pma-signon.php` exists after every deploy and is served as `https://<hostname>/keel/`
+by the hostname site's PHP-FPM www pool (the tree must stay world-readable). The switch writes
+`/etc/phpmyadmin/conf.d/keel-signon.php` (Debian's `config.inc.php` globs `conf.d/*.php`; on another layout create the
+include yourself); verify with `php -l /etc/phpmyadmin/conf.d/keel-signon.php` and
+`curl -sI https://<hostname>/keel/pma-signon.php` (200). Customers keep the cookie login as phpMyAdmin server 2. The
+script talks to the panel's own listener on `127.0.0.1` (HTTPS port with TLS, the plain port without): the drop-in
+carries that address as the `KEEL_SSO_ENDPOINT` constant and the script reads it from there (`/etc/phpmyadmin/conf.d`
+must stay readable by the www pool); switch single sign-on off and on after changing the panel port. An Apache
+`SetEnv KEEL_SSO_ENDPOINT …` on the `/keel` drop-in is honoured when no constant is defined.
 
 ### 4.6 Post-install checks
 

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import https from 'node:https';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import { z } from 'zod';
@@ -298,12 +299,18 @@ function findEximBlock(text) {
   return null;
 }
 
+// Exim takes a main option once per configuration ("option set for the second
+// time" is fatal), so a disable_ipv6 line an operator added by hand outside
+// the block gives way when the block sets it.
+const DISABLE_IPV6_LINE = /^\s*disable_ipv6\s*=.*(?:\r?\n|$)/gm;
 export function mergeEximBlock(previous, content) {
   const block = `${EXIM_BLOCK.begin}\n${String(content).trimEnd()}\n${EXIM_BLOCK.end}\n`;
+  const outside = (text) => (/^\s*disable_ipv6\s*=/m.test(String(content)) ? text.replace(DISABLE_IPV6_LINE, '') : text);
   const text = previous || '';
   const found = findEximBlock(text);
-  if (found) return `${text.slice(0, found.start)}${block}${text.slice(found.stop + found.endLength).replace(/^\n/, '')}`;
-  return `${text.length && !text.endsWith('\n') ? `${text}\n` : text}${block}`;
+  if (found) return `${outside(text.slice(0, found.start))}${block}${outside(text.slice(found.stop + found.endLength).replace(/^\n/, ''))}`;
+  const before = outside(text);
+  return `${before.length && !before.endsWith('\n') ? `${before}\n` : before}${block}`;
 }
 
 export function readEximBlock(text) {
@@ -1101,6 +1108,65 @@ defineOp('web.host.app.list', {
   },
 });
 
+// A published application answering 500 (Roundcube on a PHP it does not know,
+// a missing database) is "published" to Apache all the same: the only proof is
+// a request over loopback with the site's own name, no redirects followed, and
+// the last PHP fatal from the site's error log when it fails.
+function httpProbe({ port, tls, servername, path: urlPath, timeoutMs }) {
+  return new Promise((resolve) => {
+    const mod = tls ? https : http;
+    const req = mod.request({ host: '127.0.0.1', port, path: urlPath, method: 'GET', servername, rejectUnauthorized: false, headers: { Host: servername, 'User-Agent': 'keel-probe' }, timeout: timeoutMs }, (res) => {
+      res.resume();
+      resolve({ status: res.statusCode, location: res.headers.location ?? null, error: null });
+    });
+    req.on('timeout', () => { req.destroy(new Error('timeout')); });
+    req.on('error', (err) => resolve({ status: null, location: null, error: err.code || err.message }));
+    req.end();
+  });
+}
+
+const PHP_FATAL_RE = /PHP Fatal error[^\n]*/g;
+export function lastPhpFatal(text) {
+  const matches = String(text || '').match(PHP_FATAL_RE);
+  if (!matches) return null;
+  return matches[matches.length - 1].replace(/\\n.*$/, '').replace(/['"]?\s*$/, '').slice(0, 300);
+}
+
+function tailText(file, bytes = 64 * 1024) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const length = Math.min(size, bytes);
+      const buf = Buffer.alloc(length);
+      fs.readSync(fd, buf, 0, length, size - length);
+      return buf.toString('utf8');
+    } finally { fs.closeSync(fd); }
+  } catch { return null; }
+}
+
+defineOp('web.host.app.probe', {
+  description: 'GET https://127.0.0.1<alias>/ with the hostname site\'s name as SNI and Host (no redirects, 5 s): the HTTP status an application published under the hostname site really answers, plus the last PHP fatal from the site\'s error log when it is 5xx',
+  schema: z.object({ alias: hostAppAlias, timeoutMs: z.number().int().min(100).max(5000).default(5000) }).strict(),
+  run: async ({ alias, timeoutMs }, ctx) => {
+    const apache = requireApache();
+    const layout = hostLayout(apache);
+    const meta = parseHostMeta(readText(ctx.assertAllowedPath(layout.file, 'read')));
+    if (!meta?.hostname) throw new OpError('not_found', `${layout.file} is not a panel-managed hostname site`);
+    const tls = Boolean(meta.ssl && meta.sslPort);
+    const port = tls ? meta.sslPort : meta.port || 80;
+    const urlPath = alias.length > 1 ? `${alias.replace(/\/+$/, '')}/` : alias;
+    const r = await httpProbe({ port, tls, servername: meta.hostname, path: urlPath, timeoutMs });
+    const url = `${tls ? 'https' : 'http'}://${meta.hostname}${port === (tls ? 443 : 80) ? '' : `:${port}`}${urlPath}`;
+    let phpFatal = null;
+    if (r.status != null && r.status >= 500) {
+      const log = ctx.assertAllowedPath(path.join(layout.logDir, `${HOST_VHOST.name}${tls ? '-ssl' : ''}-error.log`), 'read');
+      phpFatal = lastPhpFatal(tailText(log));
+    }
+    return { alias: urlPath.replace(/\/$/, '') || '/', url, hostname: meta.hostname, port, tls, status: r.status, ok: r.status != null && r.status >= 200 && r.status < 400, location: r.location, error: r.error, phpFatal };
+  },
+});
+
 // ------------------------------------------------------------ global include ---
 
 defineOp('web.global.read', {
@@ -1790,7 +1856,7 @@ async function validateExim(layout) {
   if (layout.flavor === 'debian' && layout.updateConf) { const r = await exec('update-exim4.conf', [], { allowFailure: true, timeoutMs: 120_000 }); regenerated = { ok: r.code === 0, output: `${r.stdout}${r.stderr}`.trim() }; }
   const { code, stdout, stderr } = await exec(layout.bin, ['-bV'], { allowFailure: true, timeoutMs: 60_000 });
   const output = `${stdout}${stderr}`.trim();
-  const ok = code === 0 && !/configuration error|main option .* unknown|Exim configuration error|option set for a second time|unknown ACL condition/i.test(output) && (regenerated?.ok ?? true);
+  const ok = code === 0 && !/configuration error|main option .* unknown|Exim configuration error|option set for (?:a|the) second time|unknown ACL condition/i.test(output) && (regenerated?.ok ?? true);
   return { ok, output: regenerated && !regenerated.ok ? regenerated.output : output, ...parseEximVersion(stdout), regenerated };
 }
 

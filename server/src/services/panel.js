@@ -15,6 +15,8 @@ import { PANEL_SCOPES } from '../routes/panel/index.js';
 //   panel.recovery.request({ username | email }, req) / confirm({ token, password }, req)
 //                                                  -> forgot-password by e-mail (routes/auth.js, public)
 //   panel.adminReset2fa(username, user, req)       -> clear the account login's authenticator (console)
+//   panel.assertTwoFactor(user, path?)             -> the panel 2FA policy (panelScope + the core password seam)
+//   panel.preferences.get/setContact/setLocale(scope, …) / notifyFor(username) -> contact, language, notifications (§50)
 //   panel.audit(req, entry)                        -> audit row carrying actingAs/by while impersonating
 
 export const LOGIN_AS_TTL = { min: 5, max: 480, fallback: 60 };
@@ -75,6 +77,13 @@ export function createPanelService(ctx) {
     burnReset: db.prepare('UPDATE password_reset_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL'),
     purgeResets: db.prepare("DELETE FROM password_reset_tokens WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day')"),
     clearTotp: db.prepare("UPDATE users SET totp_secret_enc = NULL, totp_enabled = 0 WHERE id = ? AND role = 'user'"),
+    usersWithoutTotp: db.prepare("SELECT COUNT(*) AS n FROM users u JOIN account_users au ON au.user_id = u.id WHERE u.role = 'user' AND u.totp_enabled = 0"),
+    linkedUsers: db.prepare("SELECT COUNT(*) AS n FROM users u JOIN account_users au ON au.user_id = u.id WHERE u.role = 'user'"),
+    setContactEmail: db.prepare("UPDATE accounts SET contact_email = ?, updated_at = datetime('now') WHERE id = ?"),
+    setUserLocale: db.prepare("UPDATE users SET locale = ? WHERE id = ? AND role = 'user'"),
+    prefs: db.prepare('SELECT * FROM panel_account_prefs WHERE account_id = ?'),
+    upsertPrefs: db.prepare(`INSERT INTO panel_account_prefs (account_id, email2, notify_quota, notify_bandwidth, notify_password_change, updated_at) VALUES (?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT (account_id) DO UPDATE SET email2 = excluded.email2, notify_quota = excluded.notify_quota, notify_bandwidth = excluded.notify_bandwidth, notify_password_change = excluded.notify_password_change, updated_at = excluded.updated_at`),
   };
 
   // Tables owned by the mail and FTP units may not exist on this tree yet.
@@ -327,6 +336,18 @@ export function createPanelService(ctx) {
     if (scope?.mode === 'acting') throw new HttpError(403, 'not_while_impersonating', 'This action is not available while logged in as the account');
   }
 
+  // The panel-side 2FA policy (§2.5), checked in one place: panelScope in
+  // routes/categories/panel.js passes the request path so /me and the enrolment
+  // routes stay reachable; the core password seam passes none. Administrators
+  // acting as the account answer to the console's own policy, not this one.
+  const TWO_FACTOR_OPEN = (p) => p === '/me' || p.startsWith('/security/two-factor');
+  function assertTwoFactor(user, path = null) {
+    if (!user || user.role !== 'user' || user.totp_enabled) return;
+    if (!settings.get('panel.require_2fa_for_users')) return;
+    if (path != null && TWO_FACTOR_OPEN(path)) return;
+    throw new HttpError(403, 'two_factor_required', 'Two-factor authentication is required for your account. Set it up to continue.');
+  }
+
   function ttlMinutes() {
     const n = Number(settings.get('panel.login_as_ttl_minutes'));
     if (!Number.isFinite(n)) return LOGIN_AS_TTL.fallback;
@@ -385,7 +406,8 @@ export function createPanelService(ctx) {
     const a = s.account;
     const userRow = s.mode === 'user' ? stmts.userById.get(req.user.id) : null;
     return {
-      user: ctx.auth.publicUser(req.user),
+      user: { ...ctx.auth.publicUser(req.user), locale: userRow?.locale ?? null },
+      preferences: preferences.get(s),
       account: {
         username: a.username, domain: a.domain, ip: a.ip, package: a.package_name, plan: a.plan, features: s.features, limits: s.limits,
         suspended: a.suspended, forcePasswordChange: a.force_password_change, demoMode: a.demo_mode, contactEmail: a.contact_email, homeDir: a.home_dir, shell: a.shell,
@@ -454,6 +476,7 @@ export function createPanelService(ctx) {
     })();
     ctx.sessionStore?.destroyUserSessions?.(user.id);
     audit(req, { action: 'panel.password.change', target: s.username, args: { host, forced, recovery: Boolean(recovery) } });
+    notifyPasswordChanged(s, req);
     return { changed: true, host };
   }
 
@@ -480,9 +503,100 @@ export function createPanelService(ctx) {
     const forced = (Boolean(force) && Boolean(user.must_change_password)) || Boolean(recovery);
     if (!forced) {
       if (s.features?.passwordchange === false) throw new HttpError(403, 'feature_disabled', 'Your hosting package does not include password changes');
-      if (settings.get('panel.require_2fa_for_users') && !user.totp_enabled) throw new HttpError(403, 'two_factor_required', 'Two-factor authentication is required for your account. Set it up to continue.');
+      assertTwoFactor(user);
     }
     return changePassword(s, { currentPassword, newPassword, force, recovery }, req);
+  }
+
+  // ------------------------------------------------------------- preferences
+
+  // Contact addresses live on the account row (the console's contactEmail,
+  // also the forgot-password address) and are mirrored to the linked login;
+  // the switches and the second address are the account's own row; the
+  // language is the login's (never written while acting: that row is root's).
+  const enabledLocales = () => {
+    try { return (ctx.locales?.list?.()?.data || []).filter((l) => l.enabled).map((l) => ({ code: l.code, name: l.name })); } catch { return []; }
+  };
+  const preferences = {
+    get(s) {
+      const a = stmts.accountById.get(s.accountId) || s.account;
+      const row = stmts.prefs.get(s.accountId);
+      const link = stmts.linkByAccount.get(s.accountId);
+      const login = link ? stmts.userById.get(link.user_id) : null;
+      return {
+        email: a.contact_email || null, email2: row?.email2 || null,
+        notify: { quota: row ? Boolean(row.notify_quota) : true, bandwidth: row ? Boolean(row.notify_bandwidth) : true, passwordChange: row ? Boolean(row.notify_password_change) : true },
+        locale: login?.locale ?? null, locales: enabledLocales(), defaultLocale: ctx.locales?.defaultCode?.() ?? 'en',
+      };
+    },
+    // The contact address is the forgot-password address, so a live session
+    // alone cannot move it: the login's password is checked again (an
+    // administrator acting as the account already authenticated to the
+    // console) and the previous address is told.
+    async setContact(s, { email, email2 = null, notify = {}, currentPassword }, req) {
+      if (s.mode !== 'acting') await assertCurrentPassword(s, currentPassword);
+      const before = preferences.get(s);
+      const next = { quota: notify.quota ?? before.notify.quota, bandwidth: notify.bandwidth ?? before.notify.bandwidth, passwordChange: notify.passwordChange ?? before.notify.passwordChange };
+      const link = stmts.linkByAccount.get(s.accountId);
+      db.transaction(() => {
+        stmts.setContactEmail.run(email, s.accountId);
+        if (link) stmts.setUserEmail.run(email, link.user_id);
+        stmts.upsertPrefs.run(s.accountId, email2 || null, next.quota ? 1 : 0, next.bandwidth ? 1 : 0, next.passwordChange ? 1 : 0);
+      })();
+      audit(req, { action: 'panel.me.contact', target: s.username, args: { email, email2: email2 || null, notify: next, previousEmail: before.email } });
+      if (before.email && before.email !== email) notifyContactChanged(s, before.email, email, req);
+      return preferences.get(s);
+    },
+    setLocale(s, { locale }, req) {
+      assertNotActing(s);
+      const code = locale || null;
+      if (code && !enabledLocales().some((l) => l.code === code)) throw unprocessable('That language is not available on this server', { locale: ['Pick one of the enabled languages'] });
+      stmts.setUserLocale.run(code, s.actor.id);
+      audit(req, { action: 'panel.me.locale', target: s.username, args: { locale: code } });
+      return preferences.get(s);
+    },
+    // Seam for whoever mails the account (quota/bandwidth warnings): the
+    // addresses to use and whether the customer wants that kind of message.
+    notifyFor(username) {
+      const account = stmts.accountByUsername.get(username);
+      if (!account) return null;
+      const p = preferences.get({ accountId: account.id, account, username });
+      return { to: [p.email, p.email2].filter(Boolean), notify: p.notify };
+    },
+  };
+
+  async function assertCurrentPassword(s, currentPassword) {
+    const user = stmts.userById.get(s.actor?.id);
+    const link = user ? stmts.linkByUser.get(user.id) : null;
+    if (!link || link.account_id !== s.accountId) throw forbidden('This login is not linked to the account');
+    if (!currentPassword) throw unprocessable('Confirm the change with your current password', { currentPassword: ['Enter your current password'] });
+    if (!(await crypto.verifyPassword(currentPassword, user.password_hash))) throw unauthorized('Current password is incorrect');
+  }
+
+  // The address that just stopped being the recovery address hears about it,
+  // detached like the password notice. Forgot-password now mails the new
+  // address, so the advice is to reach the provider, not the sign-in page.
+  function notifyContactChanged(s, previous, email, req) {
+    if (!ctx.contacts?.sendMail) return;
+    const company = companyName();
+    const body = `The contact (password recovery) address of the ${company} account "${s.username}" on ${settings.get('basic.hostname') || 'this server'} was changed from ${previous} to ${email} from ${req?.ip || 'an unknown address'}. If that was not you, contact your hosting provider right away: password resets now go to the new address.`;
+    try {
+      Promise.resolve(ctx.contacts.sendMail({ to: previous, subject: `[${company}] Contact address changed for ${s.username}`, body }, req)).catch((err) => logger.debug({ err, username: s.username }, 'panel: contact-change notice not sent'));
+    } catch (err) { logger.debug({ err, username: s.username }, 'panel: contact-change notice not sent'); }
+  }
+
+  // The customer asked to hear about password changes: a plain note to the
+  // contact addresses, detached (never delays or fails the change itself).
+  function notifyPasswordChanged(s, req) {
+    const p = preferences.notifyFor(s.username);
+    if (!p?.notify.passwordChange || !p.to.length || !ctx.contacts?.sendMail) return;
+    const company = companyName();
+    const body = `The password of the ${company} account "${s.username}" on ${settings.get('basic.hostname') || 'this server'} was changed from ${req?.ip || 'an unknown address'}. If that was not you, use "Forgot password" on the sign-in page right away.`;
+    for (const to of p.to) {
+      try {
+        Promise.resolve(ctx.contacts.sendMail({ to, subject: `[${company}] Password changed for ${s.username}`, body }, req)).catch((err) => logger.debug({ err, username: s.username }, 'panel: password-change notice not sent'));
+      } catch (err) { logger.debug({ err, username: s.username }, 'panel: password-change notice not sent'); }
+    }
   }
 
   // ---------------------------------------------------------------- recovery
@@ -685,6 +799,8 @@ export function createPanelService(ctx) {
         enabled: raw['panel.enabled'] !== false, require2faForUsers: Boolean(raw['panel.require_2fa_for_users']),
         loginAsTtlMinutes: ttlMinutes(), loginAsAcl: loginAsAclKey(), webmailUrl: String(raw['panel.webmail_url'] || ''),
         uploadChunkBytes: Number(raw['panel.upload_chunk_bytes']) || 1310720,
+        // What switching require2faForUsers on will force at next login.
+        linkedUsers: stmts.linkedUsers.get().n, usersWithoutTotp: stmts.usersWithoutTotp.get().n,
       };
     },
     update(input, req) {
@@ -703,8 +819,8 @@ export function createPanelService(ctx) {
   return {
     SYSTEM_ROOT,
     ensureUser, backfill, syncPassword, setSuspended, subscribe, userStatus, adminEnsureUser, adminSetPassword, adminReset2fa, recovery,
-    scope, assertNotActing, loginAs, logoutAs, loginAsHistory, endImpersonation,
-    me, quickLinks, counts, userPrincipal,
+    scope, assertNotActing, assertTwoFactor, loginAs, logoutAs, loginAsHistory, endImpersonation,
+    me, quickLinks, counts, userPrincipal, preferences,
     changePassword, changePasswordForUser, linkForUser, reestablish, sessions, tokens, settings: panelSettings, audit, releaseMailDomain,
   };
 }

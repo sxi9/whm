@@ -1,6 +1,7 @@
 import { validate, z, fields, pagination, patchOf } from '../../lib/validate.js';
+import { HttpError } from '../../lib/errors.js';
 import { panelRouter, wrap, created } from './index.js';
-import { createPanelEmailService, LOCAL_PART, SPECIAL_DESTINATIONS, DEFAULT_ACTIONS } from '../../services/panel-email.js';
+import { createPanelEmailService, LOCAL_PART, SPECIAL_DESTINATIONS, DEFAULT_ACTIONS, FILTER_HEADERS, FILTER_OPS, FILTER_ACTION_TYPES, FILTER_MAX_MATCH, FILTER_MAX_ACTIONS, FILTER_NAME, FILTER_VALUE, FILTER_HEADER_NAME, FILTER_FOLDER, FILTER_ADDRESS, FOLDER_NAME, EXPUNGE_MIN_DAYS, EXPUNGE_MAX_DAYS, MESSAGE_STATUSES } from '../../services/panel-email.js';
 
 // A forwarding target that can never be read by Exim as a pipe, a file, an
 // :include: or an expansion: plain address characters only, lower-cased.
@@ -55,13 +56,45 @@ const spamPatch = patchOf(spamBody).strict().refine((b) => Object.keys(b).length
 const fixBody = z.object({ items: z.array(z.enum(['spf', 'dkim', 'dmarc'])).min(1).max(3) }).strict();
 const dkimBody = z.object({ rotate: z.boolean().default(false) }).strict();
 const webmailQuery = z.object({ user: z.string().max(254).regex(/^[^\s@]+@[^\s@]+$/, 'Email address').optional() });
+const webmailSsoBody = z.object({ mailbox: z.string().max(254).regex(/^[a-z0-9][a-z0-9._-]{0,63}@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i, 'Must be one of your mailbox addresses').transform((s) => s.toLowerCase()) }).strict();
 const usageQuery = z.object({ sinceHours: z.coerce.number().int().min(1).max(168).default(24) });
+const usageMessagesQuery = usageQuery.extend({
+  q: z.string().trim().max(200).optional(),
+  status: z.enum(MESSAGE_STATUSES).optional(),
+  page: z.coerce.number().int().min(1).max(10_000).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(25),
+});
+const folderParam = z.object({ id: fields.id, folder: z.string().regex(FOLDER_NAME, 'Folder: no control characters, quotes, backslashes, wildcards or leading, trailing or doubled dots; max 200 chars') });
+const emptyFolderBody = z.object({ olderThanDays: z.number().int().min(EXPUNGE_MIN_DAYS).max(EXPUNGE_MAX_DAYS).optional() }).strict();
+
+// Mail filters: structured rules only (the service renders Sieve); values
+// are single lines, every string lands in a Sieve quoted string.
+const filterValue = z.string().min(1).max(998).regex(FILTER_VALUE, 'Must be a single line without control characters');
+const filterMatch = z.object({
+  header: z.enum(FILTER_HEADERS),
+  name: z.string().regex(FILTER_HEADER_NAME, 'Header name: letters, digits and "-"; max 64 chars').optional(),
+  op: z.enum(FILTER_OPS),
+  value: filterValue,
+}).strict();
+const filterAction = z.object({
+  type: z.enum(FILTER_ACTION_TYPES),
+  folder: z.string().max(200).regex(FILTER_FOLDER, 'Folder: no control characters, quotes, slashes or leading, trailing or doubled dots').optional(),
+  address: z.string().max(254).regex(FILTER_ADDRESS, 'Must be an email address').transform((s) => s.toLowerCase()).optional(),
+}).strict();
+const filterRules = z.object({ matchAll: z.boolean().default(true), match: z.array(filterMatch).min(1).max(FILTER_MAX_MATCH), actions: z.array(filterAction).min(1).max(FILTER_MAX_ACTIONS) }).strict();
+const filterName = z.string().trim().min(1).max(80).regex(FILTER_NAME, 'Must be a single line');
+const filterBody = z.object({ name: filterName, rules: filterRules, enabled: z.boolean().default(true) }).strict();
+const filterPatch = patchOf(filterBody).strict().refine((b) => Object.keys(b).length > 0, 'Nothing to update');
+const filterTestBody = z.object({ name: filterName.optional(), rules: filterRules }).strict();
+const filterReorderBody = z.object({ ids: z.array(fields.id).min(1).max(1000) }).strict();
+const filterMailboxQuery = z.object({ mailbox: fields.id });
 
 const createdWithMeta = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(201).json(d?.meta ? d : { data: d })).catch(next);
 
 export async function register(ctx) {
   ctx.panelEmail = createPanelEmailService(ctx);
   const s = ctx.panelEmail;
+  s.registerSso();
 
   // Seam S4 (ctx.web.applyVirtualMail) is a root-level Exim/Dovecot rewrite
   // that only ever runs as a panel job: queued here once per boot (the worker
@@ -126,8 +159,37 @@ export async function register(ctx) {
   r.post('/dkim/:domain', validate({ params: domainParam, body: dkimBody }), wrap((req) => s.dkim.ensure(req.panel, req.params.domain, req.body, req)));
   r.delete('/dkim/:domain', validate({ params: domainParam }), wrap((req) => s.dkim.remove(req.panel, req.params.domain, req)));
 
+  // Mail filters (Sieve): per mailbox (?mailbox=<id>) and account-wide.
+  ctx.capabilities.register('sieve', { binaries: ['sievec'], required: ['sievec'] });
+  const mailboxId = (req) => req.query.mailbox;
+  r.get('/filters', validate({ query: filterMailboxQuery }), wrap((req) => s.filters.list(req.panel, mailboxId(req))));
+  r.post('/filters', validate({ query: filterMailboxQuery, body: filterBody }), createdWithMeta((req) => s.filters.create(req.panel, mailboxId(req), req.body, req)));
+  r.post('/filters/test', validate({ query: filterMailboxQuery, body: filterTestBody }), wrap((req) => s.filters.test(req.panel, mailboxId(req), req.body, req)));
+  r.post('/filters/reorder', validate({ query: filterMailboxQuery, body: filterReorderBody }), wrap((req) => s.filters.reorder(req.panel, mailboxId(req), req.body, req)));
+  r.put('/filters/:id', validate({ params: idParam, body: filterPatch }), wrap((req) => s.filters.update(req.panel, req.params.id, req.body, req, 'mailbox')));
+  r.delete('/filters/:id', validate({ params: idParam }), wrap((req) => s.filters.remove(req.panel, req.params.id, req, 'mailbox')));
+  r.get('/global-filters', wrap((req) => s.filters.list(req.panel, null)));
+  r.post('/global-filters', validate({ body: filterBody }), createdWithMeta((req) => s.filters.create(req.panel, null, req.body, req)));
+  r.post('/global-filters/test', validate({ body: filterTestBody }), wrap((req) => s.filters.test(req.panel, null, req.body, req)));
+  r.post('/global-filters/reorder', validate({ body: filterReorderBody }), wrap((req) => s.filters.reorder(req.panel, null, req.body, req)));
+  r.put('/global-filters/:id', validate({ params: idParam, body: filterPatch }), wrap((req) => s.filters.update(req.panel, req.params.id, req.body, req, 'account')));
+  r.delete('/global-filters/:id', validate({ params: idParam }), wrap((req) => s.filters.remove(req.panel, req.params.id, req, 'account')));
+
+  // Per-domain mail routing (P1-4): 'remote' is refused (409) while mailboxes exist.
+  r.get('/routing', wrap((req) => s.routing.list(req.panel)));
+  r.get('/domains/:domain/routing', validate({ params: domainParam }), wrap((req) => s.routing.get(req.panel, req.params.domain)));
+  r.put('/domains/:domain/routing', validate({ params: domainParam, body: z.object({ routing: z.enum(['auto', 'local', 'remote']) }).strict() }), wrap((req) => s.routing.set(req.panel, req.params.domain, req.body, req)));
+
   r.get('/webmail', validate({ query: webmailQuery }), wrap((req) => s.webmail(req.panel, req.query)));
+  // Single sign-on is a browser hand-off (§44): never minted for an API token.
+  const sessionOnly = (req, _res, next) => (req.auth?.via === 'token' ? next(new HttpError(403, 'session_required', 'Webmail sign-on is only available from a browser session')) : next());
+  r.post('/webmail/sso', sessionOnly, validate({ body: webmailSsoBody }), wrap((req) => s.webmailSso(req.panel, req.body, req)));
   r.get('/usage', validate({ query: usageQuery }), wrap((req) => s.usage(req.panel, req.query)));
+  // Delivery tracking + mailbox folders (P1-12). `/usage/messages` is
+  // registered before any `/usage/:x` pattern could shadow it.
+  r.get('/usage/messages', validate({ query: usageMessagesQuery }), wrap((req) => s.usageMessages(req.panel, req.query)));
+  r.get('/accounts/:id/folders', validate({ params: idParam }), wrap((req) => s.folders.list(req.panel, req.params.id)));
+  r.post('/accounts/:id/folders/:folder/empty', validate({ params: folderParam, body: emptyFolderBody }), wrap((req) => s.folders.empty(req.panel, req.params.id, req.params.folder, req.body, req)));
 
   return { path: '/email', router: r };
 }

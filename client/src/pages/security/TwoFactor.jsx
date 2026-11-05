@@ -8,6 +8,7 @@ import { Modal } from '../../components/Modal.jsx';
 import { useApi } from '../../hooks/useApi.js';
 import { useToast } from '../../components/Toast.jsx';
 import { useConfirm } from '../../components/Modal.jsx';
+import { QrCode } from '../../components/QrCode.jsx';
 
 export default function TwoFactor({ fn }) {
   const toast = useToast();
@@ -56,7 +57,10 @@ export default function TwoFactor({ fn }) {
         {user.totpEnabled && <FormActions><Button variant="danger" onClick={disable}>Disable</Button></FormActions>}
         {enrollment && (
           <form onSubmit={confirmCode} className="form-narrow" style={{ marginTop: 14 }}>
-            <p>Add this key to your authenticator app (Google Authenticator, Authy, 1Password and similar), then enter the current 6-digit code to finish.</p>
+            <p>Scan this code with your authenticator app (Google Authenticator, Authy, 1Password and similar), or add the key by hand, then enter the current 6-digit code to finish.</p>
+            <div style={{ display: 'flex', justifyContent: 'center', margin: '8px 0 14px' }}>
+              <QrCode value={enrollment.otpauthUrl} label={`Enrolment code for ${user.username}`} fallback={<p className="muted">The setup link is too long for a QR code; add the secret key by hand.</p>} />
+            </div>
             <KeyValue items={[['Secret key', <code key="k">{enrollment.secret}</code>], ['Account', user.username]]} />
             <p className="muted" style={{ marginTop: 8 }}>Or paste this URI into an app that supports it: <code className="small">{enrollment.otpauthUrl}</code></p>
             <ErrorBanner error={error} />

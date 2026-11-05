@@ -625,7 +625,9 @@ mixed case and symbols) and **per-context overrides** (`security.password.streng
 
 Scan the server for security weaknesses. **Who:** root.
 **Scan now / Scan again** runs read-only probes (SSH, firewall, cPHulk, ModSecurity,
-services, panel integrity via `MANIFEST.sha256`, …) and groups findings by grade with
+services, panel integrity via `MANIFEST.sha256`, the account panel's own two-factor policy as
+`panel.2fa.policy` — "Account panel users: two-factor required/optional (N linked users without
+an authenticator)", …) and groups findings by grade with
 remediation links; the summary shows counts and the last scan time and trigger.
 **Server:** `POST /api/security/advisor/scan`, last result from `GET /api/security/advisor`.
 **Gotchas:** scans never change anything.
@@ -873,6 +875,34 @@ the DATA ACL fragment. **Save and apply to Exim**. **Server:** `PUT /api/service
 renders the managed files, validates (`exim -bV`), reloads. **Needs:** Exim. **Gotchas:** the
 page warns when Exim does not include the panel's RCPT ACL chain — rejection rules are then not
 in force until the include exists (the Email category's filters rely on the same chain).
+
+The **Outbound and IPv6** tab holds two host-level settings:
+
+- **Outbound relay (smarthost).** Clouds such as EC2 block outbound port 25, so mail to the
+  internet stays queued unless it leaves through a relay. Toggle *Relay outbound mail through a
+  smarthost*, enter the relay host and port (587 for nearly every provider), keep *Require TLS*
+  on and, when the relay wants SMTP AUTH, the login and password (stored encrypted, never shown
+  again; leave the password empty on a later save to keep it). Saving writes the `whm_smarthost`
+  router (`manualroute` to `host::port`, every domain that is neither local nor a backup-MX relay
+  domain, loaded **before** `dnslookup`) and validates/reloads Exim. On Debian the router uses
+  the distribution's own `remote_smtp_smarthost` transport and `passwd.client` client
+  authenticators: the Keel main block sets `REMOTE_SMTP_SMARTHOST_HOSTS_REQUIRE_TLS = *` and the
+  credential goes into a managed block of `/etc/exim4/passwd.client` (0640 root:Debian-exim); that
+  file is `host:login:password`, so neither the login nor the password may contain `:` (the form
+  and the agent refuse it). A
+  split-config host gets `conf.d/router/150_whm_smarthost`; an **unsplit** host needs the one-time
+  line `.include_if_exists /etc/exim4/whm/router_whm_smarthost.conf` directly after `begin routers`
+  in `exim4.conf.template` (the card prints it; the panel never edits that file), then
+  `update-exim4.conf` and a reload. RHEL-style layouts get their own transport, authenticators and
+  `/etc/exim/whm/smarthost.passwd` with the matching include lines. The card shows whether Exim
+  loads the router and whether it sits before `dnslookup`; the *Security Advisor* reports
+  `mail.outbound.port25` (info) when no relay is set and a connection to a well-known mail
+  exchanger on port 25 fails from this host.
+- **IPv6.** *Automatic* renders `disable_ipv6 = true` only when the host has no global IPv6
+  address (Exim would otherwise try the AAAA addresses of every mail exchanger first and log a
+  failure per message); *Off* forces it, *On* never renders it. A `disable_ipv6` line an operator
+  added by hand outside the Keel block of `exim4.conf.localmacros` is dropped when the block sets
+  it, because Exim refuses a main option "set for the second time".
 
 #### 7.6 FTP Server Selection
 
