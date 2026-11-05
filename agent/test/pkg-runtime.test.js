@@ -4,11 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { exec, hasBinary } from '../src/exec.js';
-import { runOp, createContext, OpError, DEFAULT_ALLOWED_ROOTS, catalog } from '../src/lib.js';
+import { runOp, createContext, OpError, DEFAULT_ALLOWED_ROOTS, catalog, PHP_MINORS, PHP_UNIT_PATHS, PHP_LINK_PATHS } from '../src/lib.js';
 import {
-  parseOsRelease, pickNodeTarball, verifySha256, probePpaSeries, phpDiscovery, phpPackageGlob,
-  APT_SOURCES_DIR, APT_KEYRINGS_DIR, YUM_REPOS_DIR, NODE_DIR, LOCAL_BIN_DIR,
+  parseOsRelease, pickNodeTarball, verifySha256, probePpaSeries, phpDiscovery, phpPackageGlob, discoverPhp, parsePhpRelease, renderPhpUnit, phpMinor, PHP_SOURCE_MINORS,
+  APT_SOURCES_DIR, APT_KEYRINGS_DIR, YUM_REPOS_DIR, NODE_DIR, LOCAL_BIN_DIR, KEEL_PHP_DIR, KEEL_PHP_RUN_DIR, SYSTEMD_UNIT_DIR,
 } from '../src/ops/pkg.js';
+import { phpLayout } from '../src/ops/web.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
@@ -25,6 +26,9 @@ const dirs = {
   WHM_YUM_REPOS_DIR: path.join(base, 'yum.repos.d'),
   WHM_NODE_DIR: path.join(base, 'node'),
   WHM_LOCAL_BIN_DIR: path.join(base, 'bin'),
+  WHM_KEEL_PHP_DIR: path.join(base, 'php'),
+  WHM_SYSTEMD_UNIT_DIR: path.join(base, 'systemd'),
+  WHM_PKG_RUN_DIR: path.join(base, 'pkg-runs'),
 };
 const osRelease = path.join(base, 'os-release');
 const previousEnv = {};
@@ -172,6 +176,18 @@ describe('pkg.repo.ensure', () => {
     expect(php.detail).toContain('ondrej-ubuntu-php-noble.sources');
     expect(await runOp('pkg.repo.ensure', { repo: 'python' }, ctx)).toMatchObject({ repo: 'python', action: 'present' });
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('enables CRB on Enterprise Linux through dnf config-manager only when repolist lacks it, and refuses it on Debian', async () => {
+    setOs(OS.rocky);
+    const calls = [];
+    exec.mockImplementation(async (bin, argv) => { calls.push([bin, ...argv]); if (argv[1] === 'repolist') return ok('repo id  repo name\nappstream  Rocky Linux 9 - AppStream\nbaseos  Rocky Linux 9 - BaseOS\n'); return ok(); });
+    expect(await runOp('pkg.repo.ensure', { repo: 'crb' }, ctx)).toMatchObject({ repo: 'crb', family: 'rhel', action: 'added' });
+    expect(calls).toEqual([['dnf', '-q', 'repolist', '--enabled'], ['dnf', '-y', '-q', 'config-manager', '--set-enabled', 'crb']]);
+    exec.mockImplementation(async (bin, argv) => (argv[1] === 'repolist' ? ok('crb  Rocky Linux 9 - CRB\n') : (() => { throw new Error('unexpected'); })()));
+    expect(await runOp('pkg.repo.ensure', { repo: 'crb' }, ctx)).toMatchObject({ action: 'present' });
+    setOs(OS.ubuntu);
+    expect(await runOp('pkg.repo.ensure', { repo: 'crb' }, ctx)).toMatchObject({ action: 'unsupported' });
   });
 
   it('does not count a file that merely names another PPA', async () => {
@@ -404,6 +420,15 @@ describe('pkg.runtime.detect', () => {
     if (r.go) expect(r.go).toBe('1.22.1');
     if (r.composer) expect(r.composer).toBe('2.7.1');
   });
+
+  it('reports a Keel source build with its layout, source flag and prefix', async () => {
+    setOs(OS.ubuntu);
+    const prefix = fakeKeelTree('8.4');
+    exec.mockImplementation(async (bin) => (bin === path.join(prefix, 'bin', 'php') ? ok('8.4.27') : ok('')));
+    const r = await runOp('pkg.runtime.detect', {}, ctx);
+    expect(r.php.find((p) => p.id === '8.4')).toEqual({ id: '8.4', version: '8.4.27', layout: 'keel', source: true, prefix });
+    for (const p of r.php.filter((x) => x.layout !== 'keel')) expect(p.source).toBe(false);
+  });
 });
 
 // --- PHP Version Manager: PPA series probe, pkg.repo.status, pkg.php.remove ---
@@ -566,5 +591,403 @@ describe('pkg.php.remove', () => {
     expect(phpPackageGlob({ id: 'php83', layout: 'remi' })).toBe('php83-php-*');
     expect(phpPackageGlob({ id: '8.3', layout: 'debian' })).toBe('php8.3-*');
     expect(phpPackageGlob({ id: 'system', layout: 'unknown' })).toBeNull();
+  });
+});
+
+// --- PHP from source: pkg.php.build / pkg.php.build.finish / keel removal ----
+
+const RELEASE = (version = '8.4.27', extra = {}) => JSON.stringify({ version, source: [{ filename: `php-${version}.tar.gz`, sha256: SHA_A }, { filename: `php-${version}.tar.xz`, sha256: extra.sha256 ?? SHA_A }], supported_versions: ['8.4'] });
+const SRC_TARBALL = Buffer.from('fake-php-source-tarball');
+const SRC_SHA = crypto.createHash('sha256').update(SRC_TARBALL).digest('hex');
+const keelPrefix = (minor) => path.join(dirs.WHM_KEEL_PHP_DIR, minor);
+const fakeKeelTree = (minor) => {
+  const prefix = keelPrefix(minor);
+  for (const d of ['bin', 'sbin', 'lib/conf.d', 'etc/php-fpm.d', 'var/log']) fs.mkdirSync(path.join(prefix, d), { recursive: true });
+  fs.writeFileSync(path.join(prefix, 'bin', 'php'), '#!php\n');
+  fs.writeFileSync(path.join(prefix, 'sbin', 'php-fpm'), '#!php-fpm\n');
+  fs.writeFileSync(path.join(prefix, 'lib', 'php.ini'), 'memory_limit = 128M\n');
+  fs.writeFileSync(path.join(prefix, 'etc', 'php-fpm.conf'), '[global]\n');
+  fs.writeFileSync(path.join(prefix, '.keel-build-ok'), '');
+  return prefix;
+};
+const buildScript = fs.readFileSync(new URL('../src/ops/php-build.sh', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+const KEEL_ENV = ['KEEL_PHP_SRC', 'KEEL_PHP_PREFIX', 'KEEL_PHP_MINOR', 'KEEL_PHP_JOBS', 'KEEL_FPM_USER', 'KEEL_FPM_GROUP'];
+
+// curl answers the release index and the tarball, tar "extracts" the source tree, bash is the build script.
+const buildMock = ({ release = RELEASE('8.4.27', { sha256: SRC_SHA }), tarball = SRC_TARBALL, extract = true, bash = ok('built'), seen = {} } = {}) => async (bin, argv, opts) => {
+  if (bin === 'curl') {
+    const url = argv[argv.length - 1];
+    expect(url.startsWith('https://www.php.net/')).toBe(true);
+    expect(argv.slice(0, 5)).toEqual(['-fsSL', '--proto', '=https', '--proto-redir', '=https']);
+    if (url.includes('releases/index.php')) { expect(url).toBe('https://www.php.net/releases/index.php?json&version=8.4'); expect(argv).toEqual(['-fsSL', '--proto', '=https', '--proto-redir', '=https', '--max-time', '60', url]); return ok(release); }
+    expect(url).toBe('https://www.php.net/distributions/php-8.4.27.tar.xz');
+    expect(argv.slice(5, 7)).toEqual(['--max-time', '900']);
+    const out = argv[argv.indexOf('-o') + 1];
+    expect(path.basename(path.dirname(out))).toMatch(/^\.build-/);
+    expect(path.dirname(path.dirname(out))).toBe(dirs.WHM_KEEL_PHP_DIR);
+    seen.buildDir = path.dirname(out);
+    fs.writeFileSync(out, tarball);
+    return ok();
+  }
+  if (bin === 'tar') {
+    expect(argv).toEqual(['--no-same-owner', '--no-same-permissions', '-xJf', argv[3], '-C', seen.buildDir]);
+    expect(argv[3]).toBe(path.join(seen.buildDir, 'php-8.4.27.tar.xz'));
+    if (extract) { fs.mkdirSync(path.join(seen.buildDir, 'php-8.4.27'), { recursive: true }); fs.writeFileSync(path.join(seen.buildDir, 'php-8.4.27', 'configure'), '#!/bin/sh\n'); }
+    return ok();
+  }
+  if (bin === 'bash') { seen.bash = { argv, opts }; return bash; }
+  throw new Error(`unexpected ${bin} ${argv.join(' ')}`);
+};
+
+describe('pkg.php.build / pkg.php.build.finish schemas and registration', () => {
+  it('take a two-part PHP minor and nothing else; nothing runs on a rejected schema', async () => {
+    for (const bad of [...INJECTION, '8.4.1', '8.4; rm', '7.3', '8.7', '10.0', '8', '8.', '.4', ' 8.4', '8.4\n', 'latest', 84, null]) {
+      expect((await opError(runOp('pkg.php.build', { minor: bad }, ctx))).code, String(bad)).toBe('invalid_args');
+      expect((await opError(runOp('pkg.php.build.finish', { minor: bad }, ctx))).code, String(bad)).toBe('invalid_args');
+      expect(phpMinor.safeParse(bad).success, String(bad)).toBe(false);
+    }
+    for (const good of ['7.4', '8.0', '8.4', '8.5', '9.0']) expect(phpMinor.safeParse(good).success, good).toBe(true);
+    for (const m of PHP_MINORS) expect(phpMinor.safeParse(m).success, m).toBe(true);
+    expect((await opError(runOp('pkg.php.build', {}, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.php.build', { minor: '8.4', prefix: '/tmp/x' }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.php.build', { minor: '8.4', wait: 'no' }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.php.build.finish', { minor: '8.4', wait: false }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+    expect(fs.readdirSync(dirs.WHM_KEEL_PHP_DIR)).toEqual([]);
+  });
+
+  it('registers both ops, the build with a 90 minute budget, neither destructive', () => {
+    expect(catalog.get('pkg.php.build').timeoutMs).toBe(90 * 60_000);
+    expect(catalog.get('pkg.php.build').destructive).toBe(false);
+    expect(catalog.get('pkg.php.build.finish').destructive).toBe(false);
+  });
+
+  it('allows the prefix tree, the socket dir and only the per-minor unit files and php<minor> links', () => {
+    expect(PHP_MINORS).toEqual(['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5', '8.6', '9.0', '9.1']);
+    for (const p of [KEEL_PHP_DIR, KEEL_PHP_RUN_DIR, ...PHP_UNIT_PATHS, ...PHP_LINK_PATHS]) expect(DEFAULT_ALLOWED_ROOTS, p).toContain(p);
+    expect(PHP_UNIT_PATHS).toContain(`${SYSTEMD_UNIT_DIR}/keel-php8.4-fpm.service`);
+    expect(PHP_LINK_PATHS).toContain(`${LOCAL_BIN_DIR}/php8.4`);
+    expect(DEFAULT_ALLOWED_ROOTS).not.toContain(SYSTEMD_UNIT_DIR);
+    expect(DEFAULT_ALLOWED_ROOTS).not.toContain(LOCAL_BIN_DIR);
+    expect(() => defaultCtx.assertAllowedPath('/etc/systemd/system/ssh.service')).toThrow(OpError);
+    expect(() => defaultCtx.assertAllowedPath('/usr/local/bin/php')).toThrow(OpError);
+    expect(() => defaultCtx.assertAllowedPath('/usr/local/bin/php8.4.1')).toThrow(OpError);
+    expect(defaultCtx.assertAllowedPath('/etc/systemd/system/keel-php8.4-fpm.service', 'write')).toBe('/etc/systemd/system/keel-php8.4-fpm.service');
+    expect(defaultCtx.assertAllowedPath('/opt/keel/php/8.4/etc/php-fpm.d/whm-alice.conf', 'write')).toBeTruthy();
+  });
+});
+
+describe('parsePhpRelease', () => {
+  it('picks the tar.xz entry with its SHA-256 and refuses a release without one', () => {
+    expect(parsePhpRelease(RELEASE('8.4.27', { sha256: SRC_SHA.toUpperCase() }), '8.4')).toEqual({ version: '8.4.27', filename: 'php-8.4.27.tar.xz', sha256: SRC_SHA });
+    expect(() => parsePhpRelease(JSON.stringify({ version: '8.4.27', source: [{ filename: 'php-8.4.27.tar.xz' }] }), '8.4')).toThrow(/SHA-256/);
+    expect(() => parsePhpRelease(JSON.stringify({ version: '8.4.27', source: [{ filename: 'php-8.4.27.tar.xz', sha256: 'abc' }] }), '8.4')).toThrow(/SHA-256/);
+    expect(() => parsePhpRelease(JSON.stringify({ version: '8.4.27', source: [{ filename: 'php-8.4.27.tar.gz', sha256: SHA_A }] }), '8.4')).toThrow(/tar\.xz/);
+  });
+
+  it('answers not_found for an unknown minor and invalid_release for anything that is not that minor', () => {
+    for (const text of ['[]', '{}', '{"version":""}']) { let err; try { parsePhpRelease(text, '8.4'); } catch (e) { err = e; } expect(err?.code, text).toBe('not_found'); }
+    for (const text of ['not json', RELEASE('8.3.1'), RELEASE('8.4'), RELEASE('8.4.27-rc1'), RELEASE('../8.4.27'), JSON.stringify({ version: '8.4.27', source: 'x' })]) { let err; try { parsePhpRelease(text, '8.4'); } catch (e) { err = e; } expect(err?.code, text).toBe('invalid_release'); }
+  });
+});
+
+describe('renderPhpUnit', () => {
+  it('contains only constants and the validated minor', () => {
+    const unit = renderPhpUnit('8.4');
+    expect(unit).toBe([
+      '[Unit]', 'Description=Keel PHP 8.4 FPM', 'After=network.target', '',
+      '[Service]', 'Type=simple', 'ExecStartPre=+/usr/bin/mkdir -p /run/keel-php',
+      'ExecStart=/opt/keel/php/8.4/sbin/php-fpm --nodaemonize --fpm-config /opt/keel/php/8.4/etc/php-fpm.conf',
+      'ExecReload=/bin/kill -USR2 $MAINPID', 'PrivateTmp=true', '',
+      '[Install]', 'WantedBy=multi-user.target', '',
+    ].join('\n'));
+    for (const bad of ['8.4; rm', '../8.4', '8.4\nExecStart=/bin/sh']) expect(() => renderPhpUnit(bad)).toThrow(OpError);
+  });
+});
+
+describe('pkg.php.build', () => {
+  it('downloads the verified php.net source and runs only the shipped script with the KEEL_* environment', async () => {
+    const seen = {};
+    exec.mockImplementation(buildMock({ seen }));
+    const r = await runOp('pkg.php.build', { minor: '8.4' }, ctx);
+    expect(exec.mock.calls.map((c) => c[0])).toEqual(['curl', 'curl', 'tar', 'bash']);
+    expect(r).toMatchObject({ minor: '8.4', version: '8.4.27', release: { version: '8.4.27', filename: 'php-8.4.27.tar.xz', sha256: SRC_SHA }, prefix: keelPrefix('8.4'), buildDir: seen.buildDir, background: false, code: 0 });
+    expect(r.output.some((l) => /Checksum verified/.test(l))).toBe(true);
+    expect(seen.bash.argv).toEqual([path.join(seen.buildDir, 'php-build.sh')]);
+    expect(fs.readFileSync(seen.bash.argv[0], 'utf8')).toBe(buildScript);
+    expect(buildScript).toMatch(/^set -euo pipefail$/m);
+    expect(buildScript).not.toMatch(/xmlrpc/);
+    if (linux) expect(fs.statSync(seen.bash.argv[0]).mode & 0o777).toBe(0o700);
+    expect(seen.bash.opts.env).toMatchObject({ KEEL_PHP_SRC: path.join(seen.buildDir, 'php-8.4.27'), KEEL_PHP_PREFIX: keelPrefix('8.4'), KEEL_PHP_MINOR: '8.4', KEEL_FPM_GROUP: seen.bash.opts.env.KEEL_FPM_USER });
+    expect(seen.bash.opts.env.KEEL_PHP_JOBS).toMatch(/^[1-9]\d*$/);
+    expect(seen.bash.opts.env.PATH).toBeTruthy();
+    expect(seen.bash.opts.timeoutMs).toBe(90 * 60_000);
+    // The script reads every parameter from the environment: nothing but constants and quoted $KEEL_* references.
+    for (const v of KEEL_ENV) expect(buildScript).toContain('"$' + v + '"');
+    expect(fs.existsSync(path.join(seen.buildDir, 'php-8.4.27.tar.xz'))).toBe(false);
+    expect(fs.existsSync(keelPrefix('8.4'))).toBe(false);
+    if (linux) expect(fs.statSync(seen.buildDir).mode & 0o777).toBe(0o700);
+    expect(fs.existsSync(seen.buildDir)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(path.join(seen.buildDir, 'keel-build.json'), 'utf8'))).toMatchObject({ minor: '8.4', version: '8.4.27', done: true });
+    expect(fs.existsSync(path.join(dirs.WHM_KEEL_PHP_DIR, '.build-8.4.lock'))).toBe(false);
+  });
+
+  it('refuses the minors whose last php.net release no longer compiles, before any network call', async () => {
+    expect(PHP_SOURCE_MINORS).toEqual(['8.1', '8.2', '8.3', '8.4', '8.5']);
+    for (const minor of ['7.4', '8.0']) expect((await opError(runOp('pkg.php.build', { minor }, ctx))).code, minor).toBe('unsupported');
+    expect(exec).not.toHaveBeenCalled();
+    expect(fs.readdirSync(dirs.WHM_KEEL_PHP_DIR)).toEqual([]);
+  });
+
+  it('refuses a tarball whose checksum differs, removes the build dir and installs nothing', async () => {
+    const seen = {};
+    exec.mockImplementation(buildMock({ seen, tarball: Buffer.from('tampered') }));
+    expect((await opError(runOp('pkg.php.build', { minor: '8.4' }, ctx))).code).toBe('checksum_mismatch');
+    expect(exec.mock.calls.map((c) => c[0])).toEqual(['curl', 'curl']);
+    expect(fs.readdirSync(dirs.WHM_KEEL_PHP_DIR)).toEqual([]);
+    expect(fs.readdirSync(dirs.WHM_LOCAL_BIN_DIR)).toEqual([]);
+    expect(fs.readdirSync(dirs.WHM_SYSTEMD_UNIT_DIR)).toEqual([]);
+  });
+
+  it('reports an unknown minor, a bad release and a failed build without leaving a build dir', async () => {
+    exec.mockImplementation(buildMock({ release: '[]' }));
+    expect((await opError(runOp('pkg.php.build', { minor: '8.4' }, ctx))).code).toBe('not_found');
+    exec.mockImplementation(buildMock({ release: JSON.stringify({ version: '8.4.27', source: [{ filename: 'php-8.4.27.tar.xz' }] }) }));
+    expect((await opError(runOp('pkg.php.build', { minor: '8.4' }, ctx))).code).toBe('invalid_release');
+    exec.mockImplementation(buildMock({ extract: false }));
+    expect((await opError(runOp('pkg.php.build', { minor: '8.4' }, ctx))).code).toBe('extract_failed');
+    exec.mockImplementation(buildMock({ bash: ok('configure: error: no libxml', 1) }));
+    const err = await opError(runOp('pkg.php.build', { minor: '8.4' }, ctx));
+    expect(err.code).toBe('build_failed');
+    expect(err.message).toMatch(/libxml/);
+    expect(fs.readdirSync(dirs.WHM_KEEL_PHP_DIR)).toEqual([]);
+    expect(exec.mock.calls.filter((c) => c[0] === 'curl').every((c) => c[1][c[1].length - 1].startsWith('https://'))).toBe(true);
+  });
+
+  it.skipIf(!linux)('records the run id in the marker and lets a failed background build be retried at once', async () => {
+    const seen = {};
+    exec.mockImplementation(buildMock({ seen }));
+    const r = await runOp('pkg.php.build', { minor: '8.4', wait: false }, ctx);
+    expect(r.background).toBe(true);
+    expect(exec.mock.calls.map((c) => c[0])).toEqual(['curl', 'curl', 'tar']);
+    const marker = JSON.parse(fs.readFileSync(path.join(r.buildDir, 'keel-build.json'), 'utf8'));
+    expect(marker).toMatchObject({ minor: '8.4', version: '8.4.27', runId: r.run.id });
+    // The detached script (a fake bash here) exits non-zero: the run is finished, so the marker is stale.
+    for (let i = 0; i < 100 && JSON.parse(fs.readFileSync(path.join(dirs.WHM_PKG_RUN_DIR, `${r.run.id}.json`), 'utf8')).status === 'running'; i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(JSON.parse(fs.readFileSync(path.join(dirs.WHM_PKG_RUN_DIR, `${r.run.id}.json`), 'utf8')).status).not.toBe('running');
+    expect((await opError(runOp('pkg.php.build.finish', { minor: '8.4' }, ctx))).code).toBe('build_failed');
+    exec.mockClear();
+    exec.mockImplementation(buildMock({ seen }));
+    const again = await runOp('pkg.php.build', { minor: '8.4' }, ctx);
+    expect(fs.existsSync(r.buildDir)).toBe(false);
+    expect(again.buildDir).not.toBe(r.buildDir);
+  });
+
+  it('keeps in_use while the marker names a run that is still alive, without a run id only within the budget', async () => {
+    fs.mkdirSync(dirs.WHM_PKG_RUN_DIR, { recursive: true });
+    const live = path.join(dirs.WHM_KEEL_PHP_DIR, '.build-live');
+    fs.mkdirSync(live);
+    fs.writeFileSync(path.join(live, 'keel-build.json'), JSON.stringify({ minor: '8.4', startedAt: new Date(Date.now() - 5 * 3600_000).toISOString(), runId: 'run-live' }));
+    fs.writeFileSync(path.join(dirs.WHM_PKG_RUN_DIR, 'run-live.json'), JSON.stringify({ id: 'run-live', bin: process.execPath, pid: process.pid, status: 'running', startedAt: new Date().toISOString(), timeoutMs: 90 * 60_000 }));
+    if (linux) {
+      expect((await opError(runOp('pkg.php.build', { minor: '8.4' }, ctx))).code).toBe('in_use');
+      expect((await opError(runOp('pkg.php.build.finish', { minor: '8.4' }, ctx))).code).toBe('build_failed');
+      expect(fs.existsSync(live)).toBe(true);
+      expect(exec).not.toHaveBeenCalled();
+    }
+    // The run finished: the marker is stale however young it is.
+    fs.writeFileSync(path.join(dirs.WHM_PKG_RUN_DIR, 'run-live.json'), JSON.stringify({ id: 'run-live', bin: process.execPath, pid: process.pid, status: 'finished', code: 2, startedAt: new Date().toISOString(), timeoutMs: 90 * 60_000 }));
+    fs.writeFileSync(path.join(live, 'keel-build.json'), JSON.stringify({ minor: '8.4', startedAt: new Date().toISOString(), runId: 'run-live' }));
+    exec.mockImplementation(buildMock({}));
+    await runOp('pkg.php.build', { minor: '8.4' }, ctx);
+    expect(fs.existsSync(live)).toBe(false);
+  });
+
+  it('takes a per-minor lock before the first network call and sweeps one left by a dead agent', async () => {
+    const lock = path.join(dirs.WHM_KEEL_PHP_DIR, '.build-8.4.lock');
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    expect((await opError(runOp('pkg.php.build', { minor: '8.4' }, ctx))).code).toBe('in_use');
+    expect(exec).not.toHaveBeenCalled();
+    expect(fs.existsSync(lock)).toBe(true);
+    fs.writeFileSync(lock, JSON.stringify({ pid: 2 ** 22 - 7, startedAt: new Date().toISOString() }));
+    exec.mockImplementation(buildMock({}));
+    await runOp('pkg.php.build', { minor: '8.4' }, ctx);
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  it('refuses a second build of the same minor while one is running and sweeps a stale build dir', async () => {
+    const stale = path.join(dirs.WHM_KEEL_PHP_DIR, '.build-stale');
+    fs.mkdirSync(stale, { recursive: true });
+    fs.writeFileSync(path.join(stale, 'keel-build.json'), JSON.stringify({ minor: '8.4', startedAt: new Date(Date.now() - 3 * 3600_000).toISOString() }));
+    const running = path.join(dirs.WHM_KEEL_PHP_DIR, '.build-running');
+    fs.mkdirSync(running, { recursive: true });
+    fs.writeFileSync(path.join(running, 'keel-build.json'), JSON.stringify({ minor: '8.3', startedAt: new Date().toISOString() }));
+    expect((await opError(runOp('pkg.php.build', { minor: '8.3' }, ctx))).code).toBe('in_use');
+    expect(exec).not.toHaveBeenCalled();
+    exec.mockImplementation(buildMock({}));
+    await runOp('pkg.php.build', { minor: '8.4' }, ctx);
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(running)).toBe(true);
+  });
+
+  it('refuses a prefix override outside the allowed roots before anything runs', async () => {
+    const prev = process.env.WHM_KEEL_PHP_DIR;
+    process.env.WHM_KEEL_PHP_DIR = '/usr/share/keel-php';
+    try {
+      expect((await opError(runOp('pkg.php.build', { minor: '8.4' }, ctx))).code).toBe('path_not_allowed');
+      expect((await opError(runOp('pkg.php.build.finish', { minor: '8.4' }, ctx))).code).toBe('path_not_allowed');
+    } finally { process.env.WHM_KEEL_PHP_DIR = prev; }
+    expect(fs.existsSync('/usr/share/keel-php')).toBe(false);
+    expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('pkg.php.build.finish', () => {
+  const systemctl = (calls) => async (bin, argv) => {
+    if (bin === 'systemctl') { calls.push(argv); return argv[0] === 'is-active' ? ok('active\n') : ok(); }
+    if (bin.endsWith(path.join('bin', 'php'))) return ok('8.4.27');
+    throw new Error(`unexpected ${bin} ${argv.join(' ')}`);
+  };
+
+  it('refuses when the prefix holds no complete build', async () => {
+    expect((await opError(runOp('pkg.php.build.finish', { minor: '8.4' }, ctx))).code).toBe('build_failed');
+    fs.mkdirSync(path.join(keelPrefix('8.4'), 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(keelPrefix('8.4'), 'bin', 'php'), '');
+    expect((await opError(runOp('pkg.php.build.finish', { minor: '8.4' }, ctx))).code).toBe('build_failed');
+    // Every file but the script's final .keel-build-ok: make install died half-way.
+    fakeKeelTree('8.4');
+    fs.unlinkSync(path.join(keelPrefix('8.4'), '.keel-build-ok'));
+    expect((await opError(runOp('pkg.php.build.finish', { minor: '8.4' }, ctx))).code).toBe('build_failed');
+    expect(discoverPhp().versions.some((v) => v.layout === 'keel')).toBe(false);
+    expect(phpLayout().versions.some((v) => v.flavor === 'keel')).toBe(false);
+    expect(exec).not.toHaveBeenCalled();
+    expect(fs.readdirSync(dirs.WHM_SYSTEMD_UNIT_DIR)).toEqual([]);
+  });
+
+  it.skipIf(!linux)('writes the unit, enables it, links php<minor>, drops the build dir and is idempotent', async () => {
+    const prefix = fakeKeelTree('8.4');
+    const build = path.join(dirs.WHM_KEEL_PHP_DIR, '.build-abc');
+    fs.mkdirSync(build);
+    fs.writeFileSync(path.join(build, 'keel-build.json'), JSON.stringify({ minor: '8.4', version: '8.4.27', startedAt: new Date().toISOString(), done: true }));
+    const other = path.join(dirs.WHM_KEEL_PHP_DIR, '.build-other');
+    fs.mkdirSync(other);
+    fs.writeFileSync(path.join(other, 'keel-build.json'), JSON.stringify({ minor: '8.3', startedAt: new Date().toISOString() }));
+    hasBinary.mockImplementation((name) => name === 'systemctl');
+    const calls = [];
+    exec.mockImplementation(systemctl(calls));
+    const r = await runOp('pkg.php.build.finish', { minor: '8.4' }, ctx);
+    const unitFile = path.join(dirs.WHM_SYSTEMD_UNIT_DIR, 'keel-php8.4-fpm.service');
+    const link = path.join(dirs.WHM_LOCAL_BIN_DIR, 'php8.4');
+    expect(r).toEqual({ minor: '8.4', version: '8.4.27', prefix, binary: path.join(prefix, 'bin', 'php'), unit: 'keel-php8.4-fpm', unitFile, active: true, link, buildDirsRemoved: [build] });
+    expect(fs.readFileSync(unitFile, 'utf8')).toBe(renderPhpUnit('8.4'));
+    expect(fs.statSync(unitFile).mode & 0o777).toBe(0o644);
+    expect(fs.readlinkSync(link)).toBe(path.join(prefix, 'bin', 'php'));
+    expect(calls).toEqual([['daemon-reload'], ['enable', '--now', 'keel-php8.4-fpm.service'], ['is-active', 'keel-php8.4-fpm.service']]);
+    expect(fs.existsSync(build)).toBe(false);
+    expect(fs.existsSync(other)).toBe(true);
+    const again = await runOp('pkg.php.build.finish', { minor: '8.4' }, ctx);
+    expect(again).toMatchObject({ link, active: true, buildDirsRemoved: [] });
+  });
+
+  it.skipIf(!linux)('leaves a foreign php<minor> alone and reports a unit that failed to start', async () => {
+    fakeKeelTree('8.4');
+    const link = path.join(dirs.WHM_LOCAL_BIN_DIR, 'php8.4');
+    fs.writeFileSync(link, '#!/bin/sh\n');
+    hasBinary.mockImplementation((name) => name === 'systemctl');
+    exec.mockImplementation(async (bin, argv) => {
+      if (bin === 'systemctl' && argv[0] === 'enable') return { stdout: '', stderr: 'Job for keel-php8.4-fpm.service failed', code: 1 };
+      if (bin === 'systemctl' && argv[0] === 'is-active') return { stdout: 'failed\n', stderr: '', code: 3 };
+      if (bin === 'systemctl') return ok();
+      return ok('8.4.27');
+    });
+    const r = await runOp('pkg.php.build.finish', { minor: '8.4' }, ctx);
+    expect(r).toMatchObject({ active: false, unitError: expect.stringMatching(/failed/), link: null, linkConflict: expect.stringMatching(/not a symbolic link/) });
+    expect(fs.readFileSync(link, 'utf8')).toBe('#!/bin/sh\n');
+  });
+});
+
+describe('discoverPhp / phpLayout see a Keel build', () => {
+  it('lists /opt/keel/php/<minor> with the keel layout, after any distro tree of the same minor', () => {
+    fakeKeelTree('9.1');
+    fs.mkdirSync(path.join(dirs.WHM_KEEL_PHP_DIR, '8.3'), { recursive: true });
+    fs.mkdirSync(path.join(dirs.WHM_KEEL_PHP_DIR, '.build-x'), { recursive: true });
+    fs.mkdirSync(path.join(dirs.WHM_KEEL_PHP_DIR, 'latest', 'bin'), { recursive: true });
+    const prefix = keelPrefix('9.1');
+    const v = discoverPhp().versions.find((x) => x.layout === 'keel');
+    expect(v).toEqual({
+      id: '9.1', binary: path.join(prefix, 'bin', 'php'), layout: 'keel', label: 'PHP 9.1 (Keel build)', iniPath: path.join(prefix, 'lib', 'php.ini'), iniPaths: { php: path.join(prefix, 'lib', 'php.ini') },
+      poolDir: path.join(prefix, 'etc', 'php-fpm.d'), fpmUnit: 'keel-php9.1-fpm', packagePrefix: null, source: true, prefix,
+    });
+    expect(discoverPhp().versions.filter((x) => x.layout === 'keel')).toHaveLength(1);
+    const ids = discoverPhp().versions.map((x) => x.id);
+    expect(ids.indexOf('9.1')).toBe(ids.length - 1);
+    const tree = phpLayout().versions.find((x) => x.flavor === 'keel');
+    expect(tree).toEqual({ version: '9.1', flavor: 'keel', poolDir: `${dirs.WHM_KEEL_PHP_DIR}/9.1/etc/php-fpm.d`, bin: `${dirs.WHM_KEEL_PHP_DIR}/9.1/sbin/php-fpm`, fpmConfig: `${dirs.WHM_KEEL_PHP_DIR}/9.1/etc/php-fpm.conf`, units: ['keel-php9.1-fpm'], socketDir: '/run/keel-php', listenOwner: fs.existsSync('/etc/apache2') ? 'www-data' : 'apache' });
+    expect(phpLayout().versions.filter((x) => x.flavor === 'keel')).toHaveLength(1);
+    expect(phpLayout().versions.filter((x) => x.version === '9.1')).toHaveLength(1);
+  });
+});
+
+describe('pkg.php.remove for a Keel build', () => {
+  const KEEL_SET = () => ({
+    versions: [
+      { id: '8.5', binary: '/usr/bin/php8.5', layout: 'debian', label: 'PHP 8.5', packagePrefix: 'php8.5-' },
+      { id: '8.4', binary: path.join(keelPrefix('8.4'), 'bin', 'php'), layout: 'keel', label: 'PHP 8.4 (Keel build)', packagePrefix: null, source: true, prefix: keelPrefix('8.4') },
+    ],
+    defaultId: '8.5', defaultBinary: '/usr/bin/php8.5',
+  });
+
+  it.skipIf(!linux)('stops and removes the unit, the php<minor> link and the prefix without touching a package manager or /etc/php', async () => {
+    const prefix = fakeKeelTree('8.4');
+    const unitFile = path.join(dirs.WHM_SYSTEMD_UNIT_DIR, 'keel-php8.4-fpm.service');
+    fs.mkdirSync(dirs.WHM_SYSTEMD_UNIT_DIR, { recursive: true });
+    fs.writeFileSync(unitFile, renderPhpUnit('8.4'));
+    const link = path.join(dirs.WHM_LOCAL_BIN_DIR, 'php8.4');
+    fs.symlinkSync(path.join(prefix, 'bin', 'php'), link);
+    const foreign = path.join(dirs.WHM_LOCAL_BIN_DIR, 'php8.3');
+    fs.symlinkSync('/usr/bin/php8.3', foreign);
+    const build = path.join(dirs.WHM_KEEL_PHP_DIR, '.build-left');
+    fs.mkdirSync(build);
+    fs.writeFileSync(path.join(build, 'keel-build.json'), JSON.stringify({ minor: '8.4', startedAt: new Date().toISOString(), runId: 'run-gone' }));
+    fs.writeFileSync(path.join(dirs.WHM_KEEL_PHP_DIR, '.build-8.4.lock'), '{}');
+    phpDiscovery.discover = KEEL_SET;
+    hasBinary.mockImplementation((name) => name === 'systemctl' || name === 'apt-get');
+    const calls = [];
+    exec.mockImplementation(async (bin, argv) => { if (bin !== 'systemctl') throw new Error(`unexpected ${bin}`); calls.push(argv); return ok(); });
+    const r = await runOp('pkg.php.remove', { version: '8.4' }, ctx);
+    expect(r).toMatchObject({ version: '8.4', layout: 'keel', manager: null, packages: [], prefix, removed: true, unit: 'keel-php8.4-fpm', unitRemoved: true, link, linkRemoved: true, buildDirsRemoved: [build], background: false, code: 0 });
+    expect(calls).toEqual([['disable', '--now', 'keel-php8.4-fpm.service'], ['daemon-reload']]);
+    expect(fs.existsSync(prefix)).toBe(false);
+    expect(fs.existsSync(unitFile)).toBe(false);
+    expect(() => fs.lstatSync(link)).toThrow();
+    expect(fs.readlinkSync(foreign)).toBe('/usr/bin/php8.3');
+    expect(fs.existsSync(build)).toBe(false);
+    expect(fs.readdirSync(dirs.WHM_KEEL_PHP_DIR)).toEqual([]);
+  });
+
+  it.skipIf(!linux)('keeps a php<minor> that points elsewhere and refuses a prefix that is a symbolic link', async () => {
+    const link = path.join(dirs.WHM_LOCAL_BIN_DIR, 'php8.4');
+    fs.symlinkSync('/usr/bin/php8.4', link);
+    const elsewhere = path.join(base, 'elsewhere');
+    fs.mkdirSync(elsewhere, { recursive: true });
+    fs.symlinkSync(elsewhere, keelPrefix('8.4'));
+    phpDiscovery.discover = KEEL_SET;
+    hasBinary.mockImplementation(() => false);
+    expect((await opError(runOp('pkg.php.remove', { version: '8.4' }, ctx))).code).toBe('refused');
+    expect(fs.existsSync(elsewhere)).toBe(true);
+    expect(fs.readlinkSync(link)).toBe('/usr/bin/php8.4');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('still refuses the CLI default and the only version, and refuses a prefix override outside the allowed roots', async () => {
+    phpDiscovery.discover = () => ({ ...KEEL_SET(), defaultId: '8.4' });
+    expect((await opError(runOp('pkg.php.remove', { version: '8.4' }, ctx))).code).toBe('refused');
+    phpDiscovery.discover = () => ({ versions: KEEL_SET().versions.slice(1), defaultId: null, defaultBinary: null });
+    expect((await opError(runOp('pkg.php.remove', { version: '8.4' }, ctx))).code).toBe('refused');
+    phpDiscovery.discover = KEEL_SET;
+    const prev = process.env.WHM_KEEL_PHP_DIR;
+    process.env.WHM_KEEL_PHP_DIR = '/usr/share/keel-php';
+    try { expect((await opError(runOp('pkg.php.remove', { version: '8.4' }, ctx))).code).toBe('path_not_allowed'); } finally { process.env.WHM_KEEL_PHP_DIR = prev; }
+    expect(exec).not.toHaveBeenCalled();
   });
 });

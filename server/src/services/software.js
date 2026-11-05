@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, badRequest, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot, ownsRow } from '../middleware/rbac.js';
-import { RUNTIMES, TOOLS, RUNTIME_KEYS, resolveInstall, packagesFor, runtimeNote, detectedVersion } from './software-runtimes.js';
+import { RUNTIMES, TOOLS, RUNTIME_KEYS, PHP_SOURCE_PREFIX, PHP_SOURCE_MINORS, resolveInstall, packagesFor, runtimeNote, detectedVersion } from './software-runtimes.js';
 
 // Software. Attached as ctx.software; other categories may call:
 //   software.pkg.detect()                                   -> { manager: 'apt'|'dnf'|'yum'|null, family, rpm, capability }
@@ -107,6 +107,7 @@ export function proxyFingerprint(settings, domains) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MAX_RUN_LOG_LINES = 2000;
+const RUN_FAIL_TAIL_LINES = 40;
 
 export function createSoftwareService(ctx) {
   const { db, agent, capabilities, settings, logger } = ctx;
@@ -178,6 +179,10 @@ export function createSoftwareService(ctx) {
       delay = Math.min(Math.round(delay * 1.5), runs.maxPollMs);
     }
     if (status.status === 'finished' && status.code === 0) return { ...started, output, run: status };
+    if (output.length > MAX_RUN_LOG_LINES) {
+      job.log(`${label}: last ${RUN_FAIL_TAIL_LINES} lines of the output`, 'warn');
+      for (const line of output.slice(-RUN_FAIL_TAIL_LINES)) job.log(line);
+    }
     const reason = status.status === 'finished' ? `exited with status ${status.code}` : status.status === 'lost' ? status.error : status.status === 'timeout' ? status.error : status.error || status.status;
     const err = new Error(`${label} ${reason}${status.status === 'finished' ? `: ${output.filter((l) => /^E:|error|fail/i.test(l)).pop() || output[output.length - 1] || 'see the log'}` : ''}`);
     err.run = status;
@@ -248,12 +253,40 @@ export function createSoftwareService(ctx) {
 
   // --- one-click runtimes and tools (contract §51) ----------------------------
   const RUNTIME_JOB_TYPES = ['software.runtime.install', 'software.runtime.remove'];
+  // One pkg.repo.status per distinct repo of the runtimes that fall back to a
+  // source build; a failed probe (offline) is null, state 'unknown'.
+  async function probeRepos(repos) {
+    const status = {};
+    for (const repo of new Set(repos.filter(Boolean))) {
+      try { const r = await op('pkg.repo.status', { repo }); status[repo] = { present: Boolean(r.present), supported: r.supported === true ? true : r.supported === false ? false : null, detail: r.detail ?? null }; } catch (err) { logger.warn({ err, repo }, 'pkg.repo.status failed'); status[repo] = null; }
+    }
+    return status;
+  }
+  const osLabel = (os) => (os?.id ? `${os.id}${os.versionId ? ` ${os.versionId}` : ''}${os.codename ? ` (${os.codename})` : ''}` : 'this OS');
+  const repoLabel = (repo, fam, os) => (repo === 'php' ? (fam === 'rhel' ? 'Remi' : os?.id === 'ubuntu' ? 'ppa:ondrej/php' : 'packages.sury.org') : repo);
+  // State of a catalog version that is not installed: packages when the repo
+  // serves them, the php.net source build when it does not (or the probe could
+  // not say), unsupported only without any package manager.
+  function availability(entry, repo, rs, fam, os, version) {
+    if (!fam) return { state: 'unsupported', method: null, note: 'No supported package manager (apt-get, dnf or yum) was found on this server' };
+    if (repo === null || rs?.present || rs?.supported === true) return { state: 'available', method: 'package', note: null };
+    if (entry.source) {
+      const why = `packages from ${repoLabel(repo, fam, os)} are not available for ${osLabel(os)}`;
+      if (!PHP_SOURCE_MINORS.includes(version)) return { state: 'unsupported', method: null, note: `php.net's last ${version} release does not compile against this OS's libxml2/ICU, and ${why}${rs?.detail ? ` (${rs.detail})` : ''}` };
+      return { state: 'available', method: 'source', note: `Built from the official php.net source into ${PHP_SOURCE_PREFIX}/${version} (about 15 minutes); ${why}${rs?.detail ? ` (${rs.detail})` : ''}` };
+    }
+    if (rs?.supported === false) return { state: 'unsupported', method: null, note: rs.detail ?? null };
+    return { state: 'unknown', method: 'package', note: rs?.detail ?? null };
+  }
+
   const runtimes = {
-    async catalog() {
+    async catalog({ repoStatus = null } = {}) {
       const d = await pkg.detect();
       const fam = d.family ?? null;
       let detected = {};
       try { detected = await op('pkg.runtime.detect'); } catch (err) { logger.warn({ err }, 'runtime detection failed'); }
+      const sourceRepos = RUNTIME_KEYS.filter((key) => RUNTIMES[key].source).map((key) => RUNTIMES[key].repo);
+      const repos = repoStatus ?? (fam ? await probeRepos(sourceRepos) : {});
       const toolEntries = TOOLS.map((t) => ({ key: t.key, label: t.label, packages: (fam ? packagesFor(t, fam) : null) ?? [] }));
       let installedSet = null;
       if (fam && capabilities.has('pkg')) {
@@ -269,22 +302,36 @@ export function createSoftwareService(ctx) {
           const state = detectedVersion(key, v, detected);
           const packages = entry.installer ? [] : (fam ? packagesFor(entry, fam, v) : null) ?? [];
           const repo = entry.repo === 'epel' ? (fam === 'rhel' ? 'epel' : null) : entry.repo ?? null;
-          return { id: v ?? key, label: v ? `${entry.label} ${v}` : entry.label, installed: state.installed, version: state.version, packages, repo, note, ...(key === 'nodejs' && v ? { path: state.path ?? `/opt/keel/node/${v}`, bin: `/usr/local/bin/node${v}` } : {}) };
+          const row = { id: v ?? key, label: v ? `${entry.label} ${v}` : entry.label, installed: state.installed, version: state.version, packages, repo, note, ...(key === 'nodejs' && v ? { path: state.path ?? `/opt/keel/node/${v}`, bin: `/usr/local/bin/node${v}` } : {}) };
+          if (!entry.source) return row;
+          const rs = repo ? repos[repo] ?? null : null;
+          const avail = state.installed ? { state: 'installed', method: state.source ? 'source' : 'package', note } : availability(entry, repo, rs, d.capability ? fam : null, detected.os, v);
+          return { ...row, ...avail, note: avail.note ?? note, source: Boolean(state.source), repoStatus: rs, ...(avail.method === 'source' || state.source ? { prefix: `${PHP_SOURCE_PREFIX}/${v}` } : {}) };
         });
-        return { key, label: entry.label, single: Boolean(entry.single), installer: entry.installer ?? null, versions };
+        return { key, label: entry.label, single: Boolean(entry.single), installer: entry.installer ?? null, source: Boolean(entry.source), versions };
       });
       const tools = toolEntries.map((t) => ({ ...t, installed: installedSet && t.packages.length ? t.packages.every((p) => installedSet.has(p)) : null }));
       return { family: fam, os: detected.os ?? null, manager: d.manager ?? null, capability: Boolean(d.capability), runtimes: runtimeList, tools };
     },
-    async install({ runtime, version, tool }, user, req) {
+    async install({ runtime, version, tool, method }, user, req) {
       // Node.js builds need no package manager; everything else answers 501 before the catalog check.
       if (RUNTIMES[runtime]?.installer !== 'node') requirePkg();
       const fam = capabilities.has('pkg') ? await family().catch(() => null) : null;
-      const plan = resolveInstall({ runtime, version, tool }, fam);
-      const job = enqueue('software.runtime.install', { kind: plan.kind, key: plan.key, version: plan.version, family: fam }, user);
+      const entry = runtime ? RUNTIMES[runtime] : null;
+      if (method && !entry?.source) throw unprocessable('Only PHP versions have an install method; everything else installs from packages', { method: ['Leave it out'] });
+      if (entry?.source && fam) {
+        // Catalog check first (422 on a bad version), then the repo decides the default method.
+        resolveInstall({ runtime, version }, fam);
+        const rs = (await probeRepos([entry.repo]))[entry.repo];
+        const packagesAvailable = Boolean(rs?.present || rs?.supported === true);
+        if (!method) method = packagesAvailable ? 'package' : 'source';
+        else if (method === 'package' && rs?.supported === false) throw unprocessable(`${entry.label} ${version} packages are not available on this OS: ${rs.detail || 'the repository has no series for it'}${PHP_SOURCE_MINORS.includes(version) ? '; install it as a source build instead' : ''}`, { method: PHP_SOURCE_MINORS.includes(version) ? ['source'] : ['No install method is available for this version on this OS'] });
+      }
+      const plan = resolveInstall({ runtime, version, tool }, fam, { method });
+      const job = enqueue('software.runtime.install', { kind: plan.kind, key: plan.key, version: plan.version, family: fam, ...(plan.installer === 'php-source' ? { method: 'source' } : {}) }, user);
       const target = plan.version ? `${plan.key}:${plan.version}` : plan.key;
-      req?.audit?.({ action: 'software.runtime.install', target, args: { kind: plan.kind, key: plan.key, version: plan.version, packages: plan.packages, jobId: job.id } });
-      return { job, target, packages: plan.packages };
+      req?.audit?.({ action: 'software.runtime.install', target, args: { kind: plan.kind, key: plan.key, version: plan.version, method: plan.installer === 'php-source' ? 'source' : plan.installer === 'node' ? 'node' : 'package', packages: plan.packages, jobId: job.id } });
+      return { job, target, packages: plan.packages, method: plan.installer === 'php-source' ? 'source' : 'package', ...(plan.prefix ? { prefix: plan.prefix } : {}) };
     },
     remove({ runtime, version }, user, req) {
       if (runtime !== 'nodejs') throw unprocessable('Only Node.js builds are removed here; PHP versions are removed in the PHP Version Manager and Python packages from the Installed tab', { runtime: ['nodejs'] });
@@ -295,11 +342,11 @@ export function createSoftwareService(ctx) {
     },
     recent(limit = 20) { return ctx.jobs.list({ limit: 200 }).filter((j) => RUNTIME_JOB_TYPES.includes(j.type)).slice(0, limit); },
     async installJob(job) {
-      const { kind, key, version } = job.params;
+      const { kind, key, version, method } = job.params;
       const fam = job.params.family ?? (capabilities.has('pkg') ? await job.agent.op('pkg.detect').then((d) => d.family).catch(() => null) : null);
-      const plan = resolveInstall(kind === 'tool' ? { tool: key } : { runtime: key, version }, fam);
+      const plan = resolveInstall(kind === 'tool' ? { tool: key } : { runtime: key, version }, fam, { method });
       const label = plan.version ? `${plan.label} ${plan.version}` : plan.label;
-      job.log(`${label}: ${plan.installer === 'node' ? `official Node.js ${plan.major}.x build` : JSON.stringify(plan.packages)}${fam ? ` (${fam})` : ''}`);
+      job.log(`${label}: ${plan.installer === 'node' ? `official Node.js ${plan.major}.x build` : plan.installer === 'php-source' ? `php.net source build into ${plan.prefix}` : JSON.stringify(plan.packages)}${fam ? ` (${fam})` : ''}`);
       let added = false;
       for (const [i, repo] of plan.repos.entries()) {
         job.progress(5 + i * 5, `checking the ${repo} repository`);
@@ -316,12 +363,26 @@ export function createSoftwareService(ctx) {
       if (plan.key === 'php' && capabilities.has('php')) {
         try { cliDefaultBefore = (await job.agent.op('pkg.php.versions')).defaultId ?? null; } catch (err) { job.log(`could not read the current PHP CLI default: ${err.message}`, 'warn'); }
       }
-      job.progress(30, `installing ${label}`);
-      let nodeResult = null;
-      if (plan.installer === 'node') nodeResult = await runLongOp(job, 'pkg.node.install', { major: plan.major }, `${label} install`);
-      else await runLongOp(job, 'pkg.install', { packages: plan.packages }, `${label} install`);
+      let nodeResult = null; let build = null;
+      if (plan.installer === 'php-source') {
+        job.progress(5, 'installing build dependencies');
+        job.log(`build dependencies (${fam}): ${JSON.stringify(plan.deps)}`);
+        await runLongOp(job, 'pkg.install', { packages: plan.deps }, 'build dependencies');
+        job.progress(15, `downloading and building PHP ${plan.minor}`);
+        await runLongOp(job, 'pkg.php.build', { minor: plan.minor }, `PHP ${plan.minor} build`);
+        job.progress(90, 'registering the PHP-FPM unit');
+        build = await job.agent.op('pkg.php.build.finish', { minor: plan.minor });
+        const unit = build.unit ?? `keel-php${plan.minor}-fpm`;
+        if (build.linkConflict) job.log(`${build.link ?? `/usr/local/bin/php${plan.minor}`} was left alone: ${build.linkConflict}`, 'warn');
+        if (build.unitError || build.active === false) throw new Error(`PHP ${build.version ?? plan.minor} built but ${unit} did not start: ${build.unitError ?? 'unit inactive'}; see journalctl -u ${unit}`);
+        job.log(`PHP ${build.version ?? plan.minor} installed under ${build.prefix ?? plan.prefix}; unit ${unit} ${build.active ? 'active' : 'not checked'}; CLI ${build.link ?? `/usr/local/bin/php${plan.minor}`}`);
+      } else {
+        job.progress(30, `installing ${label}`);
+        if (plan.installer === 'node') nodeResult = await runLongOp(job, 'pkg.node.install', { major: plan.major }, `${label} install`);
+        else await runLongOp(job, 'pkg.install', { packages: plan.packages }, `${label} install`);
+      }
       if (cliDefaultBefore) {
-        job.progress(85, 'checking the PHP CLI default');
+        job.progress(92, 'checking the PHP CLI default');
         try {
           const after = (await job.agent.op('pkg.php.versions')).defaultId ?? null;
           if (after && after !== cliDefaultBefore) {
@@ -330,18 +391,19 @@ export function createSoftwareService(ctx) {
           }
         } catch (err) { job.log(`PHP CLI default check failed: ${err.message}`, 'warn'); }
       }
-      job.progress(90, 're-detecting capabilities');
+      job.progress(94, 're-detecting capabilities');
       await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after runtime install failed'); job.log(`capability re-detection failed: ${err.message}`, 'warn'); });
       let detected = null;
       if (plan.kind === 'runtime') {
-        job.progress(95, 'verifying');
+        job.progress(96, 'verifying');
         const state = detectedVersion(plan.key, plan.version ?? plan.key, await job.agent.op('pkg.runtime.detect'));
         if (!state.installed) throw new Error(`${label} is still not detected after the install; see the log above`);
-        detected = state.version ?? nodeResult?.version ?? null;
+        detected = state.version ?? nodeResult?.version ?? build?.version ?? null;
         job.log(`${label} detected: ${detected ?? 'present'}`);
       }
       job.progress(100, 'done');
-      return { kind: plan.kind, [plan.kind === 'tool' ? 'tool' : 'runtime']: plan.key, version: plan.version, packages: plan.packages, installed: true, detected, ...(nodeResult ? { path: nodeResult.path, bin: nodeResult.bin, symlinks: nodeResult.symlinks } : {}) };
+      const how = plan.installer === 'php-source' ? 'source' : plan.installer === 'node' ? 'node' : 'package';
+      return { kind: plan.kind, [plan.kind === 'tool' ? 'tool' : 'runtime']: plan.key, version: plan.version, packages: plan.packages, installed: true, detected, method: how,...(nodeResult ? { path: nodeResult.path, bin: nodeResult.bin, symlinks: nodeResult.symlinks } : {}), ...(build ? { prefix: build.prefix ?? plan.prefix, unit: build.unit ?? null, link: build.link ?? null, release: build.version ?? null, binary: build.binary ?? null, deps: plan.deps } : {}) };
     },
     async removeJob(job) {
       const major = Number(job.params.version);
@@ -800,30 +862,23 @@ export function createSoftwareService(ctx) {
       const offered = php.offeredVersions();
       const usage = php.usage();
       const dependants = (id) => php.dependants(id);
-      const repoStatus = {};
-      for (const repo of new Set(phpRuntime.versions.map((v) => v.repo).filter(Boolean))) {
-        try { const r = await op('pkg.repo.status', { repo }); repoStatus[repo] = { present: Boolean(r.present), supported: r.supported === true ? true : r.supported === false ? false : null, detail: r.detail ?? null }; } catch (err) { logger.warn({ err, repo }, 'pkg.repo.status failed'); repoStatus[repo] = null; }
-      }
       const digits = (id) => String(id).replace(/[^0-9]/g, '');
       const findInstalled = (id) => installed.versions.find((x) => x.id === id || /php(\d+)$/.exec(String(x.id))?.[1] === digits(id) || String(x.version || '').startsWith(`${id}.`)) ?? null;
       const isOffered = (id, inst) => Boolean(inst) && (offered === null || offered.includes(id));
-      const shapeInstalled = (inst) => ({ installed: true, version: inst.version ?? null, binary: inst.binary ?? null, iniPath: inst.iniPath ?? null, fpmInstalled: inst.fpmInstalled ?? null, fpmActive: inst.fpmActive ?? null, fpmUnit: inst.fpmUnit ?? null, isDefault: Boolean(inst.isDefault), isSystemDefault: inst.id === installed.effectiveDefault, advisories: inst.advisories ?? [] });
+      const isSource = (inst) => Boolean(inst.source || inst.layout === 'keel');
+      const shapeInstalled = (inst) => ({ installed: true, version: inst.version ?? null, binary: inst.binary ?? null, iniPath: inst.iniPath ?? null, fpmInstalled: inst.fpmInstalled ?? null, fpmActive: inst.fpmActive ?? null, fpmUnit: inst.fpmUnit ?? null, isDefault: Boolean(inst.isDefault), isSystemDefault: inst.id === installed.effectiveDefault, advisories: inst.advisories ?? [], source: isSource(inst), layout: inst.layout ?? null, method: isSource(inst) ? 'source' : 'package', ...(isSource(inst) ? { prefix: `${PHP_SOURCE_PREFIX}/${inst.id}` } : {}) });
       const seen = new Set();
       const versions = phpRuntime.versions.map((v) => {
         const inst = findInstalled(v.id);
         if (inst) seen.add(inst.id);
         const id = inst ? inst.id : v.id;
-        const rs = v.repo ? repoStatus[v.repo] ?? null : null;
-        let state = 'installed'; let note = v.note ?? null;
-        if (!inst) {
-          if (v.repo === null || rs?.present || rs?.supported === true) state = 'available';
-          else if (rs?.supported === false) { state = 'unsupported'; note = rs.detail ?? note; }
-          else { state = 'unknown'; note = rs?.detail ?? note; }
-        }
+        const rs = v.repoStatus ?? null;
+        // pkg.php.versions decides "installed"; a missing version gets package / source / unsupported from the repo probe.
+        const avail = inst ? { state: 'installed', note: null } : availability(RUNTIMES.php, v.repo, rs, rc.capability ? rc.family : null, rc.os, v.id);
         return {
-          id, catalogVersion: v.id, label: inst ? inst.label ?? v.label : v.label, state,
-          ...(inst ? shapeInstalled(inst) : { installed: false, version: null, binary: null, iniPath: null, fpmInstalled: null, fpmActive: null, fpmUnit: null, isDefault: false, isSystemDefault: false, advisories: [] }),
-          offered: isOffered(id, inst), domains: usage[id] ?? 0, ...(inst ? dependants(id) : { webDefault: false, plans: 0, vhosts: 0 }), packages: v.packages ?? [], repo: v.repo ?? null, repoStatus: rs, note,
+          id, catalogVersion: v.id, label: inst ? inst.label ?? v.label : v.label, state: avail.state,
+          ...(inst ? shapeInstalled(inst) : { installed: false, version: null, binary: null, iniPath: null, fpmInstalled: null, fpmActive: null, fpmUnit: null, isDefault: false, isSystemDefault: false, advisories: [], source: false, layout: null, method: avail.method, ...(avail.method === 'source' ? { prefix: `${PHP_SOURCE_PREFIX}/${v.id}` } : {}) }),
+          offered: isOffered(id, inst), domains: usage[id] ?? 0, ...(inst ? dependants(id) : { webDefault: false, plans: 0, vhosts: 0 }), packages: avail.method === 'source' || (inst && isSource(inst)) ? [] : v.packages ?? [], repo: v.repo ?? null, repoStatus: rs, note: avail.note ?? runtimeNote('php', rc.family),
         };
       });
       for (const inst of installed.versions) {
@@ -876,7 +931,7 @@ export function createSoftwareService(ctx) {
       const offered = php.offeredVersions();
       if (offered?.includes(version)) settings.set('php.offered_versions', offered.filter((id) => id !== version));
       job.progress(100, 'done');
-      return { version, packages: result.packages ?? [], removed: true };
+      return { version, packages: result.packages ?? [], removed: true, ...(result.layout ? { layout: result.layout } : {}), ...(result.prefix ? { prefix: result.prefix } : {}) };
     },
   };
 

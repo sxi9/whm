@@ -1,10 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
+import { PHP_MINORS } from '../lib.js';
 
 // Software: distro packages (apt / dnf / yum), language module installers,
 // PHP versions + ini files, PHP-FPM pools and the NGINX reverse proxy. Every
@@ -178,6 +180,15 @@ export function setIniDirectives(content, changes) {
 const safeReaddir = (dir) => { try { return fs.readdirSync(dir); } catch { return []; } };
 const firstExisting = (paths) => paths.find((p) => fs.existsSync(p)) || null;
 
+// PHP builds from source (pkg.php.build) live under /opt/keel/php/<minor>; the
+// test override must stay under an allowed root exactly like WHM_NODE_DIR.
+export const KEEL_PHP_DIR = '/opt/keel/php';
+export const KEEL_PHP_RUN_DIR = '/run/keel-php';
+export const SYSTEMD_UNIT_DIR = '/etc/systemd/system';
+const keelPhpDir = () => process.env.WHM_KEEL_PHP_DIR || KEEL_PHP_DIR;
+const systemdUnitDir = () => process.env.WHM_SYSTEMD_UNIT_DIR || SYSTEMD_UNIT_DIR;
+const keelPhpUnit = (minor) => `keel-php${minor}-fpm`;
+
 // PHP installations this host may carry, by packaging layout.
 export function discoverPhp() {
   const found = new Map();
@@ -207,7 +218,18 @@ export function discoverPhp() {
   if (fs.existsSync('/etc/php.ini') && fs.existsSync('/usr/bin/php')) {
     add('system', '/usr/bin/php', 'rhel', { label: 'System PHP', iniPath: '/etc/php.ini', iniPaths: { php: '/etc/php.ini' }, poolDir: '/etc/php-fpm.d', fpmUnit: 'php-fpm', packagePrefix: 'php-' });
   }
-  if (found.size === 0 && fs.existsSync('/usr/bin/php')) {
+  const packaged = found.size;
+  for (const dir of safeReaddir(keelPhpDir())) {
+    if (!/^\d\.\d+$/.test(dir)) continue;
+    const prefix = path.join(keelPhpDir(), dir);
+    // php-build.sh writes .keel-build-ok as its last step; a prefix without it is a build that died in make install.
+    if (!fs.existsSync(path.join(prefix, '.keel-build-ok')) || !fs.existsSync(path.join(prefix, 'etc', 'php-fpm.conf'))) continue;
+    add(dir, path.join(prefix, 'bin', 'php'), 'keel', {
+      label: `PHP ${dir} (Keel build)`, iniPath: path.join(prefix, 'lib', 'php.ini'), iniPaths: { php: path.join(prefix, 'lib', 'php.ini') },
+      poolDir: path.join(prefix, 'etc', 'php-fpm.d'), fpmUnit: keelPhpUnit(dir), packagePrefix: null, source: true, prefix,
+    });
+  }
+  if (packaged === 0 && fs.existsSync('/usr/bin/php')) {
     add('system', '/usr/bin/php', 'unknown', { label: 'System PHP', iniPath: null, iniPaths: {}, poolDir: null, fpmUnit: 'php-fpm', packagePrefix: 'php-' });
   }
   let defaultBinary = null;
@@ -897,8 +919,39 @@ export function phpPackageGlob(v) {
 // Discovery reads /etc/php, /opt/cpanel, /opt/remi and /usr/bin, which no test host carries; tests swap `discover`.
 export const phpDiscovery = { discover: discoverPhp };
 
+// A Keel source build is one prefix, one unit and one link; /etc/php is never touched.
+async function removeKeelPhp(minor, ctx) {
+  if (!phpMinor.safeParse(minor).success) throw new OpError('invalid_args', `"${minor}" is not a PHP minor this panel builds`);
+  const root = keelPhpDir();
+  if (root !== KEEL_PHP_DIR) ctx.assertAllowedPath(root, 'write');
+  const prefix = path.join(root, minor);
+  const unit = keelPhpUnit(minor);
+  const unitFile = ctx.assertAllowedPath(path.join(systemdUnitDir(), `${unit}.service`), 'write');
+  const link = ctx.assertAllowedPath(path.join(localBinDir(), `php${minor}`), 'write');
+  ctx.assertAllowedPath(prefix, 'write');
+  let unitRemoved = false;
+  if (hasBinary('systemctl')) await exec('systemctl', ['disable', '--now', `${unit}.service`], { allowFailure: true, timeoutMs: 180_000 });
+  try { fs.unlinkSync(unitFile); unitRemoved = true; } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  if (unitRemoved && hasBinary('systemctl')) await exec('systemctl', ['daemon-reload'], { allowFailure: true, timeoutMs: 120_000 });
+  let linkRemoved = false;
+  try {
+    const st = fs.lstatSync(link);
+    if (st.isSymbolicLink() && fs.readlinkSync(link).startsWith(`${prefix}/`)) { fs.unlinkSync(link); linkRemoved = true; }
+  } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  let removed = false;
+  try {
+    const st = fs.lstatSync(prefix);
+    if (st.isSymbolicLink()) throw new OpError('refused', `${prefix} is a symbolic link; refusing to follow it`);
+    fs.rmSync(prefix, { recursive: true, force: true });
+    removed = true;
+  } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  const builds = removeBuildDirs(root, minor);
+  fs.rmSync(buildLockPath(root, minor), { force: true });
+  return { version: minor, layout: 'keel', manager: null, packages: [], purge: true, background: false, code: 0, output: [], prefix, removed, unit, unitRemoved, link, linkRemoved, buildDirsRemoved: builds };
+}
+
 defineOp('pkg.php.remove', {
-  description: 'Remove every package of one installed PHP version; refuses the CLI default and the last remaining version, keeps /etc/php/<ver> unless purge',
+  description: 'Remove every package of one installed PHP version (or the prefix, unit and link of a Keel source build); refuses the CLI default and the last remaining version, keeps /etc/php/<ver> unless purge',
   destructive: true,
   timeoutMs: LONG,
   schema: z.object({ version: phpVersionId, purge: z.boolean().default(false), wait }).strict(),
@@ -908,6 +961,7 @@ defineOp('pkg.php.remove', {
     if (!v) throw new OpError('not_found', `PHP version "${version}" is not installed on this server`);
     if (v.id === defaultId) throw new OpError('refused', `PHP ${version} is the CLI default (/usr/bin/php); make another version the default first`);
     if (versions.length < 2) throw new OpError('refused', `PHP ${version} is the only installed version; install another one before removing it`);
+    if (v.layout === 'keel') return removeKeelPhp(v.id, ctx);
     const glob = phpPackageGlob(v);
     if (!glob) throw new OpError('unsupported', `PHP ${version} (${v.binary}) is not a packaged build this panel can remove`);
     const pm = requireManager();
@@ -1452,6 +1506,19 @@ async function ensureEpel(ctx) {
   return { action: 'added', detail: 'epel-release installed' };
 }
 
+// CRB (PowerTools on EL8) carries the -devel packages a PHP source build needs.
+async function ensureCrb(os, ctx) {
+  ctx.assertAllowedPath(yumReposDir(), 'read');
+  const major = Number.parseInt(String(os.versionId || ''), 10);
+  const name = major === 8 ? 'powertools' : 'crb';
+  const enabled = await exec('dnf', ['-q', 'repolist', '--enabled'], { allowFailure: true, timeoutMs: 120_000, maxBuffer: BIG });
+  if (enabled.code === 0 && enabled.stdout.split('\n').some((l) => l.trim().toLowerCase().startsWith(name))) return { action: 'present', detail: `${name} is enabled` };
+  ctx.assertAllowedPath(yumReposDir(), 'write');
+  const r = await exec('dnf', ['-y', '-q', 'config-manager', '--set-enabled', name], { allowFailure: true, timeoutMs: LONG, maxBuffer: BIG });
+  if (r.code !== 0) return { action: 'unsupported', detail: `dnf config-manager could not enable ${name}: ${(r.stderr || r.stdout).trim().split('\n').pop() || `exit ${r.code}`}` };
+  return { action: 'added', detail: `${name} enabled` };
+}
+
 async function ensureRemi(os, ctx) {
   ctx.assertAllowedPath(yumReposDir(), 'read');
   if (await rpmInstalled('remi-release')) return { action: 'present', detail: 'remi-release is installed' };
@@ -1465,14 +1532,14 @@ async function ensureRemi(os, ctx) {
 const combine = (steps) => ({ action: steps.some((s) => s.action === 'unsupported') ? 'unsupported' : steps.some((s) => s.action === 'added') ? 'added' : 'present', detail: steps.map((s) => s.detail).filter(Boolean).join('; ') });
 
 defineOp('pkg.repo.ensure', {
-  description: 'Make sure one of the curated package repositories (php, python, epel, remi) is configured; idempotent, never refreshes the index',
+  description: 'Make sure one of the curated package repositories (php, python, epel, remi, crb) is configured; idempotent, never refreshes the index',
   timeoutMs: LONG,
-  schema: z.object({ repo: z.enum(['php', 'python', 'epel', 'remi']) }).strict(),
+  schema: z.object({ repo: z.enum(['php', 'python', 'epel', 'remi', 'crb']) }).strict(),
   run: async ({ repo }, ctx) => {
     const os = readOsRelease(ctx);
     const base = { repo, family: os.family };
     if (os.family === 'debian') {
-      if (repo === 'epel' || repo === 'remi') return { ...base, action: 'unsupported', detail: `${repo} is an Enterprise Linux repository; this host is ${os.id || 'Debian-family'}` };
+      if (repo === 'epel' || repo === 'remi' || repo === 'crb') return { ...base, action: 'unsupported', detail: `${repo} is an Enterprise Linux repository; this host is ${os.id || 'Debian-family'}` };
       if (os.id === 'ubuntu') return { ...base, ...(await ensurePpa(repo, ctx)) };
       if (os.id === 'debian') {
         if (repo === 'php') return { ...base, ...(await ensureSury(os.codename, ctx)) };
@@ -1482,6 +1549,7 @@ defineOp('pkg.repo.ensure', {
     }
     if (os.family === 'rhel') {
       if (repo === 'epel') return { ...base, ...(await ensureEpel(ctx)) };
+      if (repo === 'crb') return { ...base, ...(await ensureCrb(os, ctx)) };
       if (repo === 'remi') return { ...base, ...(await ensureRemi(os, ctx)) };
       if (repo === 'php') {
         const epel = await ensureEpel(ctx);
@@ -1697,6 +1765,224 @@ defineOp('pkg.node.remove', {
   },
 });
 
+// --- PHP from the official php.net source under /opt/keel/php/<minor> --------
+// The minor is the only caller-supplied value and it is pinned to a two-part
+// number; every path is built from it, the release metadata comes from php.net
+// over https only and the build runs one static script shipped in the repo
+// whose parameters travel in the environment, never on the command line.
+
+// PHP_MINORS also generates the exact unit/link paths the agent may write, so the schema and the allowed roots cannot drift apart.
+export const phpMinor = z.string().refine((m) => PHP_MINORS.includes(m), 'PHP minor such as 8.4');
+// php.net's last 7.4 / 8.0 releases predate libxml2 2.12 and ICU 75 and do not compile on current distributions.
+export const PHP_SOURCE_MINORS = ['8.1', '8.2', '8.3', '8.4', '8.5'];
+const PHP_RELEASES_URL = 'https://www.php.net/releases/index.php';
+const PHP_DIST_URL = 'https://www.php.net/distributions';
+const PHP_BUILD_TIMEOUT = 90 * 60_000;
+const CURL_PHP = ['-fsSL', '--proto', '=https', '--proto-redir', '=https', '--max-time', '900'];
+const BUILD_MARKER = 'keel-build.json';
+const BUILD_OK = '.keel-build-ok';
+const BUILD_SCRIPT = new URL('./php-build.sh', import.meta.url);
+const FPM_OWNERS = ['www-data', 'apache', 'nginx', 'nobody'];
+
+export function parsePhpRelease(text, minor) {
+  let data;
+  try { data = JSON.parse(String(text || '')); } catch { throw new OpError('invalid_release', 'php.net answered with something that is not JSON'); }
+  if (!data || typeof data !== 'object' || Array.isArray(data) || !data.version) throw new OpError('not_found', `php.net publishes no release for PHP ${minor}`);
+  const version = String(data.version);
+  if (!/^\d+\.\d+\.\d+$/.test(version) || !version.startsWith(`${minor}.`)) throw new OpError('invalid_release', `php.net reports version "${version}" for PHP ${minor}`);
+  const entry = (Array.isArray(data.source) ? data.source : []).find((s) => s && typeof s.filename === 'string' && s.filename === `php-${version}.tar.xz`);
+  if (!entry) throw new OpError('invalid_release', `php.net lists no php-${version}.tar.xz source archive`);
+  const sha256 = typeof entry.sha256 === 'string' ? entry.sha256.trim().toLowerCase() : '';
+  if (!/^[0-9a-f]{64}$/.test(sha256)) throw new OpError('invalid_release', `php.net lists no SHA-256 for ${entry.filename}`);
+  return { version, filename: entry.filename, sha256 };
+}
+
+export function renderPhpUnit(minor) {
+  if (!phpMinor.safeParse(minor).success) throw new OpError('invalid_args', `"${minor}" is not a PHP minor this panel builds`);
+  const prefix = `${KEEL_PHP_DIR}/${minor}`;
+  return [
+    '[Unit]',
+    `Description=Keel PHP ${minor} FPM`,
+    'After=network.target',
+    '',
+    '[Service]',
+    'Type=simple',
+    `ExecStartPre=+/usr/bin/mkdir -p ${KEEL_PHP_RUN_DIR}`,
+    `ExecStart=${prefix}/sbin/php-fpm --nodaemonize --fpm-config ${prefix}/etc/php-fpm.conf`,
+    'ExecReload=/bin/kill -USR2 $MAINPID',
+    'PrivateTmp=true',
+    '',
+    '[Install]',
+    'WantedBy=multi-user.target',
+    '',
+  ].join('\n');
+}
+
+function fpmOwner() {
+  const passwd = (() => { try { return fs.readFileSync('/etc/passwd', 'utf8'); } catch { return ''; } })();
+  const present = FPM_OWNERS.find((u) => passwd.split('\n').some((l) => l.startsWith(`${u}:`)));
+  return present || (fs.existsSync('/etc/apache2') ? 'www-data' : 'apache');
+}
+
+function readBuildMarker(dir) {
+  try { const m = JSON.parse(fs.readFileSync(path.join(dir, BUILD_MARKER), 'utf8')); return m && typeof m === 'object' ? m : null; } catch { return null; }
+}
+
+function buildDirsFor(root, minor) {
+  return safeReaddir(root).filter((n) => n.startsWith('.build-')).map((n) => path.join(root, n)).filter((d) => { try { return fs.lstatSync(d).isDirectory() && readBuildMarker(d)?.minor === minor; } catch { return false; } });
+}
+
+// A background build is alive while its run is still running; a sync build
+// (no run id) counts as alive until the 90-minute budget has passed, a finished
+// one is marked done by the op itself.
+function buildLive(marker) {
+  if (!marker || marker.done) return false;
+  if (marker.runId) {
+    const state = readRunState(marker.runId);
+    return Boolean(state) && state.status === 'running' && runAlive(state);
+  }
+  const started = Date.parse(marker.startedAt || '') || 0;
+  return Date.now() - started < PHP_BUILD_TIMEOUT;
+}
+
+function removeBuildDirs(root, minor) {
+  const dirs = buildDirsFor(root, minor);
+  for (const d of dirs) {
+    const marker = readBuildMarker(d);
+    if (buildLive(marker)) throw new OpError('in_use', `A build of PHP ${minor} started ${marker.startedAt} is still running (${d})`);
+  }
+  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+  return dirs;
+}
+
+const buildLockPath = (root, minor) => path.join(root, `.build-${minor}.lock`);
+
+// One build per minor: the lock is taken before the first network call so two
+// pkg.php.build calls cannot both pass the marker check. A lock left by an
+// agent that died is stale once no build of the minor is alive and its holder
+// process is gone (or the budget has passed).
+function takeBuildLock(root, minor) {
+  const lock = buildLockPath(root, minor);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(lock, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+      try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })); } finally { fs.closeSync(fd); }
+      return lock;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      let holder = null;
+      try { holder = JSON.parse(fs.readFileSync(lock, 'utf8')); } catch { /* unreadable: stale */ }
+      const started = Date.parse(holder?.startedAt || '') || 0;
+      const holderAlive = (() => { try { return Number.isInteger(holder?.pid) && holder.pid > 0 && (process.kill(holder.pid, 0), true); } catch { return false; } })();
+      if (buildDirsFor(root, minor).some((d) => buildLive(readBuildMarker(d))) || (holderAlive && Date.now() - started < PHP_BUILD_TIMEOUT)) {
+        throw new OpError('in_use', `A build of PHP ${minor} is already in progress (${lock})`);
+      }
+      fs.rmSync(lock, { force: true });
+    }
+  }
+  throw new OpError('in_use', `A build of PHP ${minor} is already in progress (${lock})`);
+}
+
+function keelPaths(minor, ctx) {
+  const root = keelPhpDir();
+  if (root !== KEEL_PHP_DIR) ctx.assertAllowedPath(root, 'write');
+  const prefix = ctx.assertAllowedPath(path.join(root, minor), 'write');
+  const unit = keelPhpUnit(minor);
+  const unitFile = ctx.assertAllowedPath(path.join(systemdUnitDir(), `${unit}.service`), 'write');
+  const link = ctx.assertAllowedPath(path.join(localBinDir(), `php${minor}`), 'write');
+  return { root, prefix, unit, unitFile, link, binary: path.join(prefix, 'bin', 'php'), fpm: path.join(prefix, 'sbin', 'php-fpm') };
+}
+
+defineOp('pkg.php.build', {
+  description: 'Build a PHP minor from the official php.net source into /opt/keel/php/<minor> (download, checksum, configure/make/make install through the shipped php-build.sh); pkg.php.build.finish registers the FPM unit afterwards',
+  timeoutMs: PHP_BUILD_TIMEOUT,
+  schema: z.object({ minor: phpMinor, wait }).strict(),
+  run: async ({ minor, wait: waitFor }, ctx) => {
+    const { root, prefix } = keelPaths(minor, ctx);
+    if (!PHP_SOURCE_MINORS.includes(minor)) throw new OpError('unsupported', `php.net's last PHP ${minor} release does not compile against this OS's libxml2/ICU; source builds cover PHP ${PHP_SOURCE_MINORS.join(', ')}`);
+    fs.mkdirSync(root, { recursive: true, mode: 0o755 });
+    const lock = takeBuildLock(root, minor);
+    let builddir = null;
+    try {
+      removeBuildDirs(root, minor);
+      const output = [];
+      const index = await exec('curl', [...CURL_SHORT, `${PHP_RELEASES_URL}?json&version=${minor}`], { timeoutMs: 90_000, maxBuffer: BIG });
+      const release = parsePhpRelease(index.stdout, minor);
+      output.push(`Resolved PHP ${minor} to ${release.version} (${release.filename})`);
+      builddir = fs.mkdtempSync(path.join(root, '.build-'));
+      fs.chmodSync(builddir, 0o700);
+      const marker = { minor, version: release.version, startedAt: new Date().toISOString() };
+      const markerPath = path.join(builddir, BUILD_MARKER);
+      writeAtomic(markerPath, JSON.stringify(marker), { mode: 0o600 });
+      const archive = path.join(builddir, release.filename);
+      const src = path.join(builddir, `php-${release.version}`);
+      output.push(`Downloading ${PHP_DIST_URL}/${release.filename}`);
+      await exec('curl', [...CURL_PHP, '-o', archive, `${PHP_DIST_URL}/${release.filename}`], { timeoutMs: 920_000, maxBuffer: BIG });
+      const st = fs.lstatSync(archive);
+      if (!st.isFile()) throw new OpError('download_failed', `${archive} is not a regular file`);
+      if (!verifySha256(fs.readFileSync(archive), release.sha256)) throw new OpError('checksum_mismatch', `${release.filename} does not match the SHA-256 published by php.net; nothing was built`);
+      output.push(`Checksum verified (${release.sha256.slice(0, 12)})`);
+      // GNU tar as root would keep the archive's uid; the source tree stays ours and configure/make run in it as root.
+      await exec('tar', ['--no-same-owner', '--no-same-permissions', '-xJf', archive, '-C', builddir], { timeoutMs: 10 * 60_000, maxBuffer: BIG });
+      fs.rmSync(archive, { force: true });
+      if (!fs.existsSync(path.join(src, 'configure'))) throw new OpError('extract_failed', `${release.filename} did not contain php-${release.version}/configure`);
+      // A Windows checkout may carry CRLF; bash would read "\r" as part of every line.
+      const script = fs.readFileSync(BUILD_SCRIPT, 'utf8').replace(/\r\n/g, '\n');
+      const scriptPath = path.join(builddir, 'php-build.sh');
+      writeAtomic(scriptPath, script, { mode: 0o700 });
+      const owner = fpmOwner();
+      const env = {
+        PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', LANG: 'C', LC_ALL: 'C', HOME: '/root',
+        KEEL_PHP_SRC: src, KEEL_PHP_PREFIX: prefix, KEEL_PHP_MINOR: minor, KEEL_PHP_JOBS: String(Math.max(1, os.cpus().length || 1)), KEEL_FPM_USER: owner, KEEL_FPM_GROUP: owner,
+      };
+      output.push(`Building PHP ${release.version} into ${prefix} with ${env.KEEL_PHP_JOBS} job(s) as ${scriptPath}`);
+      const result = await runLong({ kind: 'build', bin: 'bash', argv: [scriptPath], env, timeoutMs: PHP_BUILD_TIMEOUT, wait: waitFor, allowFailure: true }, ctx);
+      if (!result.background && result.code !== 0) throw new OpError('build_failed', `The PHP ${release.version} build exited with status ${result.code}: ${result.output.slice(-1)[0] || 'no output'}`, { output: result.output.slice(-40) });
+      // The run id lets the next build (and finish/remove) tell a failed background build from one still running.
+      writeAtomic(markerPath, JSON.stringify(result.background ? { ...marker, runId: result.run.id } : { ...marker, done: true }), { mode: 0o600 });
+      const done = finished(result);
+      return { minor, version: release.version, release, prefix, buildDir: builddir, script: scriptPath, ...done, output: done.background ? output : [...output, ...done.output] };
+    } catch (err) {
+      if (builddir) fs.rmSync(builddir, { recursive: true, force: true });
+      throw err;
+    } finally {
+      fs.rmSync(lock, { force: true });
+    }
+  },
+});
+
+async function phpVersionAt(bin) {
+  try { const r = await exec(bin, ['-n', '-r', 'echo PHP_VERSION;'], { allowFailure: true, timeoutMs: PROBE_TIMEOUT }); return r.code === 0 ? r.stdout.trim().match(/^\d[\d.]*/)?.[0] ?? null : null; } catch { return null; }
+}
+
+defineOp('pkg.php.build.finish', {
+  description: 'After pkg.php.build: write the keel-php<minor>-fpm unit, enable and start it, place /usr/local/bin/php<minor> and drop the build directory; idempotent',
+  timeoutMs: 10 * 60_000,
+  schema: z.object({ minor: phpMinor }).strict(),
+  run: async ({ minor }, ctx) => {
+    const { root, prefix, unit, unitFile, link, binary, fpm } = keelPaths(minor, ctx);
+    if (!fs.existsSync(binary) || !fs.existsSync(fpm) || !fs.existsSync(path.join(prefix, 'etc', 'php-fpm.conf')) || !fs.existsSync(path.join(prefix, BUILD_OK))) {
+      throw new OpError('build_failed', `PHP ${minor} is not installed under ${prefix} (bin/php, sbin/php-fpm, etc/php-fpm.conf or ${BUILD_OK} missing); the build did not complete`);
+    }
+    const marker = buildDirsFor(root, minor).map(readBuildMarker).find(Boolean);
+    if (buildLive(marker)) throw new OpError('in_use', `A build of PHP ${minor} started ${marker.startedAt} is still running`);
+    const version = (await phpVersionAt(binary)) || marker?.version || null;
+    writeAtomic(unitFile, renderPhpUnit(minor), { mode: 0o644 });
+    let active = null;
+    let unitError = null;
+    if (hasBinary('systemctl')) {
+      await exec('systemctl', ['daemon-reload'], { allowFailure: true, timeoutMs: 120_000 });
+      const r = await exec('systemctl', ['enable', '--now', `${unit}.service`], { allowFailure: true, timeoutMs: 180_000 });
+      if (r.code !== 0) unitError = (r.stderr || r.stdout).trim().split('\n').pop() || `systemctl exited with status ${r.code}`;
+      active = await unitActive(unit);
+    }
+    const placed = placeSymlink(link, binary, root);
+    const buildDirsRemoved = removeBuildDirs(root, minor);
+    fs.rmSync(buildLockPath(root, minor), { force: true });
+    return { minor, version, prefix, binary, unit, unitFile, active, ...(unitError ? { unitError } : {}), link: placed.placed ? link : null, ...(placed.placed ? {} : { linkConflict: placed.reason }), buildDirsRemoved };
+  },
+});
+
 // --- what is installed, for the one-click catalog ----------------------------
 
 const PYTHON_MINORS = ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14'];
@@ -1710,7 +1996,7 @@ defineOp('pkg.runtime.detect', {
     for (const v of discoverPhp().versions) {
       let version = null;
       try { const r = await exec(v.binary, ['-n', '-r', 'echo PHP_VERSION;'], { allowFailure: true, timeoutMs: PROBE_TIMEOUT }); version = r.stdout.trim().match(/^\d[\d.]*/)?.[0] ?? null; } catch { /* unreadable binary */ }
-      php.push({ id: v.id, version });
+      php.push({ id: v.id, version, layout: v.layout, source: Boolean(v.source), ...(v.prefix ? { prefix: v.prefix } : {}) });
     }
     const node = await listNode(ctx);
     const python = [];

@@ -9,6 +9,20 @@ not for the commit log.
 ## [Unreleased]
 
 ### Added
+- **PHP source builds — every catalog PHP version installs on every supported host.** When no repository
+  carries a version for the host (Ubuntu 26.04 "resolute" and `ppa:ondrej/php`), the catalog no longer marks it
+  *Not available for this OS*: it is *Available* with `method: 'source'`, and Install (PHP Version Manager or
+  Install Software › Runtimes, after a confirm that names php.net and the 15-minute build) compiles it from the
+  official php.net release (`.tar.xz`, sha256 verified) into `/opt/keel/php/<minor>` with its own
+  `keel-php<minor>-fpm` service, `/usr/local/bin/php<minor>` link and `lib/php.ini`. The build is a background
+  agent run whose output streams into the job log (the last lines stay on failure); nothing is left behind when
+  it fails. A built version is first class everywhere: *PHP x.y (Keel build)* with a **Keel build** pill in both
+  pages, per-domain FPM pools (sockets under `/run/keel-php`), the INI editor, the CLI default and *Remove*
+  (service, link and prefix). `POST /api/software/runtimes/install { runtime: 'php', version, method? }`
+  (`package` | `source`; omitted = the server's choice, `package` on an unsupported repository answers `422`);
+  `GET /api/software/php/catalog` and `GET /api/software/runtimes` carry `method` and `source`. Agent ops
+  `pkg.php.build` / `pkg.php.build.finish`, shipped build script `agent/src/ops/php-build.sh` (parameters by
+  environment only), allowed roots `/opt/keel/php` and `/run/keel-php`; contracts §51/§52, manual §22.2/§22.5.
 - **Ports mirror cPanel:** the account panel is served on **2083** (HTTPS, `WHM_PANEL_PORT` / `panelPort`) and
   **2082** (plain, `WHM_PANEL_HTTP_PORT` / `panelHttpPort`); the administration shell stays on 2087/2086. The TLS
   panel listener opens only with a certificate and shares the certificate reload (SIGHUP / file change) with 2087;

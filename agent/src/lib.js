@@ -11,6 +11,10 @@ const deployDirOf = (app) => path.resolve(path.dirname(fileURLToPath(import.meta
 // in the agent config, never the API.
 export const NODE_LINK_MAJORS = { min: 16, max: 30 };
 export const NODE_LINK_PATHS = Array.from({ length: NODE_LINK_MAJORS.max - NODE_LINK_MAJORS.min + 1 }, (_, i) => NODE_LINK_MAJORS.min + i).flatMap((m) => ['node', 'npm', 'npx'].map((n) => `/usr/local/bin/${n}${m}`));
+// PHP minors the source builder (pkg.php.build) may produce; the unit file and the CLI link of each are exact allowed paths.
+export const PHP_MINORS = ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5', '8.6', '9.0', '9.1'];
+export const PHP_UNIT_PATHS = PHP_MINORS.map((m) => `/etc/systemd/system/keel-php${m}-fpm.service`);
+export const PHP_LINK_PATHS = PHP_MINORS.map((m) => `/usr/local/bin/php${m}`);
 
 export const DEFAULT_ALLOWED_ROOTS = [
   '/home', '/var/lib/whm', '/etc/whm', '/var/log/whm',
@@ -46,6 +50,11 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/apt/sources.list.d', '/etc/apt/keyrings', '/etc/yum.repos.d', '/opt/keel/node',
   // Only the versioned links the Node.js installer manages, never /usr/local/bin itself.
   ...NODE_LINK_PATHS,
+  // PHP builds from source (pkg.php.build): the prefix tree, the FPM socket directory, and only the
+  // per-minor unit files and php<minor> links, never /etc/systemd/system or /usr/local/bin themselves.
+  '/opt/keel/php', '/run/keel-php',
+  ...PHP_UNIT_PATHS,
+  ...PHP_LINK_PATHS,
   // Web applications published under the server-hostname site (web.host.app.*) and their distro
   // configuration: Debian names, then the RHEL/Remi packages and the bare-tarball locations that
   // webmail.js WEBMAIL_CANDIDATES and db.js PMA_DIRS / PMA_CONFIGS probe (keep the lists in step).

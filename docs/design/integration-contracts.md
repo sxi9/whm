@@ -1203,7 +1203,28 @@ Reports are the account's own files, rendered and read back as the account; noth
   `pkg.php.versions().defaultId` is read before the install and, when the installer moved the CLI default (ondrej's
   alternatives prefer the newest), `pkg.php.default.set` puts the previous default back and the job log says so;
   (4) `capabilities.refresh()`; (5) `pkg.runtime.detect` again — a runtime still missing fails the job; result
-  `{ kind, runtime | tool, version, packages, installed: true, detected, path?, bin?, symlinks? }`.
+  `{ kind, runtime | tool, version, packages, installed: true, detected, method: 'package' | 'node' | 'source', path?, bin?, symlinks? }`.
+- **PHP source builds (2026-11-06):** `RUNTIMES.php.source = true`; a PHP version whose repository has no packages for
+  the host (`pkg.repo.status` → `supported: false`, or the probe failed / `null`) is still `state: 'available'` with
+  `method: 'source'` (`note` "Built from the official php.net source into /opt/keel/php/<minor> (about 15 minutes);
+  packages from <repo> are not available for <os>"); repo-backed versions are `method: 'package'`; `state:
+  'unsupported'` only without any package manager (`capability: false`). `catalog()` makes ONE `pkg.repo.status { repo:
+  'php' }` for this and every PHP row carries `state`, `method`, `source` (an installed Keel build), `repoStatus` and
+  `prefix` (`/opt/keel/php/<minor>`) for source rows; the runtime entry carries `source: true`.
+  `resolveInstall({ runtime: 'php', version }, family, { method: 'source' })` → `{ installer: 'php-source', minor, deps:
+  PHP_BUILD_DEPS[family], prefix, packages: [], repos: [] }` (422 without a family, or for a runtime without a source
+  build; `PHP_BUILD_DEPS` / `PHP_SOURCE_PREFIX` / `INSTALL_METHODS` are exported). `install({ runtime: 'php', version,
+  method? })`: `method` is optional (`package` | `source`, PHP only — 422 elsewhere); omitted, the service probes the
+  repo and picks `package` when it is present or supported, `source` otherwise; `method: 'package'` on a repo with no
+  series is a 422 (`fields.method: ['source']`). Audit args and the 202 body carry `method` (and `prefix`).
+  Job steps for `installer: 'php-source'`: progress 5 "installing build dependencies" → `runLongOp(job, 'pkg.install',
+  { packages: deps })` → 15 "downloading and building PHP <minor>" → `runLongOp(job, 'pkg.php.build', { minor })` (a
+  background run polled through `pkg.run.status`, every output line forwarded to the job log; when a failed run produced
+  more than the 2000 lines the job keeps, its last 40 lines are logged again before the failure) → 90 "registering the
+  PHP-FPM unit" → `pkg.php.build.finish { minor }` → `{ minor, version, prefix, binary, unit, active, link }` (never
+  called when the build failed) → the CLI-default restore check → `capabilities.refresh()` → `pkg.runtime.detect`
+  must report the minor. Result adds `{ method: 'source', prefix, unit, link, release, binary, deps }`. The route body
+  gains `method?: enum('package', 'source')`.
 - **Routes** (`routes/categories/software.js`, all `requireRoot`): `GET /api/software/runtimes`,
   `GET /api/software/runtimes/recent`, `POST /api/software/runtimes/install` with `{ runtime: enum(RUNTIME_KEYS),
   version?: /^\d+(\.\d+)?$/ }` or `{ tool: enum(TOOL_KEYS) }` (strict, exactly one of the two, no version with a tool)
@@ -1254,7 +1275,13 @@ Reports are the account's own files, rendered and read back as the account; noth
   `installed`; not installed and (`repo === null` or `repoStatus.present` or `repoStatus.supported === true`) →
   `available`; `supported === false` → `unsupported` with `note = repoStatus.detail`; otherwise `unknown`. Installed versions
   outside the catalog (ea-php83, a distro-only build) are appended as `installed` with `catalogVersion: null`; `id` is
-  the installed id when a catalog row matched an installed build, the catalog version otherwise. `usage()` → `{ [id]:
+  the installed id when a catalog row matched an installed build, the catalog version otherwise. **Since 2026-11-06** the
+  not-installed state comes from §51's availability rule: `supported === false` or a failed probe → `state: 'available'`
+  with `method: 'source'` (the php.net build, `prefix: '/opt/keel/php/<minor>'`, `packages: []`, the source note), a
+  present/supported repo → `method: 'package'`; `unsupported` (`method: null`) only without a package manager. Every row
+  carries `method`, `source` and `layout`; an installed Keel build (agent `pkg.php.versions` entry with `layout: 'keel'`,
+  `source: true`, label "PHP <minor> (Keel build)", binary `/opt/keel/php/<minor>/bin/php`, unit `keel-php<minor>-fpm`,
+  ini `<prefix>/lib/php.ini`) shows `source: true`, `method: 'source'`, `prefix` and `packages: []`. `usage()` → `{ [id]:
   count }` from one SQL over `account_domains.php_version` (a main domain without a row inherits and counts for nothing).
   `offeredVersions()` → ids or null (= every installed version). `setOffered(ids|null, user, req)` validates each id
   against the installed versions (422 `versions`), persists setting `php.offered_versions`, audits `software.php.offered`,
@@ -1262,7 +1289,9 @@ Reports are the account's own files, rendered and read back as the account; noth
   `effectiveDefault`, when it is the only installed version or when `usage()[version] > 0` (message carries the count);
   otherwise job `software.php.remove { version }` → `runLongOp(job, 'pkg.php.remove', { version })`, `capabilities.refresh()`,
   the id dropped from `php.offered_versions`; audit `software.php.remove`; returns `{ job, version }` (202); job result
-  `{ version, packages, removed: true }`. `runtimes.remove` stays Node.js-only and points PHP to this manager.
+  `{ version, packages, removed: true, layout?, prefix? }` (`layout: 'keel'` + `prefix` when the agent removed a source build:
+  unit disabled and deleted, `/usr/local/bin/php<minor>` link and `/opt/keel/php/<minor>` removed, `/etc/php` untouched).
+  `runtimes.remove` stays Node.js-only and points PHP to this manager.
 - **Routes (`/api/software`, all `requireRoot`):** `GET /php/catalog`, `GET /php/usage`, `PUT /php/offered { versions:
   phpVersionId[] (≤50) | null }`, `POST /php/remove { version }` → 202 `{ job, version }`.
 - **Account panel (`ctx.panelPhp`):** `versions(scope)` filters by the plan's `php_versions` AND the root's offered list; a

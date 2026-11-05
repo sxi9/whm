@@ -611,7 +611,12 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   note about where the packages come from (Ubuntu: `ppa:ondrej/php` and `ppa:deadsnakes/ppa`; Debian:
   `packages.sury.org` for PHP, distro Python only; RHEL: Remi for PHP under `/opt/remi/php<nn>`, EPEL for Composer).
   Node.js rows show the path (`/usr/local/bin/node<major>`, with `npm<major>` / `npx<major>`) and a **Remove**
-  button; the panel's own Node.js is never touched. *Tools* is a grid (Git, ImageMagick, FFmpeg, Redis, Memcached,
+  button; the panel's own Node.js is never touched. A PHP row whose repository has no packages for this OS (Ubuntu
+  26.04 "resolute" and `ppa:ondrej/php`, for example) is still installable: it carries a **Source build** pill and the
+  note says so; **Install** then compiles that version from the official php.net source into `/opt/keel/php/<minor>`
+  with its own PHP-FPM service `keel-php<minor>-fpm` (confirm first — about 15 minutes, the build log streams in the
+  job panel; the panel keeps working meanwhile). An installed source build is labelled *PHP x.y (Keel build)* with a
+  **Keel build** pill. *Tools* is a grid (Git, ImageMagick, FFmpeg, Redis, Memcached,
   Certbot, unzip, build tools, pip, cpanminus, PEAR/PECL, OpenSSH server, BIND, iproute2, locales, GoAccess,
   ClamAV) with the host-family package names. *Search* is the previous page: detected manager, search
   (`GET /pkg/search`), package info, install (option *no recommends*), *update index*; deep links
@@ -619,17 +624,24 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   *Installed* lists and removes packages (option *purge*); *History* shows package and runtime jobs with their logs.
   Other pages that find a tool missing (transfers, access grants, DNS cluster, Module Installers, PHP Version Manager,
   statistics software, quotas, phpMyAdmin, locales, IP functions) now show an **Install** button in place.
-- **Server:** `GET /software/runtimes` (catalog with installed state), `POST /software/runtimes/install`
-  `{ runtime, version }` or `{ tool }` → `202` job `software.runtime.install` (adds the repository when needed,
-  refreshes the index only when one was added, installs the exact package list or the official nodejs.org build
-  under `/opt/keel/node/<major>`, restores the PHP CLI default the installer may have switched, re-detects and fails
-  when the runtime is still missing); `POST /software/runtimes/remove { runtime: 'nodejs', version }` → `202`;
+- **Server:** `GET /software/runtimes` (catalog with installed state; PHP rows carry `method: 'package' | 'source'`
+  and installed Keel builds `source: true`), `POST /software/runtimes/install` `{ runtime, version, method? }` or
+  `{ tool }` → `202` job `software.runtime.install` (adds the repository when needed, refreshes the index only when
+  one was added, installs the exact package list or the official nodejs.org build under `/opt/keel/node/<major>`,
+  restores the PHP CLI default the installer may have switched, re-detects and fails when the runtime is still
+  missing). `method` is optional: the server picks `package` when the repository serves the host and `source`
+  otherwise; `method: 'package'` on a repository that cannot serve the host answers `422`. A source build installs the
+  build dependencies as packages, downloads the release tarball named by php.net (sha256 verified), runs the shipped
+  build script, then registers the `keel-php<minor>-fpm` unit and the `/usr/local/bin/php<minor>` link (agent
+  `pkg.php.build` / `pkg.php.build.finish`, contract §51). `POST /software/runtimes/remove { runtime: 'nodejs', version }` → `202`;
   `GET /software/runtimes/recent`. `POST /pkg/install` / `/pkg/remove` / `/pkg/update-index` answer `202` with jobs
   as before.
 - **Gotchas:** a version outside the catalog is refused (`422`); Python versions beyond the distro's are Ubuntu only
   (deadsnakes) — on Debian the job fails with that message before installing anything; PHP and Python are removed
-  from the *Installed* tab, only Node.js builds have their own *Remove*; package names cannot start with `-`; the
-  agent re-validates them.
+  from the *Installed* tab, only Node.js builds have their own *Remove* (a PHP source build is removed from PHP
+  Version Manager); package names cannot start with `-`; the agent re-validates them. A source build needs a compiler
+  and about 1 GB of disk under `/opt/keel/php` while it runs; a failed build leaves nothing behind except the last
+  log lines in the job, and a distro package with the same minor always wins over a Keel build when both exist.
 
 #### 22.3 Module Installers
 
@@ -660,19 +672,29 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   (EA4 `ea-php*`, Remi SCL, the stock `php` package) with its state (*Installed*, *Available*, *Not available
   for this OS* with the reason, *Unknown* when the repository probe failed), PHP-FPM unit, *System default* /
   *CLI* pill, the number of domains pinned to it, the *Offered to accounts* switch (installed versions
-  only) and the row action: *Install* (job through *Install Software*'s runtime installer; disabled on an
-  unsupported row), *Set as default* (the existing default flow: saved at once, inherited domains re-pinned
-  by a job), *Remove* (confirm; disabled with the reason while the version is the system default or a
-  domain runs it). `?install=<version>` opens the install confirm for that version. Then *PHP version per
-  domain* (bulk selection, `inherit`), *PHP-FPM pools* and the job log.
+  only) and the row action: *Install* (job through *Install Software*'s runtime installer; disabled only on a
+  row whose OS has no package manager at all), *Set as default* (the existing default flow: saved at once,
+  inherited domains re-pinned by a job), *Remove* (confirm; disabled with the reason while the version is the
+  system default or a domain runs it). `?install=<version>` opens the install confirm for that version. Then
+  *PHP version per domain* (bulk selection, `inherit`), *PHP-FPM pools* and the job log.
+  **Source build:** a version whose repository has no packages for this OS (26.04 "resolute" and `ppa:ondrej/php`)
+  is still *Available* — its row shows a **Source build** pill, the note explains why, and *Install* confirms a
+  build from the official php.net source into `/opt/keel/php/<minor>` with its own `keel-php<minor>-fpm`
+  service (about 15 minutes; the build output streams in the job panel and the last lines stay visible when it
+  fails). Once built it is a first-class version everywhere — labelled *PHP x.y (Keel build)* with a **Keel build**
+  pill and `/opt/keel/php/<minor>/bin/php` as the binary, selectable per domain, editable in the INI editor,
+  usable as the CLI default (`/usr/local/bin/php<minor>`), and *Remove* stops the service and deletes the whole
+  prefix. *Not available for this OS* remains only on a host without a package manager.
 - **Server:** `GET /php/catalog` merges the runtime catalog with the detected versions and asks the agent
   `pkg.repo.status` once for the PHP repository — on Ubuntu the `ondrej/php` PPA is probed for the host's
-  series before anything is added, so a release the PPA does not carry yet (26.04 "resolute") shows *Not
-  available for this OS* instead of breaking `apt-get update`; `PUT /php/offered { versions | null }`
+  series before anything is added, so a release the PPA does not carry yet (26.04 "resolute") is offered as
+  `method: 'source'` instead of breaking `apt-get update` (installed Keel builds carry `source: true`);
+  `POST /software/runtimes/install { runtime: 'php', version, method? }` starts either flow;
+  `PUT /php/offered { versions | null }`
   stores `php.offered_versions` (`null` = every installed version; a version is always kept selectable for a
   domain already on it); `POST /php/remove { version }` → `202` job `software.php.remove` → agent
   `pkg.php.remove` (refused for the system default, the only installed version or a version domains use;
-  `/etc/php/<ver>` is kept); `PUT /php/domains` calls `ctx.web.setPhpVersion` per domain (a job when
+  `/etc/php/<ver>` is kept for a package version; a Keel build loses its unit, link and prefix); `PUT /php/domains` calls `ctx.web.setPhpVersion` per domain (a job when
   more than one domain); `PUT /php/default` updates the default and FPM. Audit `software.php.offered`,
   `software.php.remove`. Contract §52.
 

@@ -25,7 +25,7 @@ const { generatorPackages } = await import('../src/pages/fn/server-configuration
 const { quotaPackages } = await import('../src/pages/fn/server-configuration/initial-quota-setup.jsx');
 const { InstallPackages, installPackagesBody, normalizePackages } = await import('../src/components/InstallPackages.jsx');
 const { CapabilityNotice } = await import('../src/components/Common.jsx');
-const { RuntimeInstaller, runtimeInstallBody, toolInstallBody } = await import('../src/pages/software/Shared.jsx');
+const { RuntimeInstaller, runtimeInstallBody, toolInstallBody, sourceBuildMessage } = await import('../src/pages/software/Shared.jsx');
 const { ToolingNotice, toolPackages } = await import('../src/pages/transfers/Shared.jsx');
 const { bindPackages } = await import('../src/pages/clusters/DnsCluster.jsx');
 const { iprouteQuery, Iproute2Notice } = await import('../src/pages/ip/Shared.jsx');
@@ -41,8 +41,10 @@ const catalog = {
   family: 'debian', os: { id: 'ubuntu', versionId: '24.04' }, manager: 'apt', capability: true,
   runtimes: [
     { key: 'php', label: 'PHP', single: false, versions: [
-      { id: '8.4', label: 'PHP 8.4', installed: false, version: null, packages: ['php8.4-fpm', 'php8.4-cli'], repo: 'php', note: null },
-      { id: '8.3', label: 'PHP 8.3', installed: true, version: '8.3.19', packages: ['php8.3-fpm', 'php8.3-cli'], repo: 'php', note: null },
+      { id: '8.4', label: 'PHP 8.4', installed: false, version: null, packages: ['php8.4-fpm', 'php8.4-cli'], repo: 'php', note: null, method: 'package' },
+      { id: '8.3', label: 'PHP 8.3', installed: true, version: '8.3.19', packages: ['php8.3-fpm', 'php8.3-cli'], repo: 'php', note: null, method: 'package' },
+      { id: '8.2', label: 'PHP 8.2', installed: false, version: null, packages: [], repo: 'php', note: 'Built from the official php.net source into /opt/keel/php/8.2 (about 15 minutes); packages from ppa:ondrej/php are not available for ubuntu 26.04', method: 'source', state: 'available' },
+      { id: '8.1', label: 'PHP 8.1 (Keel build)', installed: true, version: '8.1.33', packages: [], repo: 'php', note: null, method: 'source', source: true, state: 'installed' },
     ] },
     { key: 'nodejs', label: 'Node.js', single: false, versions: [{ id: '22', label: 'Node.js 22', installed: true, version: 'v22.14.0', packages: [], repo: null, note: 'installed under /opt/keel/node/22' }] },
     { key: 'ruby', label: 'Ruby', single: true, versions: [{ id: 'ruby', label: 'Ruby', installed: false, version: null, packages: ['ruby-full'], repo: null, note: null }] },
@@ -122,8 +124,28 @@ describe('Install Software page', () => {
 describe('RuntimeInstaller', () => {
   it('posts { runtime, version } for a version row, { runtime } for a single runtime and { tool } for a tool', () => {
     expect(runtimeInstallBody('php', '8.4')).toEqual({ runtime: 'php', version: '8.4' });
+    expect(runtimeInstallBody('php', '8.4', 'source')).toEqual({ runtime: 'php', version: '8.4', method: 'source' });
+    expect(runtimeInstallBody('php', '8.4', 'package')).toEqual({ runtime: 'php', version: '8.4', method: 'package' });
+    expect(runtimeInstallBody('php', '8.4', 'bogus')).toEqual({ runtime: 'php', version: '8.4' });
     expect(runtimeInstallBody('ruby', undefined)).toEqual({ runtime: 'ruby' });
     expect(toolInstallBody('imagemagick')).toEqual({ tool: 'imagemagick' });
+  });
+
+  it('marks source-built PHP rows and explains the build in the confirm copy', () => {
+    fixtures.responses.clear();
+    set('/software/runtimes', { data: catalog });
+    const html = render(h(RuntimeInstaller, { only: ['php'] }));
+    expect(html).toContain('>Source build<');
+    expect(html).toContain('>Keel build<');
+    expect(html).toContain('PHP 8.1 (Keel build)');
+    expect(html).toContain('/opt/keel/php/8.2');
+    expect(html).toContain('/opt/keel/php/8.1');
+    expect(html).toContain('packages from ppa:ondrej/php are not available');
+    expect((html.match(/<button type="button" class="btn btn-primary btn-sm[^"]*">Install<\/button>/g) || []).length).toBe(2);
+    expect(html).not.toMatch(/disabled=""[^>]*>Install<\/button>/);
+    expect(sourceBuildMessage('8.2')).toContain('php.net');
+    expect(sourceBuildMessage('8.2')).toContain('/opt/keel/php/8.2');
+    expect(sourceBuildMessage('8.2')).toContain('about 15 minutes');
   });
 
   it('restricts to the given runtimes and takes a custom title', () => {
@@ -233,9 +255,11 @@ describe('pages that used to link to the package search', () => {
       family: 'debian', os: { id: 'ubuntu', versionId: '26.04' }, effectiveDefault: '8.3', configuredDefault: '8.3', offered: ['8.3'],
       versions: [
         row({ id: '8.5', label: 'PHP 8.5', state: 'unsupported', repoStatus: { present: false, supported: false, detail: 'ppa:ondrej/php has no packages for Ubuntu resolute' }, note: 'ppa:ondrej/php has no packages for Ubuntu resolute' }),
-        row({ id: '8.4', label: 'PHP 8.4', state: 'available', packages: ['php8.4-fpm', 'php8.4-cli'] }),
-        row({ id: '8.3', label: 'PHP 8.3', state: 'installed', installed: true, version: '8.3.19', binary: '/usr/bin/php8.3', fpmInstalled: true, fpmActive: true, fpmUnit: 'php8.3-fpm', isDefault: true, isSystemDefault: true, offered: true, domains: 3 }),
-        row({ id: '8.2', label: 'PHP 8.2', state: 'installed', installed: true, version: '8.2.29', binary: '/usr/bin/php8.2', fpmInstalled: true, fpmActive: false, fpmUnit: 'php8.2-fpm', offered: false, domains: 0 }),
+        row({ id: '8.4', label: 'PHP 8.4', state: 'available', packages: ['php8.4-fpm', 'php8.4-cli'], method: 'package' }),
+        row({ id: '8.3', label: 'PHP 8.3', state: 'installed', installed: true, version: '8.3.19', binary: '/usr/bin/php8.3', fpmInstalled: true, fpmActive: true, fpmUnit: 'php8.3-fpm', isDefault: true, isSystemDefault: true, offered: true, domains: 3, method: 'package' }),
+        row({ id: '8.2', label: 'PHP 8.2', state: 'installed', installed: true, version: '8.2.29', binary: '/usr/bin/php8.2', fpmInstalled: true, fpmActive: false, fpmUnit: 'php8.2-fpm', offered: false, domains: 0, method: 'package' }),
+        row({ id: '8.1', label: 'PHP 8.1', state: 'available', method: 'source', repoStatus: { present: false, supported: false, detail: 'ppa:ondrej/php has no packages for Ubuntu resolute' }, note: 'Built from the official php.net source into /opt/keel/php/8.1 (about 15 minutes); packages from ppa:ondrej/php are not available for ubuntu 26.04' }),
+        row({ id: '7.4', label: 'PHP 7.4 (Keel build)', state: 'installed', installed: true, version: '7.4.33', binary: '/opt/keel/php/7.4/bin/php', fpmInstalled: true, fpmActive: true, fpmUnit: 'keel-php7.4-fpm', offered: false, domains: 0, method: 'source', source: true }),
       ],
     };
     set('/software/php/versions', { data: { versions: phpCatalog.versions.filter((v) => v.installed), effectiveDefault: '8.3' } });
@@ -246,13 +270,22 @@ describe('pages that used to link to the package search', () => {
     expect(html).toContain('<h1>PHP Version Manager</h1>');
     expect(html).not.toContain('MultiPHP Manager');
     expect(html).not.toContain('Install another PHP version');
-    for (const v of ['PHP 8.5', 'PHP 8.4', 'PHP 8.3', 'PHP 8.2']) expect(html).toContain(`<strong>${v}</strong>`);
+    for (const v of ['PHP 8.5', 'PHP 8.4', 'PHP 8.3', 'PHP 8.2', 'PHP 8.1', 'PHP 7.4 (Keel build)']) expect(html).toContain(`<strong>${v}</strong>`);
     expect(html).toContain('>Not available for this OS<');
     expect(html).toContain('>Available<');
     expect(html).toContain('>Installed<');
     expect(html).toContain('ppa:ondrej/php has no packages for Ubuntu resolute');
     expect(html).toMatch(/<button type="button" class="btn btn-primary btn-sm[^"]*" disabled="" title="ppa:ondrej\/php has no packages for Ubuntu resolute">Install<\/button>/);
     expect(html).toMatch(/<button type="button" class="btn btn-primary btn-sm[^"]*">Install<\/button>/);
+    expect(html).toMatch(/<button type="button" class="btn btn-primary btn-sm[^"]*" title="Built from the php.net source into \/opt\/keel\/php\/8.1">Install<\/button>/);
+    expect((html.match(/disabled=""[^>]*>Install<\/button>/g) || []).length).toBe(1);
+    expect(html).toContain('>Source build<');
+    expect(html).toContain('/opt/keel/php/8.1</code>');
+    expect(html).toContain('>Keel build<');
+    expect(html).toContain('/opt/keel/php/7.4/bin/php');
+    expect(html).toContain('keel-php7.4-fpm');
+    expect(html).toContain('Versions marked <em>Source build</em>');
+    expect(sourceBuildMessage('8.1')).toContain('official php.net source into /opt/keel/php/8.1');
     expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*" disabled="" title="This is the system default; set another version as default first">Remove<\/button>/);
     expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*">Remove<\/button>/);
     expect(html).toContain('>Set as default</button>');
@@ -260,8 +293,8 @@ describe('pages that used to link to the package search', () => {
     expect(html).toContain('php8.2-fpm · stopped');
     expect(html).toContain('Offered to accounts');
     expect((html.match(/<input type="checkbox" checked=""/g) || []).length).toBe(1);
-    expect((html.match(/<label class="toggle[^"]*"><input type="checkbox"/g) || []).length).toBe(4);
-    expect((html.match(/<label class="toggle disabled"><input type="checkbox" disabled=""/g) || []).length).toBe(2);
+    expect((html.match(/<label class="toggle[^"]*"><input type="checkbox"/g) || []).length).toBe(6);
+    expect((html.match(/<label class="toggle disabled"><input type="checkbox" disabled=""/g) || []).length).toBe(3);
     expect(html).toContain('>Install first<');
     expect(html).not.toContain('Install Distro Packages');
     expect(removeBlocker({ installed: true, isSystemDefault: false, domains: 2 })).toContain('2 domain(s)');
@@ -274,7 +307,7 @@ describe('pages that used to link to the package search', () => {
     expect(removeBlocker({ installed: false, isSystemDefault: false, domains: 0 }, 1)).toBeNull();
     expect(toggleOffered(phpCatalog, '8.2', true)).toEqual(['8.3', '8.2']);
     expect(toggleOffered(phpCatalog, '8.3', false)).toEqual([]);
-    expect(toggleOffered({ ...phpCatalog, offered: null }, '8.3', false)).toEqual(['8.2']);
+    expect(toggleOffered({ ...phpCatalog, offered: null }, '8.3', false)).toEqual(['8.2', '7.4']);
   });
 
   it('picks packages by host family for statistics generators and quota tools', () => {

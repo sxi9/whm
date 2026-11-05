@@ -171,8 +171,12 @@ function vhostLink(apache, domain) {
   return apache.flavor === 'debian' ? path.join(apache.sitesEnabled, `${domain}.conf`) : null;
 }
 
+export const KEEL_PHP_DIR = '/opt/keel/php';
+export const KEEL_PHP_RUN_DIR = '/run/keel-php';
+
 // PHP-FPM: Debian ships one tree per version under /etc/php/<ver>/fpm; RHEL
-// ships a single /etc/php-fpm.d (or Remi SCL trees under /etc/opt/remi).
+// ships a single /etc/php-fpm.d (or Remi SCL trees under /etc/opt/remi);
+// Keel source builds carry their own etc/php-fpm.d under /opt/keel/php/<minor>.
 export function phpLayout() {
   const versions = [];
   try {
@@ -181,6 +185,17 @@ export function phpLayout() {
       versions.push({ version: v, flavor: 'debian', poolDir: `/etc/php/${v}/fpm/pool.d`, bin: hasBinary(`php-fpm${v}`) ? `php-fpm${v}` : null, units: [`php${v}-fpm`], socketDir: '/run/php', listenOwner: 'www-data' });
     }
   } catch { /* no /etc/php */ }
+  try {
+    // Source builds (pkg.php.build) under /opt/keel/php/<minor>; a distro tree of the same minor is listed first and wins.
+    const keelRoot = process.env.WHM_KEEL_PHP_DIR || KEEL_PHP_DIR;
+    const listenOwner = exists('/etc/apache2') ? 'www-data' : 'apache';
+    for (const v of fs.readdirSync(keelRoot)) {
+      const prefix = `${keelRoot}/${v}`;
+      // .keel-build-ok is php-build.sh's last step; a prefix without it is an unfinished build, not a version.
+      if (!/^\d\.\d+$/.test(v) || !exists(`${prefix}/etc/php-fpm.d`) || !exists(`${prefix}/.keel-build-ok`) || versions.some((x) => x.version === v)) continue;
+      versions.push({ version: v, flavor: 'keel', poolDir: `${prefix}/etc/php-fpm.d`, bin: exists(`${prefix}/sbin/php-fpm`) ? `${prefix}/sbin/php-fpm` : null, fpmConfig: `${prefix}/etc/php-fpm.conf`, units: [`keel-php${v}-fpm`], socketDir: KEEL_PHP_RUN_DIR, listenOwner });
+    }
+  } catch { /* no source builds */ }
   try {
     for (const d of fs.readdirSync('/etc/opt/remi')) {
       const m = d.match(/^php(\d)(\d+)$/);
@@ -1293,7 +1308,9 @@ defineOp('web.phpfpm.pool.write', {
     writeAtomic(file, content);
     let validated = null;
     if (tree.bin) {
-      const { code, stdout, stderr } = await exec(tree.bin, ['-t'], { allowFailure: true, timeoutMs: 60_000 });
+      // A source build only finds its own php-fpm.conf when told where it is; without --fpm-config `-t` would test the prefix default.
+      const testArgv = tree.flavor === 'keel' ? ['-t', '--fpm-config', tree.fpmConfig] : ['-t'];
+      const { code, stdout, stderr } = await exec(tree.bin, testArgv, { allowFailure: true, timeoutMs: 60_000 });
       validated = code === 0;
       if (!validated) { restore(file, previous); throw new OpError('config_invalid', `PHP-FPM rejected the pool; the previous file was restored: ${lastLine(stderr || stdout)}`, { output: `${stdout}${stderr}`.trim() }); }
     }

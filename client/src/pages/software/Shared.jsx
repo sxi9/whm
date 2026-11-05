@@ -14,8 +14,22 @@ import { RequestError, Tabs, isCapabilityError } from '../security/Shared.jsx';
 export { RequestError, Tabs, isCapabilityError };
 export { InstallPackages, installPackagesBody, normalizePackages } from '../../components/InstallPackages.jsx';
 
-export function runtimeInstallBody(runtime, version) {
-  return version == null || version === '' ? { runtime } : { runtime, version: String(version) };
+export function runtimeInstallBody(runtime, version, method) {
+  const body = version == null || version === '' ? { runtime } : { runtime, version: String(version) };
+  return method === 'package' || method === 'source' ? { ...body, method } : body;
+}
+
+export const PHP_SOURCE_PREFIX = '/opt/keel/php';
+
+// Confirm copy for a PHP version the server compiles from php.net instead of installing packages.
+export function sourceBuildMessage(minor) {
+  return `Builds PHP ${minor} from the official php.net source into ${PHP_SOURCE_PREFIX}/${minor} with its own PHP-FPM service. This compiles on the server and takes about 15 minutes; the panel keeps working meanwhile.`;
+}
+
+export function SourceBuildPill({ row }) {
+  if (row?.installed && row.source) return <StatusPill status="info">Keel build</StatusPill>;
+  if (!row?.installed && row?.method === 'source') return <StatusPill status="info">Source build</StatusPill>;
+  return null;
 }
 
 export function toolInstallBody(tool) {
@@ -23,7 +37,7 @@ export function toolInstallBody(tool) {
 }
 
 const RUNTIME_SUBTITLES = {
-  php: 'Each version installs side by side with PHP-FPM and the common extensions; the CLI default stays as it is.',
+  php: 'Each version installs side by side with PHP-FPM and the common extensions; a version no repository carries for this OS is built from the php.net source under /opt/keel/php. The CLI default stays as it is.',
   nodejs: 'Official nodejs.org builds under /opt/keel/node/<major>; the panel\'s own Node is never touched.',
   python: 'Interpreter, venv and headers for the version; the distro\'s python3 stays the default.',
 };
@@ -33,13 +47,18 @@ const rowLabel = (runtime, row) => row.label || `${runtime.label} ${row.id}`;
 
 function RuntimeRow({ runtime, row, busy, onInstall, onRemove }) {
   const isNode = runtime.key === 'nodejs';
+  const isSource = runtime.key === 'php' && (row.source || row.method === 'source');
+  const unsupported = row.state === 'unsupported';
   return (
     <tr>
-      <td><strong>{runtime.single ? runtime.label : rowLabel(runtime, row)}</strong>{isNode && <><br /><code className="small">/usr/local/bin/node{row.id}</code></>}</td>
+      <td><strong>{runtime.single ? runtime.label : rowLabel(runtime, row)}</strong> <SourceBuildPill row={row} />
+        {isNode && <><br /><code className="small">/usr/local/bin/node{row.id}</code></>}
+        {isSource && <><br /><code className="small">{PHP_SOURCE_PREFIX}/{row.id}</code></>}
+      </td>
       <td>{row.installed ? <StatusPill status="installed">{row.version ? `installed · ${row.version}` : 'installed'}</StatusPill> : <StatusPill status="not-installed">not installed</StatusPill>}</td>
       <td className="muted small">{row.note || (row.packages?.length ? <CodeList names={row.packages.slice(0, 4).concat(row.packages.length > 4 ? [`+${row.packages.length - 4} more`] : [])} /> : '—')}</td>
       <td className="actions-col">
-        {!row.installed && <Button size="sm" variant="primary" loading={busy} onClick={() => onInstall(runtime, row)}>Install</Button>}
+        {!row.installed && <Button size="sm" variant="primary" loading={busy} disabled={unsupported} title={unsupported ? row.note || 'Not available for this OS' : undefined} onClick={() => onInstall(runtime, row)}>Install</Button>}
         {row.installed && !isNode && <StatusPill status="installed">Installed</StatusPill>}
         {row.installed && isNode && <Button size="sm" variant="danger" loading={busy} onClick={() => onRemove(runtime, row)}>Remove</Button>}
       </td>
@@ -58,7 +77,11 @@ export function RuntimeInstaller({ only, title, subtitle, onFinished, tools }) {
   const showTools = tools == null ? !only : Boolean(tools);
   const cardTitle = (runtime) => (title && only?.length === 1 ? title : runtime.label);
 
-  const install = (runtime, row) => runner.start(() => api.post('/software/runtimes/install', runtimeInstallBody(runtime.key, runtime.single ? undefined : row.id)), `Install ${runtime.single ? runtime.label : rowLabel(runtime, row)}`);
+  const install = async (runtime, row) => {
+    const source = runtime.key === 'php' && row.method === 'source';
+    if (source && !(await confirm({ title: `Install ${rowLabel(runtime, row)}?`, message: sourceBuildMessage(row.id), confirmLabel: 'Build and install' }))) return;
+    runner.start(() => api.post('/software/runtimes/install', runtimeInstallBody(runtime.key, runtime.single ? undefined : row.id, source ? 'source' : undefined)), `Install ${runtime.single ? runtime.label : rowLabel(runtime, row)}`);
+  };
   const remove = async (runtime, row) => {
     if (!(await confirm({ title: `Remove ${rowLabel(runtime, row)}?`, message: `Deletes /opt/keel/node/${row.id} and the node${row.id}, npm${row.id} and npx${row.id} links in /usr/local/bin. Sites started with this Node stop working until it is installed again.`, confirmLabel: 'Remove', danger: true }))) return;
     runner.start(() => api.post('/software/runtimes/remove', runtimeInstallBody(runtime.key, row.id)), `Remove ${rowLabel(runtime, row)}`);

@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { compareVersions, pickBasic, BASIC_DIRECTIVES, EA4_CATALOG } from '../src/services/software.js';
-import { RUNTIMES, TOOLS, resolveInstall, reposFor, detectedVersion } from '../src/services/software-runtimes.js';
+import { RUNTIMES, TOOLS, PHP_BUILD_DEPS, PHP_SOURCE_MINORS, resolveInstall, reposFor, detectedVersion } from '../src/services/software-runtimes.js';
 
 const BIN_FULL = { 'apt-get': true, 'dpkg-query': true, php: true, 'php-fpm': true, nginx: true, perl: true, cpan: true, gem: true, pip3: true, apache2ctl: true, systemctl: true };
 const PHP = { id: '8.3', label: 'PHP 8.3', binary: '/usr/bin/php8.3', layout: 'debian', version: '8.3.6', iniPath: '/etc/php/8.3/fpm/php.ini', iniPaths: { fpm: '/etc/php/8.3/fpm/php.ini', cli: '/etc/php/8.3/cli/php.ini' }, poolDir: '/etc/php/8.3/fpm/pool.d', fpmUnit: 'php8.3-fpm', isDefault: true, fpmActive: true, fpmInstalled: true };
@@ -16,9 +16,12 @@ let rpmPresent = false;
 let repoState = { php: 'added', python: 'unsupported', epel: 'present' };
 let nodeVersions = [{ major: 22, version: 'v22.11.0', path: '/opt/keel/node/22', bin: '/opt/keel/node/22/bin/node' }];
 let phpCliDefault = '8.3';
+// PHP minors built from source (agent pkg.php.build.finish) under /opt/keel/php/<minor>.
+let keelBuilds = [];
+const keelVersion = (minor) => ({ id: minor, label: `PHP ${minor} (Keel build)`, binary: `/opt/keel/php/${minor}/bin/php`, layout: 'keel', source: true, version: `${minor}.33`, iniPath: `/opt/keel/php/${minor}/lib/php.ini`, iniPaths: { php: `/opt/keel/php/${minor}/lib/php.ini` }, poolDir: `/opt/keel/php/${minor}/etc/php-fpm.d`, fpmUnit: `keel-php${minor}-fpm`, packagePrefix: null, isDefault: false, fpmActive: true, fpmInstalled: true });
 const detectRuntimes = () => ({
   os: { id: 'ubuntu', idLike: ['debian'], versionId: '26.04', codename: 'resolute', family: 'debian' },
-  php: [...new Set(installedPkgs.map((p) => /^php(\d\.\d)-fpm$/.exec(p.name)?.[1]).filter(Boolean)), '8.3', '8.2'].map((id) => ({ id, version: `${id}.6` })),
+  php: [...[...new Set(installedPkgs.map((p) => /^php(\d\.\d)-fpm$/.exec(p.name)?.[1]).filter(Boolean)), '8.3', '8.2'].map((id) => ({ id, version: `${id}.6` })), ...keelBuilds.map((minor) => ({ id: minor, version: `${minor}.33`, layout: 'keel', source: true }))],
   node: { system: { version: 'v22.11.0', path: '/usr/bin/node' }, versions: nodeVersions },
   python: [{ minor: '3.12', version: '3.12.3', bin: '/usr/bin/python3.12' }, ...(installedPkgs.some((p) => p.name === 'python3.11') ? [{ minor: '3.11', version: '3.11.9', bin: '/usr/bin/python3.11' }] : [])],
   ruby: installedPkgs.some((p) => p.name === 'ruby-full') ? '3.3.0' : null, go: null, composer: null, perl: '5.38.2',
@@ -74,6 +77,7 @@ beforeAll(async () => {
     'pkg.php.versions': () => ({ versions: [PHP, PHP82], defaultId: phpCliDefault, defaultBinary: `/usr/bin/php${phpCliDefault}` }),
     'pkg.php.default.set': ({ version }) => { phpCliDefault = version; return { version, binary: `/usr/bin/php${version}`, tool: 'update-alternatives' }; },
     'pkg.os.release': () => detectRuntimes().os,
+    'pkg.repo.status': ({ repo }) => ({ repo, family: 'debian', present: repoState[repo] === 'present', supported: repoState[repo] !== 'unsupported', detail: repoState[repo] === 'unsupported' ? `no ${repo} repository for Ubuntu 26.04 resolute` : `ppa for ${repo}` }),
     'pkg.repo.ensure': ({ repo }) => ({ repo, family: 'debian', action: repoState[repo] ?? 'present', detail: repoState[repo] === 'unsupported' ? 'Debian ships one Python version; deadsnakes is Ubuntu only' : `ppa for ${repo}` }),
     'pkg.node.list': () => ({ system: { version: 'v22.11.0', path: '/usr/bin/node' }, versions: nodeVersions }),
     'pkg.node.install': ({ major }) => { const entry = { major, version: `v${major}.0.0`, path: `/opt/keel/node/${major}`, bin: `/opt/keel/node/${major}/bin/node`, symlinks: [`/usr/local/bin/node${major}`, `/usr/local/bin/npm${major}`, `/usr/local/bin/npx${major}`] }; nodeVersions = [...nodeVersions.filter((n) => n.major !== major), entry]; return { ...entry, output: [`Node.js ${entry.version} installed under ${entry.path}`] }; },
@@ -476,6 +480,18 @@ describe('Install Software (one-click runtimes and tools)', () => {
     expect(() => resolveInstall({ runtime: 'php', version: '5.6' }, 'debian')).toThrow(/not in the catalog/);
     expect(() => resolveInstall({ runtime: 'php' }, 'debian')).toThrow(/needs a version/);
     expect(() => resolveInstall({ runtime: 'php', version: '8.4' }, null)).toThrow(/No packages are known/);
+    expect(resolveInstall({ runtime: 'php', version: '8.4' }, 'debian', { method: 'source' })).toMatchObject({ installer: 'php-source', minor: '8.4', deps: PHP_BUILD_DEPS.debian, packages: [], repos: [], prefix: '/opt/keel/php/8.4' });
+    expect(resolveInstall({ runtime: 'php', version: '8.3' }, 'rhel', { method: 'source' })).toMatchObject({ deps: PHP_BUILD_DEPS.rhel, repos: ['epel', 'crb'] });
+    expect(() => resolveInstall({ runtime: 'php', version: '7.4' }, 'rhel', { method: 'source' })).toThrow(/cannot be built from source/);
+    expect(PHP_SOURCE_MINORS).toEqual(['8.1', '8.2', '8.3', '8.4', '8.5']);
+    expect(PHP_BUILD_DEPS.debian).toEqual(expect.arrayContaining(['build-essential', 'xz-utils', 'libxml2-dev', 'libssl-dev', 'libonig-dev', 'libsodium-dev']));
+    expect(PHP_BUILD_DEPS.rhel).toContain('xz');
+    expect(() => resolveInstall({ runtime: 'php', version: '8.4' }, null, { method: 'source' })).toThrow(/needs a package manager/);
+    expect(() => resolveInstall({ runtime: 'php', version: '5.6' }, 'debian', { method: 'source' })).toThrow(/not in the catalog/);
+    expect(() => resolveInstall({ runtime: 'nodejs', version: '22' }, 'debian', { method: 'source' })).not.toThrow();
+    expect(() => resolveInstall({ runtime: 'python', version: '3.12' }, 'debian', { method: 'source' })).toThrow(/no source build/);
+    expect(detectedVersion('php', '8.4', { php: [{ id: '8.4', version: '8.4.27', layout: 'keel', source: true }] })).toMatchObject({ installed: true, version: '8.4.27', source: true, layout: 'keel' });
+    expect(detectedVersion('php', '8.3', { php: [{ id: '8.3', version: '8.3.6' }] }).source).toBe(false);
     expect(() => resolveInstall({ tool: 'nope' }, 'debian')).toThrow(/Unknown tool/);
     expect(reposFor(RUNTIMES.composer, 'debian')).toEqual([]);
     expect(TOOLS.every((t) => Array.isArray(t.debian) && Array.isArray(t.rhel))).toBe(true);
@@ -494,8 +510,11 @@ describe('Install Software (one-click runtimes and tools)', () => {
     expect(d.runtimes.map((r) => r.key)).toEqual(['php', 'nodejs', 'python', 'ruby', 'go', 'composer']);
     const php = d.runtimes.find((r) => r.key === 'php');
     expect(php.versions.map((v) => [v.id, v.installed])).toEqual([['8.5', false], ['8.4', false], ['8.3', true], ['8.2', true], ['8.1', false], ['7.4', false]]);
-    expect(php.versions.find((v) => v.id === '8.3')).toMatchObject({ label: 'PHP 8.3', version: '8.3.6', repo: 'php', packages: RUNTIMES.php.debian('8.3') });
+    expect(php.versions.find((v) => v.id === '8.3')).toMatchObject({ label: 'PHP 8.3', version: '8.3.6', repo: 'php', packages: RUNTIMES.php.debian('8.3'), state: 'installed', method: 'package', source: false });
     expect(php.versions[0].note).toMatch(/ondrej/);
+    expect(php.source).toBe(true);
+    expect(php.versions[0]).toMatchObject({ state: 'available', method: 'package', repoStatus: { present: false, supported: true } });
+    expect(app.agent.callsTo('pkg.repo.status').map((c) => c.args)).toEqual([{ repo: 'php' }]);
     const node = d.runtimes.find((r) => r.key === 'nodejs');
     expect(node.versions.find((v) => v.id === '22')).toMatchObject({ installed: true, version: 'v22.11.0', path: '/opt/keel/node/22', bin: '/usr/local/bin/node22', packages: [], repo: null });
     expect(node.versions.find((v) => v.id === '20')).toMatchObject({ installed: false, bin: '/usr/local/bin/node20' });
@@ -550,6 +569,109 @@ describe('Install Software (one-click runtimes and tools)', () => {
       expect(app.agent.callsTo('pkg.install').pop().args.packages).toEqual(RUNTIMES.php.debian('8.1'));
     } finally {
       app.agent.set('pkg.install', ({ packages }) => { installedPkgs = [...installedPkgs, ...packages.filter((p) => !installedPkgs.some((i) => i.name === p)).map((name) => ({ name, version: '1.0', arch: 'amd64', summary: 'installed by test' }))]; return { manager: 'apt', packages, output: [`Setting up ${packages.join(' ')}`] }; });
+    }
+  });
+
+  it('builds a PHP version from source when the repo has no packages: deps -> pkg.php.build (polled) -> finish -> detect', async () => {
+    repoState.php = 'unsupported';
+    phpCliDefault = '8.3';
+    const runLines = ['php-8.5.33.tar.xz: sha256 verified', 'configure: creating ./config.status', 'make[1]: Leaving directory', 'Installing PHP SAPI module: fpm'];
+    app.agent.set('pkg.php.build', ({ minor }) => ({ minor, background: true, run: { id: 'run-74', pid: 4242, logPath: '/var/log/whm/runs/run-74.log' } }));
+    app.agent.set('pkg.run.status', ({ id, offset }) => ({ id, output: runLines.slice(offset), offset: runLines.length, done: true, status: 'finished', code: 0 }));
+    app.agent.set('pkg.php.build.finish', ({ minor }) => { keelBuilds = [...keelBuilds, minor]; return { minor, version: `${minor}.33`, prefix: `/opt/keel/php/${minor}`, binary: `/opt/keel/php/${minor}/bin/php`, unit: `keel-php${minor}-fpm`, active: true, link: `/usr/local/bin/php${minor}` }; });
+    app.agent.calls.length = 0;
+    try {
+      // Explicit packages on a repo without a series is refused before any job; so is a method on a non-PHP runtime.
+      const pkgOnly = await post('/api/software/runtimes/install', { runtime: 'php', version: '8.5', method: 'package' });
+      expect(pkgOnly.status).toBe(422);
+      expect(pkgOnly.body.error.message).toMatch(/not available on this OS/);
+      expect(pkgOnly.body.error.fields.method).toEqual(['source']);
+      expect((await post('/api/software/runtimes/install', { runtime: 'nodejs', version: '22', method: 'source' })).status).toBe(422);
+      expect((await post('/api/software/runtimes/install', { runtime: 'php', version: '8.5', method: 'tarball' })).status).toBe(422);
+      // 7.4's last php.net release does not compile on current distributions: no method works, so the row is unsupported.
+      const old = await post('/api/software/runtimes/install', { runtime: 'php', version: '7.4' });
+      expect(old.status).toBe(422);
+      expect(old.body.error.message).toMatch(/cannot be built from source/);
+      expect((await post('/api/software/runtimes/install', { runtime: 'php', version: '7.4', method: 'package' })).body.error.fields.method).not.toEqual(['source']);
+      expect(app.agent.callsTo('pkg.install')).toHaveLength(0);
+
+      const res = await post('/api/software/runtimes/install', { runtime: 'php', version: '8.5' });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(res.body.data).toMatchObject({ target: 'php:8.5', method: 'source', prefix: '/opt/keel/php/8.5', packages: [], job: { type: 'software.runtime.install' } });
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, job.error).toBe('done');
+      expect(job.result).toMatchObject({ runtime: 'php', version: '8.5', installed: true, method: 'source', detected: '8.5.33', release: '8.5.33', prefix: '/opt/keel/php/8.5', unit: 'keel-php8.5-fpm', link: '/usr/local/bin/php8.5', binary: '/opt/keel/php/8.5/bin/php', packages: [], deps: PHP_BUILD_DEPS.debian });
+      const order = app.agent.calls.map((c) => c.name).filter((n) => ['pkg.repo.ensure', 'pkg.update_index', 'pkg.install', 'pkg.php.build', 'pkg.run.status', 'pkg.php.build.finish', 'pkg.php.default.set', 'pkg.runtime.detect'].includes(n));
+      expect(order).toEqual(['pkg.install', 'pkg.php.build', 'pkg.run.status', 'pkg.php.build.finish', 'pkg.runtime.detect']);
+      expect(app.agent.callsTo('pkg.install').pop().args).toEqual({ packages: PHP_BUILD_DEPS.debian, wait: false });
+      expect(app.agent.callsTo('pkg.php.build').map((c) => c.args)).toEqual([{ minor: '8.5', wait: false }]);
+      expect(app.agent.callsTo('pkg.php.build.finish').map((c) => c.args)).toEqual([{ minor: '8.5' }]);
+      expect(app.agent.callsTo('pkg.run.status')[0].args).toMatchObject({ id: 'run-74', offset: 0 });
+      // The build output streams into the job log; the finish step is logged with the unit and link.
+      for (const line of runLines) expect(job.logs.some((l) => l.line === line), line).toBe(true);
+      expect(job.logs.some((l) => /build dependencies \(debian\)/.test(l.line))).toBe(true);
+      expect(job.logs.some((l) => /PHP 8\.5\.33 installed under \/opt\/keel\/php\/8\.5; unit keel-php8\.5-fpm active; CLI \/usr\/local\/bin\/php8\.5/.test(l.line))).toBe(true);
+      expect(phpCliDefault).toBe('8.3');
+      const audit = app.ctx.db.prepare("SELECT target, args_redacted AS args FROM audit_log WHERE action = 'software.runtime.install' ORDER BY id DESC LIMIT 1").get();
+      expect(audit.target).toBe('php:8.5');
+      expect(JSON.parse(audit.args)).toMatchObject({ method: 'source', packages: [] });
+      // The runtime catalog shows the build as installed from source.
+      const row = (await get('/api/software/runtimes')).body.data.runtimes.find((r) => r.key === 'php').versions.find((v) => v.id === '8.5');
+      expect(row).toMatchObject({ installed: true, version: '8.5.33', state: 'installed', method: 'source', source: true, prefix: '/opt/keel/php/8.5' });
+    } finally {
+      repoState.php = 'present';
+      keelBuilds = [];
+    }
+  });
+
+  it('fails the job when the FPM unit of a finished build does not start', async () => {
+    repoState.php = 'unsupported';
+    app.agent.set('pkg.php.build', ({ minor }) => ({ minor, background: true, run: { id: 'run-82', pid: 4245, logPath: '/var/log/whm/runs/run-82.log' } }));
+    app.agent.set('pkg.run.status', ({ id }) => ({ id, output: [], offset: 0, done: true, status: 'finished', code: 0 }));
+    app.agent.set('pkg.php.build.finish', ({ minor }) => ({ minor, version: `${minor}.33`, prefix: `/opt/keel/php/${minor}`, binary: `/opt/keel/php/${minor}/bin/php`, unit: `keel-php${minor}-fpm`, active: false, unitError: 'Job for keel-php8.2-fpm.service failed because the control process exited with error code', link: null, linkConflict: '/usr/local/bin/php8.2 is not a symbolic link' }));
+    app.agent.calls.length = 0;
+    try {
+      const job = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.2', method: 'source' })).body.data.job.id);
+      expect(job.status).toBe('failed');
+      expect(job.error).toMatch(/PHP 8\.2\.33 built but keel-php8\.2-fpm did not start: Job for keel-php8\.2-fpm\.service failed.*journalctl -u keel-php8\.2-fpm/);
+      expect(job.logs.some((l) => l.level === 'warn' && /not a symbolic link/.test(l.line))).toBe(true);
+      expect(app.agent.callsTo('pkg.runtime.detect')).toHaveLength(0);
+    } finally {
+      repoState.php = 'present';
+    }
+  });
+
+  it('a failed build fails the job with the build output and never registers the unit', async () => {
+    repoState.php = 'unsupported';
+    const failing = ['checking for libzip... no', 'configure: error: Package requirements (libzip >= 0.11) were not met'];
+    app.agent.set('pkg.php.build', ({ minor }) => ({ minor, background: true, run: { id: 'run-81', pid: 4243, logPath: '/var/log/whm/runs/run-81.log' } }));
+    app.agent.set('pkg.run.status', ({ id, offset }) => ({ id, output: failing.slice(offset), offset: failing.length, done: true, status: 'finished', code: 2 }));
+    app.agent.calls.length = 0;
+    try {
+      const job = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.1', method: 'source' })).body.data.job.id);
+      expect(job.status).toBe('failed');
+      expect(job.error).toMatch(/PHP 8\.1 build exited with status 2: configure: error: Package requirements \(libzip/);
+      expect(app.agent.callsTo('pkg.php.build.finish')).toHaveLength(0);
+      expect(app.agent.callsTo('pkg.runtime.detect')).toHaveLength(0);
+      expect(job.logs.some((l) => l.line === failing[1])).toBe(true);
+      // An op-level refusal (bad checksum) surfaces the agent's own message.
+      app.agent.fail('pkg.php.build', 'checksum_mismatch', 'sha256 mismatch for php-8.1.31.tar.xz');
+      app.agent.calls.length = 0;
+      const bad = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.1', method: 'source' })).body.data.job.id);
+      expect(bad.status).toBe('failed');
+      expect(bad.error).toMatch(/sha256 mismatch for php-8\.1\.31\.tar\.xz/);
+      expect(app.agent.callsTo('pkg.php.build.finish')).toHaveLength(0);
+      // A build log longer than the job keeps still ends with its last 40 lines when it fails.
+      const long = Array.from({ length: 2100 }, (_, i) => `make line ${i + 1}`);
+      app.agent.set('pkg.php.build', ({ minor }) => ({ minor, background: true, run: { id: 'run-long', pid: 4244, logPath: '/var/log/whm/runs/run-long.log' } }));
+      app.agent.set('pkg.run.status', ({ id, offset }) => ({ id, output: long.slice(offset), offset: long.length, done: true, status: 'finished', code: 1 }));
+      const tail = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.1', method: 'source' })).body.data.job.id);
+      expect(tail.status).toBe('failed');
+      expect(tail.logs.some((l) => /last 40 lines/.test(l.line))).toBe(true);
+      expect(tail.logs.filter((l) => l.line === 'make line 2100')).toHaveLength(1);
+      expect(tail.logs.some((l) => l.line === 'make line 2050')).toBe(false);
+    } finally {
+      repoState.php = 'present';
     }
   });
 
@@ -913,30 +1035,40 @@ describe('PHP Version Manager', () => {
       expect(res.status).toBe(200);
       const d = res.body.data;
       expect(d).toMatchObject({ family: 'debian', manager: 'apt', capability: true, phpCapability: true, effectiveDefault: '8.3', offered: null });
-      expect(d.versions.map((v) => [v.id, v.state])).toEqual([['8.5', 'unsupported'], ['8.4', 'unsupported'], ['8.3', 'installed'], ['8.2', 'installed'], ['8.1', 'unsupported'], ['7.4', 'unsupported'], ['system', 'installed']]);
+      // No PPA series for this OS: every missing version is still installable, as a php.net source build.
+      expect(d.versions.map((v) => [v.id, v.state, v.method])).toEqual([['8.5', 'available', 'source'], ['8.4', 'available', 'source'], ['8.3', 'installed', 'package'], ['8.2', 'installed', 'package'], ['8.1', 'available', 'source'], ['7.4', 'unsupported', null], ['system', 'installed', 'package']]);
+      expect(d.versions.find((v) => v.id === '7.4').note).toMatch(/last 7\.4 release does not compile/);
       const v83 = d.versions.find((v) => v.id === '8.3');
-      expect(v83).toMatchObject({ catalogVersion: '8.3', label: 'PHP 8.3', installed: true, version: '8.3.6', binary: '/usr/bin/php8.3', fpmUnit: 'php8.3-fpm', fpmActive: true, isDefault: true, isSystemDefault: true, offered: true, domains: 0, repo: 'php', repoStatus: { present: false, supported: false } });
+      expect(v83).toMatchObject({ catalogVersion: '8.3', label: 'PHP 8.3', installed: true, version: '8.3.6', binary: '/usr/bin/php8.3', fpmUnit: 'php8.3-fpm', fpmActive: true, isDefault: true, isSystemDefault: true, offered: true, domains: 0, repo: 'php', repoStatus: { present: false, supported: false }, source: false, layout: 'debian' });
       expect(v83.packages).toEqual(RUNTIMES.php.debian('8.3'));
       expect(v83.advisories.length).toBeGreaterThan(0);
       const v84 = d.versions.find((v) => v.id === '8.4');
-      expect(v84).toMatchObject({ installed: false, offered: false, isSystemDefault: false, domains: 0, binary: null });
+      expect(v84).toMatchObject({ installed: false, offered: false, isSystemDefault: false, domains: 0, binary: null, source: false, prefix: '/opt/keel/php/8.4', packages: [] });
+      expect(v84.note).toMatch(/Built from the official php\.net source into \/opt\/keel\/php\/8\.4 \(about 15 minutes\); packages from ppa:ondrej\/php are not available for ubuntu 26\.04/);
       expect(v84.note).toMatch(/no packages for Ubuntu 26.04 resolute/);
       expect(d.versions.find((v) => v.id === 'system')).toMatchObject({ catalogVersion: null, state: 'installed', installed: true, version: '8.6.1', offered: true, packages: [], repo: null, repoStatus: null });
       expect(app.agent.callsTo('pkg.repo.status')).toHaveLength(1);
       expect(app.agent.callsTo('pkg.repo.status')[0].args).toEqual({ repo: 'php' });
       expect(app.agent.callsTo('pkg.php.versions')).toHaveLength(1);
       expect(app.agent.callsTo('pkg.runtime.detect')).toHaveLength(1);
-      // A probe that fails (offline) leaves the row installable but marked unknown.
+      // A probe that fails (offline) or cannot say still leaves the row installable, from source.
       app.agent.fail('pkg.repo.status', 'command_failed', 'curl: (6) could not resolve host');
       const offline = (await get('/api/software/php/catalog')).body.data;
-      expect(offline.versions.find((v) => v.id === '8.4').state).toBe('unknown');
+      expect(offline.versions.find((v) => v.id === '8.4')).toMatchObject({ state: 'available', method: 'source', repoStatus: null });
       expect(offline.versions.find((v) => v.id === '8.3').state).toBe('installed');
       app.agent.set('pkg.repo.status', () => ({ repo: 'php', family: 'debian', present: false, supported: null, detail: 'ppa:ondrej/php could not be checked: probe failed (curl exit 6)' }));
       const unknown = (await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === '8.4');
-      expect(unknown).toMatchObject({ state: 'unknown', note: 'ppa:ondrej/php could not be checked: probe failed (curl exit 6)' });
+      expect(unknown).toMatchObject({ state: 'available', method: 'source', note: expect.stringMatching(/probe failed \(curl exit 6\)/) });
       app.agent.set('pkg.repo.status', () => ({ repo: 'php', family: 'debian', present: true, supported: true, detail: 'ppa:ondrej/php in ondrej.list' }));
       const online = (await get('/api/software/php/catalog')).body.data;
-      expect(online.versions.find((v) => v.id === '8.4')).toMatchObject({ state: 'available', note: expect.stringMatching(/ondrej/) });
+      expect(online.versions.find((v) => v.id === '8.4')).toMatchObject({ state: 'available', method: 'package', packages: RUNTIMES.php.debian('8.4'), note: expect.stringMatching(/ondrej/) });
+      expect(online.versions.find((v) => v.id === '8.4').prefix).toBeUndefined();
+      // Only a host without any package manager keeps a version unsupported.
+      await provision(false);
+      try {
+        const none = (await get('/api/software/php/catalog')).body.data;
+        expect(none.versions.find((v) => v.id === '8.4')).toMatchObject({ state: 'unsupported', method: null, note: expect.stringMatching(/package manager/) });
+      } finally { await provision(true); }
     } finally {
       app.agent.set('pkg.php.versions', stockVersions);
       app.agent.set('pkg.repo.status', () => REPO_404);
@@ -1048,6 +1180,29 @@ describe('PHP Version Manager', () => {
     expect(app.ctx.software.php.offeredVersions()).toEqual(['8.3']);
     expect(app.ctx.db.prepare("SELECT 1 AS x FROM audit_log WHERE action = 'software.php.remove' AND target = '8.2'").get()).toBeTruthy();
     await put('/api/software/php/offered', { versions: null });
+  });
+
+  it('shows an installed Keel build as a source version and removes it through pkg.php.remove', async () => {
+    keelBuilds = ['7.4'];
+    app.agent.set('pkg.php.versions', () => ({ ...stockVersions(), versions: [PHP, PHP82, keelVersion('7.4')] }));
+    app.agent.set('pkg.php.remove', ({ version }) => { keelBuilds = keelBuilds.filter((m) => m !== version); return { version, layout: 'keel', prefix: `/opt/keel/php/${version}`, unit: `keel-php${version}-fpm`, link: `/usr/local/bin/php${version}`, packages: [], removed: true, output: [`removed /opt/keel/php/${version}`] }; });
+    app.agent.calls.length = 0;
+    try {
+      const row = (await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === '7.4');
+      expect(row).toMatchObject({ catalogVersion: '7.4', state: 'installed', installed: true, source: true, layout: 'keel', method: 'source', label: 'PHP 7.4 (Keel build)', version: '7.4.33', binary: '/opt/keel/php/7.4/bin/php', prefix: '/opt/keel/php/7.4', fpmUnit: 'keel-php7.4-fpm', iniPath: '/opt/keel/php/7.4/lib/php.ini', offered: true, packages: [] });
+      expect((await get('/api/software/php/versions')).body.data.versions.map((v) => v.id)).toEqual(['8.3', '8.2', '7.4']);
+      const res = await post('/api/software/php/remove', { version: '7.4' });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, job.error).toBe('done');
+      expect(job.result).toEqual({ version: '7.4', packages: [], removed: true, layout: 'keel', prefix: '/opt/keel/php/7.4' });
+      expect(app.agent.callsTo('pkg.php.remove').map((c) => c.args)).toEqual([{ version: '7.4', wait: false }]);
+      expect(app.agent.callsTo('pkg.remove')).toHaveLength(0);
+      expect(keelBuilds).toEqual([]);
+    } finally {
+      keelBuilds = [];
+      app.agent.set('pkg.php.versions', stockVersions);
+    }
   });
 });
 

@@ -7,7 +7,7 @@ const phpDebian = (v) => ['php' + v + '-fpm', 'php' + v + '-cli', 'php' + v + '-
 const phpRhel = (v) => { const s = 'php' + v.replace('.', ''); return [s + '-php-fpm', s + '-php-cli', s + '-php-common', s + '-php-mysqlnd', s + '-php-gd', s + '-php-mbstring', s + '-php-xml', s + '-php-pecl-zip', s + '-php-intl', s + '-php-bcmath', s + '-php-opcache', s + '-php-soap', s + '-php-pecl-imagick']; };
 
 export const RUNTIMES = {
-  php: { label: 'PHP', versions: ['8.5', '8.4', '8.3', '8.2', '8.1', '7.4'], repo: 'php', debian: phpDebian, rhel: phpRhel },
+  php: { label: 'PHP', versions: ['8.5', '8.4', '8.3', '8.2', '8.1', '7.4'], repo: 'php', debian: phpDebian, rhel: phpRhel, source: true },
   nodejs: { label: 'Node.js', versions: ['24', '22', '20', '18'], installer: 'node' },
   python: { label: 'Python', versions: ['3.13', '3.12', '3.11', '3.10', '3.9'], repo: 'python', debian: (v) => ['python' + v, 'python' + v + '-venv', 'python' + v + '-dev'], rhel: (v) => ['python' + v, 'python' + v + '-pip', 'python' + v + '-devel'] },
   ruby: { label: 'Ruby', single: true, debian: ['ruby-full'], rhel: ['ruby', 'ruby-devel'] },
@@ -34,6 +34,19 @@ export const TOOLS = [
   { key: 'goaccess', label: 'GoAccess', debian: ['goaccess'], rhel: ['goaccess'] },
   { key: 'clamav', label: 'ClamAV', debian: ['clamav-daemon'], rhel: ['clamd', 'clamav-update'] },
 ];
+
+// What a PHP source build (agent pkg.php.build) needs installed first; the
+// install job puts them in through pkg.install before the build starts.
+export const PHP_BUILD_DEPS = {
+  debian: ['build-essential', 'pkg-config', 'autoconf', 'bison', 're2c', 'xz-utils', 'libxml2-dev', 'libsqlite3-dev', 'libssl-dev', 'libcurl4-openssl-dev', 'libonig-dev', 'libzip-dev', 'libpng-dev', 'libjpeg-dev', 'libwebp-dev', 'libfreetype-dev', 'libicu-dev', 'libsodium-dev', 'libreadline-dev', 'libxslt1-dev', 'libgmp-dev', 'libbz2-dev', 'libffi-dev', 'zlib1g-dev'],
+  rhel: ['gcc', 'gcc-c++', 'make', 'pkgconf-pkg-config', 'autoconf', 'bison', 're2c', 'xz', 'libxml2-devel', 'sqlite-devel', 'openssl-devel', 'libcurl-devel', 'oniguruma-devel', 'libzip-devel', 'libpng-devel', 'libjpeg-turbo-devel', 'libwebp-devel', 'freetype-devel', 'libicu-devel', 'libsodium-devel', 'readline-devel', 'libxslt-devel', 'gmp-devel', 'bzip2-devel', 'libffi-devel', 'zlib-devel'],
+};
+// On RHEL the -devel packages (oniguruma, libzip, libsodium, libwebp, re2c) sit in CRB and EPEL.
+export const PHP_BUILD_REPOS = { debian: [], rhel: ['epel', 'crb'] };
+// php.net's last 7.4 / 8.0 releases predate libxml2 2.12 and ICU 75 and fail to compile on current distributions.
+export const PHP_SOURCE_MINORS = ['8.1', '8.2', '8.3', '8.4', '8.5'];
+export const PHP_SOURCE_PREFIX = '/opt/keel/php';
+export const INSTALL_METHODS = ['package', 'source'];
 
 export const RUNTIME_KEYS = Object.keys(RUNTIMES);
 export const TOOL_KEYS = TOOLS.map((t) => t.key);
@@ -66,8 +79,9 @@ export function runtimeNote(key, family) {
 
 // Turns a validated install request into the exact work for a host family.
 // `family` may be null (no package manager): nodejs still resolves, everything
-// else is refused with a 422 that names the reason.
-export function resolveInstall({ runtime, version, tool }, family) {
+// else is refused with a 422 that names the reason. `method: 'source'` (PHP
+// only) resolves to the php.net build with the family's build dependencies.
+export function resolveInstall({ runtime, version, tool }, family, { method = 'package' } = {}) {
   if (tool) {
     const entry = TOOLS.find((t) => t.key === tool);
     if (!entry) throw unprocessable(`Unknown tool "${tool}"`, { tool: ['Pick one of the catalog tools'] });
@@ -83,6 +97,13 @@ export function resolveInstall({ runtime, version, tool }, family) {
     if (!entry.versions.includes(v)) throw unprocessable(`${entry.label} ${v} is not in the catalog`, { version: [`One of ${entry.versions.join(', ')}`] });
   }
   if (entry.installer === 'node') return { kind: 'runtime', key: runtime, label: entry.label, version: v, packages: [], repos: [], installer: 'node', major: Number(v) };
+  if (method === 'source') {
+    if (!entry.source) throw unprocessable(`${entry.label} has no source build; install it from packages`, { method: ['package'] });
+    if (!PHP_SOURCE_MINORS.includes(v)) throw unprocessable(`${entry.label} ${v} cannot be built from source: php.net's last ${v} release does not compile against this OS's libxml2/ICU`, { version: [`A source build covers ${PHP_SOURCE_MINORS.join(', ')}`] });
+    const deps = family ? PHP_BUILD_DEPS[family] : null;
+    if (!deps) throw unprocessable(`A ${entry.label} source build needs a package manager for its build dependencies`, { method: ['No supported package manager was found on this server'] });
+    return { kind: 'runtime', key: runtime, label: entry.label, version: v, packages: [], repos: [...PHP_BUILD_REPOS[family]], installer: 'php-source', minor: v, deps: [...deps], prefix: `${PHP_SOURCE_PREFIX}/${v}` };
+  }
   const packages = family ? packagesFor(entry, family, v) : null;
   if (!packages) throw unprocessable(`No packages are known for ${entry.label} on this distribution`, { runtime: ['Install it from the package search instead'] });
   return { kind: 'runtime', key: runtime, label: entry.label, version: v, packages, repos: reposFor(entry, family), installer: null };
@@ -94,7 +115,7 @@ const digitsOf = (v) => String(v).replace(/\D/g, '');
 export function detectedVersion(key, version, detected = {}) {
   if (key === 'php') {
     const hit = (detected.php || []).find((p) => p.id === version || /php(\d+)$/.exec(String(p.id))?.[1] === digitsOf(version) || String(p.version || '').startsWith(version + '.'));
-    return hit ? { installed: true, version: hit.version ?? hit.id } : { installed: false, version: null };
+    return hit ? { installed: true, version: hit.version ?? hit.id, source: Boolean(hit.source || hit.layout === 'keel'), layout: hit.layout ?? null } : { installed: false, version: null };
   }
   if (key === 'nodejs') {
     const hit = (detected.node?.versions || []).find((n) => String(n.major) === String(version));

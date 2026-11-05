@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
 import { createSoftwareService } from '../../services/software.js';
-import { RUNTIME_KEYS, TOOL_KEYS } from '../../services/software-runtimes.js';
+import { RUNTIME_KEYS, TOOL_KEYS, INSTALL_METHODS } from '../../services/software-runtimes.js';
 
 // These mirror the agent's pkg.js schemas so bad names are refused with a 422
 // before any op call, and the agent refuses them again regardless.
@@ -25,9 +25,11 @@ const packagesBody = z.object({ packages: z.array(pkgName).min(1).max(200) });
 const profileBody = z.object({ name: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,63}$/, 'Letters, digits, spaces, ".", "_", "+" or "-"'), description: z.string().max(500).optional(), packages: z.object({ debian: z.array(pkgName).max(500).default([]), rhel: z.array(pkgName).max(500).default([]) }).strict() }).strict();
 const catalogVersion = z.string().regex(/^\d+(\.\d+)?$/, 'Version such as 8.3 or 22');
 // Exactly one of runtime / tool; the service checks the version against the catalog (422).
-const runtimeInstallBody = z.object({ runtime: z.enum(RUNTIME_KEYS).optional(), version: catalogVersion.optional(), tool: z.enum(TOOL_KEYS).optional() }).strict()
+// method (PHP only): 'package' from the distro/PPA/Remi repository, 'source' the php.net build; omitted = the service picks by repo state.
+const runtimeInstallBody = z.object({ runtime: z.enum(RUNTIME_KEYS).optional(), version: catalogVersion.optional(), tool: z.enum(TOOL_KEYS).optional(), method: z.enum(INSTALL_METHODS).optional() }).strict()
   .refine((b) => Boolean(b.runtime) !== Boolean(b.tool), { message: 'Give either runtime or tool', path: ['runtime'] })
-  .refine((b) => !(b.tool && b.version), { message: 'Tools have no version', path: ['version'] });
+  .refine((b) => !(b.tool && b.version), { message: 'Tools have no version', path: ['version'] })
+  .refine((b) => !(b.method && b.runtime !== 'php'), { message: 'Only PHP has an install method', path: ['method'] });
 const runtimeRemoveBody = z.object({ runtime: z.literal('nodejs'), version: catalogVersion }).strict();
 const idParam = z.object({ id: fields.id });
 const domainParam = z.object({ domain: fields.hostname });
