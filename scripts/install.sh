@@ -332,7 +332,8 @@ if systemctl is-active --quiet whm-panel; then
   IP=$(hostname -I 2>/dev/null | awk '{print $1}')
   log "Keel is running"
   echo
-  echo "  URL:       https://${IP:-<server-ip>}:2087/   (HTTP: http://${IP:-<server-ip>}:2086/)"
+  echo "  Admin URL: https://${IP:-<server-ip>}:2087/   (HTTP: http://${IP:-<server-ip>}:2086/)"
+  echo "  Accounts:  https://${IP:-<server-ip>}:2083/   (HTTP: http://${IP:-<server-ip>}:2082/) — account holders sign in here"
   echo "  Login:     root"
   if [ -f "$DATA_DIR/initial-admin-password.txt" ]; then
     echo "  Password:  $(awk '/^password:/{print $2}' "$DATA_DIR/initial-admin-password.txt")   (from $DATA_DIR/initial-admin-password.txt — delete it after logging in)"
@@ -341,7 +342,7 @@ if systemctl is-active --quiet whm-panel; then
   fi
   echo
   echo "  Logs:      journalctl -u whm-panel -u whm-agentd -f"
-  echo "  Firewall:  allow TCP 2086 and 2087"
+  echo "  Firewall:  allow TCP 2082, 2083, 2086 and 2087"
   if grep -q '^WHM_LICENSE_HUB_URL=' "$ETC_DIR/panel.env"; then
     echo "  License:   hub $(sed -n 's/^WHM_LICENSE_HUB_URL=//p' "$ETC_DIR/panel.env" | head -1) — enter the key under Server Configuration › Basic Setup › License"
   fi

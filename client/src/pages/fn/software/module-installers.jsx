@@ -1,7 +1,11 @@
 import { Link } from 'react-router-dom';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
-import { RequestError, useJobRunner, JobPanel, InstallerCard } from '../../software/Shared.jsx';
+import { RequestError, useJobRunner, JobPanel, InstallerCard, InstallPackages } from '../../software/Shared.jsx';
+
+// The host-family packages come from the API; the hint is only a fallback for
+// a server that could not resolve them (no package manager detected).
+export const installerPackages = (data, key) => (Array.isArray(data?.packages?.[key]) && data.packages[key].length ? data.packages[key] : []);
 
 const RUNTIMES = [
   { key: 'php', label: 'PHP', tools: ['pecl', 'pear'], hint: 'php-pear (plus php-dev / php-devel to build PECL extensions)' },
@@ -31,7 +35,7 @@ export default function ModuleInstallers({ fn }) {
                     <td><strong>{r.label}</strong></td>
                     <td>{present[r.key] ? data.versions[r.key] || 'installed' : <StatusPill status="not-installed">not installed</StatusPill>}</td>
                     <td>{r.tools.map((t) => <StatusPill key={t} status={present[t] ? 'ok' : 'not-installed'}><span>{t}</span></StatusPill>)}</td>
-                    <td className="muted">{r.tools.some((t) => present[t]) ? '—' : <>Install <code>{r.hint}</code> via <Link to="/software/install-distro-packages">Install Distro Packages</Link></>}</td>
+                    <td className="muted">{r.tools.some((t) => present[t]) ? '—' : installerPackages(data, r.key).length ? <InstallPackages packages={installerPackages(data, r.key)} onFinished={refetch} /> : <>Install <code>{r.hint}</code> with the package manager</>}</td>
                   </tr>
                 ))}
               </tbody>

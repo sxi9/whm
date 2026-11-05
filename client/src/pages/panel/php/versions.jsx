@@ -3,8 +3,9 @@ import { Link } from 'react-router-dom';
 import { Globe, Code2 } from 'lucide-react';
 import { Card, StatusPill, EmptyState, KeyValue } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
-import { Select, Button } from '../../../components/Form.jsx';
+import { Field, Select, Button, FormActions } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
+import { useConfirm } from '../../../components/Modal.jsx';
 import { PanelPage, PendingPill } from '../../../panel/PanelPage.jsx';
 import { usePanelApi, panelApi } from '../../../panel/hooks/usePanel.js';
 import { PANEL_FUNCTION_BY_KEY } from '../../../panel/nav.js';
@@ -19,21 +20,24 @@ export function versionLabel(versions, id) {
 }
 
 // Options for the per-domain dropdown: "inherit the server default" plus every
-// version the plan offers.
+// version the server offers; a version no longer offered stays listed (a
+// domain may still run it) but says so.
 export function versionOptions(data, systemDefault) {
   const list = data?.versions || [];
   const def = data?.defaultId || systemDefault;
-  return [{ value: INHERIT, label: `Server default${def ? ` (${versionLabel(list, def)})` : ''}` }, ...list.map((v) => ({ value: v.id, label: versionLabel(list, v.id) }))];
+  return [{ value: INHERIT, label: `Server default${def ? ` (${versionLabel(list, def)})` : ''}` }, ...list.map((v) => ({ value: v.id, label: `${versionLabel(list, v.id)}${v.legacy ? ' (no longer offered)' : ''}` }))];
 }
 
 export default function PhpVersions({ fn }) {
   const toast = useToast();
+  const confirm = useConfirm();
   const versions = usePanelApi('/php/versions');
   const domains = usePanelApi('/php/domains');
   const [drafts, setDrafts] = useState({});
   const [busy, setBusy] = useState(null);
   const [pending, setPending] = useState({});
   const [q, setQ] = useState('');
+  const [allDraft, setAllDraft] = useState(INHERIT);
 
   const rows = useMemo(() => {
     const list = domains.data?.domains || [];
@@ -43,6 +47,8 @@ export default function PhpVersions({ fn }) {
   const options = useMemo(() => versionOptions(versions.data, domains.data?.systemDefault), [versions.data, domains.data]);
   const current = (d) => d.phpVersion || INHERIT;
   const draftOf = (d) => drafts[d.domain] ?? current(d);
+  const usage = versions.data?.usage || {};
+  const webDomains = domains.data?.domains || [];
 
   const save = async (d) => {
     const chosen = draftOf(d);
@@ -54,7 +60,27 @@ export default function PhpVersions({ fn }) {
       setPending((p) => ({ ...p, [d.domain]: w.applied ? null : w }));
       setDrafts((s) => { const n = { ...s }; delete n[d.domain]; return n; });
       toast.success(w.applied ? `${d.domain} now runs ${version ? versionLabel(versions.data?.versions, version) : 'the server default'}` : `${d.domain} is set to ${version ? versionLabel(versions.data?.versions, version) : 'the server default'}; the web server applies it once it is available`);
-      domains.refetch();
+      domains.refetch(); versions.refetch();
+    } catch (err) {
+      toast.error(err.fields?.version ? `${err.message}: ${err.fields.version.join(', ')}` : err);
+    } finally { setBusy(null); }
+  };
+
+  const saveAll = async () => {
+    const version = allDraft === INHERIT ? null : allDraft;
+    const label = version ? versionLabel(versions.data?.versions, version) : 'the server default';
+    if (webDomains.length > 1 && !(await confirm({ title: `Set all ${webDomains.length} domains to ${label}?`, message: 'Every one of your web domains (main, addon and subdomains) is switched; each domain can be changed again on its own afterwards.', confirmLabel: 'Apply to all' }))) return;
+    setBusy('*');
+    try {
+      const { data } = await panelApi.put('/php/domains', { version });
+      if (data.job) toast.info(`${data.domains.length} domain(s) set to ${label}; the web server applies them in the background (job #${data.job.id})`);
+      else {
+        const failed = (data.results || []).map((r) => ({ ...r, w: webResult(r.web) })).filter((r) => !r.w.applied);
+        setPending((p) => ({ ...p, ...Object.fromEntries(failed.map((r) => [r.domain, r.w])) }));
+        toast[failed.length ? 'warning' : 'success'](failed.length ? `${data.domains.length} domain(s) set to ${label}; ${failed.length} still pending on the web server` : `All ${data.domains.length} domains now run ${label}`);
+      }
+      setDrafts({});
+      domains.refetch(); versions.refetch();
     } catch (err) {
       toast.error(err.fields?.version ? `${err.message}: ${err.fields.version.join(', ')}` : err);
     } finally { setBusy(null); }
@@ -69,7 +95,7 @@ export default function PhpVersions({ fn }) {
     { key: 'effective', label: 'Runs', render: (d) => <>{versionLabel(versions.data?.versions, d.effective)}{d.inherited && <span className="muted small"> · server default</span>}{pending[d.domain] && <> <PendingPill result={pending[d.domain]} /></>}</> },
     { key: 'version', label: 'PHP version', width: 300, render: (d) => (
       <span className="input-group" style={{ alignItems: 'center' }}>
-        <Select value={draftOf(d)} onChange={(v) => setDrafts((s) => ({ ...s, [d.domain]: v }))} options={options} aria-label={`PHP version for ${d.domain}`} disabled={busy === d.domain || !versions.data} />
+        <Select value={draftOf(d)} onChange={(v) => setDrafts((s) => ({ ...s, [d.domain]: v }))} options={options} aria-label={`PHP version for ${d.domain}`} disabled={busy === d.domain || busy === '*' || !versions.data} />
         {draftOf(d) !== current(d) && <Button variant="primary" size="sm" loading={busy === d.domain} onClick={() => save(d)}>Save</Button>}
       </span>
     ) },
@@ -81,19 +107,21 @@ export default function PhpVersions({ fn }) {
       {!pageError && (
         <>
           <RequestError error={versions.error || domains.error} onRetry={() => { versions.refetch(); domains.refetch(); }} />
-          <Card title="Available versions" subtitle={versions.data?.restricted ? 'Your plan limits which versions you can pick.' : 'Installed on this server and available to your domains.'} padded={false}>
+          <Card title="Available versions" subtitle={versions.data?.restricted ? 'Your plan limits which versions you can pick.' : 'Offered by the server administrator and available to your domains.'} padded={false}>
             <div className="table-wrap">
               <table>
-                <thead><tr><th>Version</th><th>Release</th><th>Status</th></tr></thead>
+                <thead><tr><th>Version</th><th>Release</th><th>Your domains</th><th>Status</th></tr></thead>
                 <tbody>
-                  {versions.loading && !versions.data && <tr><td colSpan={3} className="table-state"><span className="spinner" /> Loading…</td></tr>}
-                  {versions.data && versions.data.versions.length === 0 && <tr><td colSpan={3} className="table-state">No PHP version is installed on this server yet</td></tr>}
+                  {versions.loading && !versions.data && <tr><td colSpan={4} className="table-state"><span className="spinner" /> Loading…</td></tr>}
+                  {versions.data && versions.data.versions.length === 0 && <tr><td colSpan={4} className="table-state">No PHP version is offered on this server yet</td></tr>}
                   {(versions.data?.versions || []).map((v) => (
                     <tr key={v.id}>
-                      <td><strong>{v.label || `PHP ${v.id}`}</strong></td>
+                      <td><strong>{v.label || `PHP ${v.id}`}</strong>{v.legacy && <><br /><span className="muted small">no longer offered; domains already on it keep it</span></>}</td>
                       <td>{v.version || '—'}</td>
+                      <td>{usage[v.id] ?? 0}</td>
                       <td className="row-actions" style={{ justifyContent: 'flex-start' }}>
                         {(v.isDefault || v.id === defaultVersion) && <StatusPill status="pending">server default</StatusPill>}
+                        {versions.data?.recommended === v.id && <StatusPill status="ok">recommended</StatusPill>}
                         <AdvisoryPill advisories={v.advisories} />
                         {v.advisories?.[0]?.fixedIn && <span className="muted small">fixed in {v.advisories[0].fixedIn}</span>}
                       </td>
@@ -103,6 +131,17 @@ export default function PhpVersions({ fn }) {
               </table>
             </div>
           </Card>
+
+          {webDomains.length > 1 && (
+            <Card title="Set all domains" subtitle="One version for every domain of your account; change a single domain below afterwards.">
+              <div className="form-narrow">
+                <Field label="PHP version for all domains">
+                  <Select value={allDraft} onChange={setAllDraft} options={options.filter((o) => o.value === INHERIT || !(versions.data?.versions || []).find((v) => v.id === o.value)?.legacy)} aria-label="PHP version for all domains" disabled={busy === '*' || !versions.data} />
+                </Field>
+                <FormActions><Button variant="primary" loading={busy === '*'} disabled={!versions.data} onClick={saveAll}>Apply to {webDomains.length} domains</Button></FormActions>
+              </div>
+            </Card>
+          )}
 
           <Card title="Domains" subtitle="Each domain can run its own version; the server default applies otherwise." padded={false}>
             {!domains.loading && domains.data && domains.data.domains.length === 0 ? (
@@ -118,9 +157,10 @@ export default function PhpVersions({ fn }) {
             <KeyValue items={[
               ['Server default', defaultVersion ? versionLabel(versions.data?.versions, defaultVersion) : 'Not set'],
               versions.data?.planDefault && ['Plan default', versions.data.planDefault],
+              versions.data?.recommended && ['Recommended', versionLabel(versions.data.versions, versions.data.recommended)],
               ['Per-domain settings', <Link key="l" to={INI_PATH}>Edit .user.ini directives</Link>],
             ]} />
-            <p className="muted small" style={{ marginTop: 8 }}>A changed version is applied to the domain's web server configuration right away; existing visitors may need a page reload.</p>
+            <p className="muted small" style={{ marginTop: 8 }}>Only the versions the server administrator offers (and your plan allows) can be picked. A changed version is applied to the domain's web server configuration right away; existing visitors may need a page reload.</p>
           </Card>
         </>
       )}

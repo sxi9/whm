@@ -183,7 +183,7 @@ export function createClustersService(ctx) {
   // 'ns2.example.com', 'ns2.example.com:2087' and 'https://ns2.example.com'
   // are the same peer: addresses are compared in their parsed form.
   const samePeer = (url, exceptId = null) => stmts.peerHosts.all().some((r) => { if (r.id === exceptId) return false; try { return parsePeerHost(r.remote_host).href === url.href; } catch { return false; } });
-  const ownPorts = () => new Set([ctx.config?.port, ctx.config?.tlsPort, 2086, 2087].filter(Boolean).map(String));
+  const ownPorts = () => new Set([ctx.config?.port, ctx.config?.tlsPort, ctx.config?.panelPort, ctx.config?.panelHttpPort, 2082, 2083, 2086, 2087].filter(Boolean).map(String));
   const ownAddresses = () => {
     const set = new Set();
     for (const v of [S('basic.main_ip', ''), S('basic.main_ipv6', '')]) if (v) set.add(String(v).toLowerCase());

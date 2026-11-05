@@ -71,9 +71,12 @@ destroying its sessions (`panel.user.remove` in the audit log).
 
 ## C.2 Signing in and where it lands
 
-Account users sign in on the **same login page** as administrators (`https://server:2087/login`;
-`http://server:2086` only redirects there once TLS is configured, see Part A *Signing in*) with the account
-username and password. After a successful login a role-`user` session lands on **`/panel`**
+Account holders sign in at **`https://<hostname>:2083/`** (cPanel's port; `http://…:2082` only redirects
+there once TLS is configured). That listener serves only the account panel: its login page, `/panel` and the
+panel API; an administrator or reseller who signs in there is refused with `wrong_port` and pointed at
+`https://<hostname>:2087/login`. The administration origin (2087, see Part A *Signing in*) keeps serving
+`/panel` too, so an account user who signs in there lands on the panel as well and "Log in as" keeps
+working. The login form is the same on both ports; the heading says *Account panel* on 2083. After a successful login a role-`user` session lands on **`/panel`**
 (`client/src/auth/home.js` `landingFor`); a remembered location is honoured only when it is inside
 `/panel`, so a user is never sent to a console route and an administrator is never bounced into
 the account panel by a stale link.
@@ -1118,15 +1121,25 @@ only the archives generated or uploaded from the panel** (`retention_class = pan
 
 - **Purpose:** the PHP version each domain runs.
 - **Who:** feature `phpversion`; also while acting.
-- **Screen:** the versions installed on the server — **restricted to the package's
-  `php_versions` list when the package names one** — with the server default and advisories; per
-  domain the current version and a selector (*inherit* to follow the default).
-- **Server:** `GET /php/versions`, `GET /php/domains`, `PUT /php/domains/:domain { version | null }`
-  → *Software › MultiPHP Manager* as the owner, one domain at a time (PHP-FPM pool and vhost
-  rewritten inline).
+- **Screen:** *Available versions* — the versions the server administrator **offers** (the
+  *Offered to accounts* switch in *Software › PHP Version Manager*; all installed ones until the
+  administrator hides one), **further restricted to the package's `php_versions` list when the
+  package names one** — with the server default, a *Recommended* pill (the newest offered version
+  without a critical advisory), advisories and *Your domains* (how many of the account's domains
+  run each). A version no longer offered stays listed as "no longer offered" while one of the
+  account's domains still runs it, so that domain's selector never goes blank. *Set all domains*
+  (shown with two or more web domains): one selector for every main, addon and subdomain at once,
+  with a confirm. *Domains*: per domain the current version and a selector (*inherit* to follow
+  the default).
+- **Server:** `GET /php/versions` (adds `usage`, `recommended`, `versions[].legacy`), `GET /php/domains`,
+  `PUT /php/domains/:domain { version | null }` and `PUT /php/domains { version | null, domains? }`
+  (all web domains when `domains` is omitted; `202` with a job when more than one domain) →
+  *Software › PHP Version Manager* as the owner (PHP-FPM pool and vhost rewritten). Audit
+  `panel.php.version`, `panel.php.version_all`.
 - **Needs:** PHP-FPM and the *Software* category (`503` when not loaded).
-- **Gotchas:** a version the plan does not offer answers `422` ("Pick one of the offered
-  versions").
+- **Gotchas:** a version the plan or the administrator does not offer answers `422` ("Pick one of
+  the offered versions"); a legacy version can stay on the domain that runs it but cannot be picked
+  for another one.
 
 #### 12.2 PHP settings
 
@@ -1430,7 +1443,7 @@ per-field hints. Console-wide codes (`validation_failed`, `agent_unavailable`, `
 | `feature_disabled` (403) | the package sets the named feature to `false`. | Change the package's feature list in *Packages › Feature Manager*, or upgrade the account. |
 | `limit_reached` (409) | a plan `max_*` is used up (`max_addons`, `max_subdomains`, `max_parked`, `max_email`, `max_ftp`, `max_sql`, forwarders per domain). | Remove something or raise the limit in the package. |
 | `exists` (409) | the domain is hosted elsewhere on the server, the mailbox/forwarder/FTP login/file already exists. | Pick another name, or *Overwrite* for files. |
-| `capability_missing` / `binary_not_found` (501) | the daemon or tool behind the screen is missing: `panel-files` (`setpriv`/`runuser`), `archive` (`zip`/`tar`), `cron` (`crontab`), `dovecot`, `exim`, `ftp-virtual` (`pure-pw`/`ftpasswd`), BIND, OpenSSL, an ACME client, the database client, quota tools. | Install it on the host (*Software › Install Distro Packages*), then *Re-check* on the page. |
+| `capability_missing` / `binary_not_found` (501) | the daemon or tool behind the screen is missing: `panel-files` (`setpriv`/`runuser`), `archive` (`zip`/`tar`), `cron` (`crontab`), `dovecot`, `exim`, `ftp-virtual` (`pure-pw`/`ftpasswd`), BIND, OpenSSL, an ACME client, the database client, quota tools. | Install it on the host (*Software › Install Software*: the *Tools* tab has one-click installs for BIND, OpenSSH, ClamAV and the rest, the *Search* tab any package), then *Re-check* on the page. |
 | `shell_disabled` (501) | SSH keys on a package without shell access. | Grant shell access in the package or with *Account Functions › Manage Shell Access*. |
 | `service_unavailable` (503) | a console category the function delegates to is not loaded (DNS, SSL, Software, Backup, Account Functions, Account Information, Email). | Check the panel journal for the category's registration error. |
 | `no_home` (409) | the account has no home directory on this server yet. | Create the Linux user (the account was created without one, or the home was moved). |

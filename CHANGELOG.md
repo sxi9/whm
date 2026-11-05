@@ -9,6 +9,54 @@ not for the commit log.
 ## [Unreleased]
 
 ### Added
+- **Ports mirror cPanel:** the account panel is served on **2083** (HTTPS, `WHM_PANEL_PORT` / `panelPort`) and
+  **2082** (plain, `WHM_PANEL_HTTP_PORT` / `panelHttpPort`); the administration shell stays on 2087/2086. The TLS
+  panel listener opens only with a certificate and shares the certificate reload (SIGHUP / file change) with 2087;
+  the plain one redirects (301) to 2083 and refuses `/api` (426) once TLS is on, like 2086. `0`/`off` disables a
+  listener; a bind failure on 2082/2083 is logged and the administration listener keeps serving.
+- **Shell detection** (`server/src/middleware/shell.js`): `req.shell` is `panel` when the request arrived on a panel
+  port (socket port, never a header), else `admin`. On the panel shell only `/api/health`, `/api/auth/*`,
+  `/api/branding*` and `/api/panel/*` are served; everything else under `/api` answers
+  `403 { error: { code: 'wrong_port', message: 'The administration API is served on port 2087' } }`, and any page
+  other than `/panel*`, `/login*` or an asset redirects to `/panel`.
+- **Login policy:** on the panel shell an administrator or reseller login (password, 2FA completion, OpenID Connect)
+  creates no session and answers `403 wrong_port` with `adminUrl: https://<host>:2087/login` (audit
+  `auth.login.wrong_port`); the administration shell accepts every role as before.
+- `GET /api/branding` and `GET /api/auth/me` carry `shell`; `/api/auth/me` gives administrators `panelUrl`
+  (`https://<hostname>:2083/`), which is also the base of the password-reset mail link. Cluster self-detection knows
+  the panel ports.
+- `scripts/install.sh` prints both URLs and the firewall reminder for 2082, 2083, 2086 and 2087;
+  `deploy/whm.conf.example`, `.env.example`, `docs/INSTALL.md` §2.2 and the configuration table, `docs/MANUAL.md`
+  and `docs/MANUAL-partC.md` describe the split; `e2e/panel-check.cjs` runs the account sweep on `PANEL_BASE`
+  (default `https://127.0.0.1:2083`).
+- Tests: `server/test/shell-ports.test.js`.
+- Software › PHP Version Manager (the former MultiPHP Manager, same URL): every PHP version of the
+  catalog on one page with its state (installed, available, not available for this OS, unknown),
+  PHP-FPM unit, default pill and domain count; per row Install (runtime installer job), Remove
+  (`POST /api/software/php/remove` → job `software.php.remove` → agent `pkg.php.remove`; refused for
+  the system default, the only version or a version domains use), Set as default, and an
+  *Offered to accounts* switch (`PUT /api/software/php/offered`, setting `php.offered_versions`);
+  `GET /api/software/php/catalog`; `?install=<version>` deep link. On Ubuntu the `ondrej/php` PPA is
+  probed for the host's series first (agent `pkg.repo.status`), so a release it does not carry
+  (26.04) is shown as unsupported instead of breaking `apt-get update`. Account panel › PHP versions:
+  only offered versions are selectable (a version a domain already runs stays as "no longer offered"),
+  a *Recommended* pill, *Your domains* usage counts and *Set all domains* (`PUT /api/panel/php/domains
+  { version }`, `202` job with several domains; audit `panel.php.version_all`). Contract §52.
+- Software › Install Software (the former Install Distro Packages page, same URL): one-click installs
+  of PHP 8.5–7.4 (ondrej PPA on Ubuntu, packages.sury.org on Debian, Remi on RHEL), Node.js 24/22/20/18
+  (official nodejs.org builds side by side under `/opt/keel/node/<major>` as `node<major>`; the panel's
+  own Node.js is never touched), Python 3.13–3.9 (deadsnakes on Ubuntu), Ruby, Go, Composer and a tool
+  grid (Git, ImageMagick, FFmpeg, Redis, Memcached, Certbot, BIND, ClamAV, …); `GET /api/software/runtimes`,
+  `POST /api/software/runtimes/install|remove`, job `software.runtime.install` (adds the repository,
+  refreshes the index only when one was added, restores the PHP CLI default the installer may have
+  switched, re-detects and fails when still missing). Pages that find a tool missing (transfers, access
+  grants, DNS cluster, Module Installers, PHP Version Manager, quotas, statistics software, phpMyAdmin,
+  locales, IP functions) install it in place; the raw package search stays as the *Search* tab with
+  `?tab=search&q=` deep links. Agent ops `pkg.os.release`, `pkg.repo.ensure` (enum: php, python, epel,
+  remi), `pkg.node.list|install|remove`, `pkg.runtime.detect`; contract §51. Node tarballs are extracted
+  with `--no-same-owner --no-same-permissions` and the extracted `bin/` must be root-owned before it goes
+  live; every curl fetch pins `--proto-redir =https`; the composer probe runs with `--no-plugins
+  --no-scripts` from `/`; `db.phpmyadmin.detect` adds `package` (bare package name) next to `packageHint`.
 - Live-host verification (2026-11-04/05): the panel was audited on a production Ubuntu 26.04
   install (Exim unsplit layout, Dovecot 2.4, MariaDB, pure-ftpd, BIND, certbot); the fixes below
   come from its 29 confirmed findings.

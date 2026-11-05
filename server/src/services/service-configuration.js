@@ -27,6 +27,7 @@ import { ssoEndpoint } from '../lib/sso-endpoint.js';
 //   web.applyMailserverTls({ minProtocol, cipherList, cipherSuites, preferServerCiphers }, req)       -> ssl-tls presets for Dovecot
 //   web.removeVhost(domain, req)                    -> account panel (contract §33): web.vhost.remove + web_vhosts row; never a main vhost
 //   web.vhostsForAccount(username)                  -> the account's web_vhosts rows, shaped
+//   web.vhostsUsingPhp(version)                     -> count of web_vhosts rows rendered with that PHP version (PHP Version Manager removal guard)
 //   web.applyVirtualMail({ enabled }, req)          -> account panel (contract §36): Dovecot 98-whm-virtual-auth.conf + Exim router/transport/auth slots + spam DATA ACL
 //   web.ftp.enableVirtualUsers(req)                 -> account panel (contract §37): pure-ftpd PureDB / proftpd AuthUserFile in the managed config
 //   web.hostname.ensure(req, { reload, strict })    -> server-hostname site (contract §41): keel-host.conf with the Apache service certificate; idempotent
@@ -644,6 +645,7 @@ export function createServiceConfigService(ctx) {
     vhostsByUser: db.prepare('SELECT * FROM web_vhosts WHERE username = ? ORDER BY type, domain'),
     vhostsAll: db.prepare('SELECT * FROM web_vhosts ORDER BY username, type, domain'),
     vhostsByIp: db.prepare('SELECT * FROM web_vhosts WHERE ip = ?'),
+    vhostsUsingPhp: db.prepare('SELECT COUNT(*) AS n FROM web_vhosts WHERE php_version = ?'),
     upsertVhost: db.prepare(`INSERT INTO web_vhosts (domain, account_id, username, type, docroot, aliases_json, ip, ipv6, php_version, ssl_json, redirects_json, custom_directives, status)
       VALUES (@domain, @account_id, @username, @type, @docroot, @aliases_json, @ip, @ipv6, @php_version, @ssl_json, @redirects_json, @custom_directives, 'pending')
       ON CONFLICT (domain) DO UPDATE SET account_id = excluded.account_id, username = excluded.username, type = excluded.type, docroot = excluded.docroot, aliases_json = excluded.aliases_json, ip = excluded.ip, ipv6 = excluded.ipv6,
@@ -1985,6 +1987,7 @@ export function createServiceConfigService(ctx) {
     ensureVhost, syncAccount: ensureVhost, removeAccount, applySsl, removeSsl, setRedirects, addAlias, removeAlias, setAccountIpv6, replaceIp, setPhpVersion, writePhpPool, setListenPorts,
     reload: (req) => apache.reload(req), restart: (req) => apache.restart(req), configtest: () => op('web.configtest'),
     vhostFor: (domain) => shapeVhost(stmts.vhostByDomain.get(domain)) ?? null, syncAllJob, removeVhost, vhostsForAccount,
+    vhostsUsingPhp: (version) => stmts.vhostsUsingPhp.get(version).n,
     ensureEximAclChain: (req) => exim.ensureEximAclChain(req), applyEximTls: (preset, req) => exim.applyEximTls(preset, req), applyMailserverTls: (preset, req) => mailserver.applyMailserverTls(preset, req),
     virtualMail, applyVirtualMail: (input, req) => virtualMail.apply(input, req), spamScanning,
     hostname: hostnameSite, hostApps, webmail,

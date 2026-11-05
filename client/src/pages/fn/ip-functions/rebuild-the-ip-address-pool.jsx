@@ -28,7 +28,7 @@ export default function RebuildTheIpAddressPool({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Compares the addresses bound to the host (ip -j addr) with the panel's inventory: imports addresses the panel did not know about, refreshes interfaces and netmasks, re-detects the main IP and recomputes which addresses are free, shared, dedicated, reserved or missing." />
-      <Iproute2Notice meta={meta} />
+      <Iproute2Notice meta={meta} onInstalled={refetch} />
       <Card title="Rebuild">
         <p className="muted">Last rebuild: {meta?.lastRebuild ? formatDate(meta.lastRebuild) : 'never'}. Nothing is removed from the host; addresses recorded in the panel but absent from the interfaces are flagged as "not on host". DHCP/SLAAC leases and IPv6 privacy addresses are imported as dynamic: shown, but never re-added at boot nor handed to accounts.</p>
         <FormActions><Button variant="primary" loading={busy} onClick={rebuild}>Rebuild the IP address pool</Button></FormActions>

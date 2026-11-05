@@ -883,6 +883,52 @@ defineOp('pkg.php.default.set', {
   },
 });
 
+// The package glob of one PHP build, by packaging layout; only names the
+// package manager reports under that glob are passed on, so the argv never
+// carries anything but installed package names.
+export function phpPackageGlob(v) {
+  if (v.layout === 'debian') return `php${v.id}-*`;
+  if (v.layout === 'ea4') return `${v.id}-*`;
+  if (v.layout === 'remi' || v.layout === 'scl') return `${v.id}-php-*`;
+  if (v.layout === 'rhel') return 'php-*';
+  return null;
+}
+
+// Discovery reads /etc/php, /opt/cpanel, /opt/remi and /usr/bin, which no test host carries; tests swap `discover`.
+export const phpDiscovery = { discover: discoverPhp };
+
+defineOp('pkg.php.remove', {
+  description: 'Remove every package of one installed PHP version; refuses the CLI default and the last remaining version, keeps /etc/php/<ver> unless purge',
+  destructive: true,
+  timeoutMs: LONG,
+  schema: z.object({ version: phpVersionId, purge: z.boolean().default(false), wait }).strict(),
+  run: async ({ version, purge, wait: waitFor }, ctx) => {
+    const { versions, defaultId } = phpDiscovery.discover();
+    const v = versions.find((x) => x.id === version);
+    if (!v) throw new OpError('not_found', `PHP version "${version}" is not installed on this server`);
+    if (v.id === defaultId) throw new OpError('refused', `PHP ${version} is the CLI default (/usr/bin/php); make another version the default first`);
+    if (versions.length < 2) throw new OpError('refused', `PHP ${version} is the only installed version; install another one before removing it`);
+    const glob = phpPackageGlob(v);
+    if (!glob) throw new OpError('unsupported', `PHP ${version} (${v.binary}) is not a packaged build this panel can remove`);
+    const pm = requireManager();
+    const prefix = glob.slice(0, -1);
+    let packages;
+    if (pm.family === 'debian') {
+      const r = await exec('dpkg-query', ['-W', '-f', '${binary:Package}\n', glob], { allowFailure: true, maxBuffer: BIG });
+      // Multi-arch packages print as name:arch; apt-get removes every architecture by the bare name.
+      packages = r.stdout.split('\n').map((l) => l.trim().replace(/:[a-z0-9-]+$/, '')).filter((l) => l.startsWith(prefix));
+    } else {
+      const r = await exec('rpm', ['-qa', '--qf', '%{NAME}\n', glob], { allowFailure: true, maxBuffer: BIG });
+      packages = r.stdout.split('\n').map((l) => l.trim()).filter((l) => l.startsWith(prefix));
+      if (v.layout === 'rhel') { const base = await exec('rpm', ['-q', '--qf', '%{NAME}\n', '--', 'php'], { allowFailure: true }); if (base.code === 0) packages.push('php'); }
+    }
+    packages = [...new Set(packages)].filter((p) => pkgName.safeParse(p).success);
+    if (!packages.length) throw new OpError('not_found', `No ${glob} packages are installed; PHP ${version} was not installed from packages`);
+    const argv = pm.family === 'debian' ? [purge ? 'purge' : 'remove', '-y', '-q', ...APT_DPKG_OPTS, '--', ...packages] : ['-y', '-q', 'remove', '--', ...packages];
+    return { version, manager: pm.manager, packages, purge, ...finished(await runLong({ kind: 'remove', bin: pm.binary, argv, env: APT_ENV, wait: waitFor }, ctx)) };
+  },
+});
+
 defineOp('pkg.php.ini.read', {
   description: 'Read a PHP version\'s php.ini (parsed directives + raw content)',
   schema: z.object({ version: phpVersionId, sapi: z.enum(['fpm', 'apache2', 'cli', 'php']).optional() }).strict(),
@@ -1248,5 +1294,437 @@ defineOp('pkg.nginx.proxy.remove', {
     const restored = Object.keys(state);
     if (restored.length) { ctx.assertAllowedPath(NGINX_MAIN_CONF, 'write'); restoreStockDefaults(state); fs.rmSync(NGINX_STATE_FILE, { force: true }); }
     return { path: NGINX_PROXY_CONF, removed: existed, stockDefaultsRestored: restored, configtest: await nginxConfigTest() };
+  },
+});
+
+// --- runtimes: OS release, extra repositories, side-by-side Node.js ----------
+// Everything here is driven by enums and integers: the repository is one of
+// four names, the Node.js major an integer, and every path is built from
+// constants. Tests move the directories with WHM_* overrides, which must stay
+// under an allowed root exactly like WHM_PKG_RUN_DIR.
+
+export const APT_SOURCES_DIR = '/etc/apt/sources.list.d';
+export const APT_KEYRINGS_DIR = '/etc/apt/keyrings';
+export const YUM_REPOS_DIR = '/etc/yum.repos.d';
+export const NODE_DIR = '/opt/keel/node';
+export const LOCAL_BIN_DIR = '/usr/local/bin';
+export const OS_RELEASE_FILE = '/etc/os-release';
+const aptSourcesDir = () => process.env.WHM_APT_SOURCES_DIR || APT_SOURCES_DIR;
+const aptKeyringsDir = () => process.env.WHM_APT_KEYRINGS_DIR || APT_KEYRINGS_DIR;
+const yumReposDir = () => process.env.WHM_YUM_REPOS_DIR || YUM_REPOS_DIR;
+const nodeDir = () => process.env.WHM_NODE_DIR || NODE_DIR;
+const localBinDir = () => process.env.WHM_LOCAL_BIN_DIR || LOCAL_BIN_DIR;
+const osReleaseFile = () => process.env.WHM_OS_RELEASE_FILE || OS_RELEASE_FILE;
+
+const SURY_KEY_URL = 'https://packages.sury.org/php/apt.gpg';
+const SURY_KEY_FILE = 'keel-sury-php.gpg';
+const SURY_LIST_FILE = 'keel-sury-php.list';
+const PPAS = { php: 'ondrej/php', python: 'deadsnakes/ppa' };
+const REMI_MAJORS = [8, 9, 10];
+const PROBE_TIMEOUT = 15_000;
+const CURL_SHORT = ['-fsSL', '--proto', '=https', '--proto-redir', '=https', '--max-time', '60'];
+const CURL_LONG = ['-fsSL', '--proto', '=https', '--proto-redir', '=https', '--max-time', '600'];
+
+export function parseOsRelease(text) {
+  const kv = {};
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    value = value.replace(/\\(.)/g, '$1');
+    if (!(key in kv)) kv[key] = value;
+  }
+  const id = kv.ID ? kv.ID.toLowerCase() : null;
+  const idLike = (kv.ID_LIKE || '').toLowerCase().split(/\s+/).filter(Boolean);
+  const all = [id, ...idLike].filter(Boolean);
+  const family = all.some((x) => x === 'debian' || x === 'ubuntu') ? 'debian' : all.some((x) => ['rhel', 'fedora', 'centos'].includes(x)) ? 'rhel' : null;
+  return { id, idLike, versionId: kv.VERSION_ID || null, codename: kv.VERSION_CODENAME || kv.UBUNTU_CODENAME || null, family };
+}
+
+function readOsRelease(ctx) {
+  const file = osReleaseFile();
+  if (file !== OS_RELEASE_FILE) ctx.assertAllowedPath(file, 'read');
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); } catch { try { text = fs.readFileSync('/usr/lib/os-release', 'utf8'); } catch { text = ''; } }
+  return parseOsRelease(text);
+}
+
+defineOp('pkg.os.release', {
+  description: 'Distribution identity from /etc/os-release (id, id_like, version, codename, family)',
+  run: async (_args, ctx) => readOsRelease(ctx),
+});
+
+const readSmall = (file) => { try { const st = fs.lstatSync(file); if (!st.isFile() || st.size > 256 * 1024) return ''; return fs.readFileSync(file, 'utf8'); } catch { return ''; } };
+
+function sourceMentioning(dir, needles) {
+  for (const name of safeReaddir(dir)) {
+    if (!/\.(list|sources)$/.test(name)) continue;
+    const full = path.join(dir, name);
+    const text = readSmall(full);
+    if (needles.some((n) => text.includes(n))) return full;
+  }
+  return null;
+}
+
+const ppaPresent = (ppa, ctx) => { const dir = aptSourcesDir(); ctx.assertAllowedPath(dir, 'read'); return sourceMentioning(dir, [`ppa.launchpadcontent.net/${ppa}`, `ppa.launchpad.net/${ppa}`]); };
+
+// A PPA without a series for this release (ondrej/php has none for Ubuntu
+// 26.04 "resolute") breaks every later apt-get update once added, so the
+// series index is asked for first. A failed probe (offline host) answers
+// null and the caller carries on as before.
+const CURL_HEAD = ['-fsSI', '--proto', '=https', '--proto-redir', '=https', '--max-time', '20', '-o', '/dev/null', '-w', '%{http_code}'];
+const CODENAME_RE = /^[a-z][a-z0-9]{1,31}$/;
+export async function probePpaSeries(ppa, codename) {
+  if (!CODENAME_RE.test(codename || '')) return { supported: null, error: 'codename unknown' };
+  const url = `https://ppa.launchpadcontent.net/${ppa}/ubuntu/dists/${codename}/InRelease`;
+  let r;
+  try { r = await exec('curl', [...CURL_HEAD, url], { allowFailure: true, timeoutMs: 30_000 }); } catch (err) { return { supported: null, error: err.message }; }
+  const status = Number.parseInt(String(r.stdout).trim().slice(-3), 10);
+  if (r.code === 0 || status === 200) return { supported: true };
+  if (status === 404) return { supported: false, status };
+  return { supported: null, error: `probe failed (curl exit ${r.code}${status ? `, HTTP ${status}` : ''})` };
+}
+
+const unsupportedPpa = (ppa, os) => `ppa:${ppa} has no packages for Ubuntu ${os.versionId || ''} ${os.codename || ''}`.replace(/\s+/g, ' ').trim() + '; the distribution ships its own versions only';
+
+async function ensurePpa(repo, ctx) {
+  const ppa = PPAS[repo];
+  const found = ppaPresent(ppa, ctx);
+  if (found) return { action: 'present', detail: `ppa:${ppa} in ${found}` };
+  const os = readOsRelease(ctx);
+  const probe = await probePpaSeries(ppa, os.codename);
+  if (probe.supported === false) return { action: 'unsupported', detail: unsupportedPpa(ppa, os) };
+  ctx.assertAllowedPath(aptSourcesDir(), 'write');
+  if (!hasBinary('add-apt-repository')) {
+    await exec('apt-get', ['install', '-y', '-q', ...APT_DPKG_OPTS, '--', 'software-properties-common'], { env: APT_ENV, timeoutMs: LONG, maxBuffer: BIG });
+    if (!hasBinary('add-apt-repository')) throw new OpError('binary_not_found', 'add-apt-repository is still missing after installing software-properties-common');
+  }
+  await exec('add-apt-repository', ['-y', '--no-update', `ppa:${ppa}`], { env: APT_ENV, timeoutMs: 10 * 60_000, maxBuffer: BIG });
+  return { action: 'added', detail: `ppa:${ppa} (${ppaPresent(ppa, ctx) || 'added by add-apt-repository'})` };
+}
+
+// The key is fetched into a name created O_EXCL|O_NOFOLLOW under the keyrings
+// directory (root-owned 0755), checked to still be a regular file, then renamed
+// into place; the list file goes through writeAtomic.
+async function ensureSury(codename, ctx) {
+  const sources = aptSourcesDir();
+  const keyrings = aptKeyringsDir();
+  ctx.assertAllowedPath(sources, 'read');
+  const found = sourceMentioning(sources, ['packages.sury.org/php']);
+  if (found) return { action: 'present', detail: `packages.sury.org in ${found}` };
+  if (!CODENAME_RE.test(codename || '')) throw new OpError('unsupported', 'The Debian codename is unknown (VERSION_CODENAME missing from /etc/os-release or not a plain series name)');
+  ctx.assertAllowedPath(sources, 'write');
+  ctx.assertAllowedPath(keyrings, 'write');
+  fs.mkdirSync(keyrings, { recursive: true, mode: 0o755 });
+  fs.mkdirSync(sources, { recursive: true, mode: 0o755 });
+  const keyPath = path.join(keyrings, SURY_KEY_FILE);
+  const tmp = path.join(keyrings, `.${SURY_KEY_FILE}.whm-${randomSuffix()}`);
+  fs.closeSync(fs.openSync(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o644));
+  try {
+    await exec('curl', [...CURL_SHORT, '-o', tmp, SURY_KEY_URL], { timeoutMs: 90_000 });
+    const st = fs.lstatSync(tmp);
+    if (!st.isFile() || st.size === 0) throw new OpError('download_failed', `The sury signing key download at ${tmp} is empty or not a regular file`);
+    fs.chmodSync(tmp, 0o644);
+    fs.renameSync(tmp, keyPath);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
+  const listPath = path.join(sources, SURY_LIST_FILE);
+  writeAtomic(listPath, `deb [signed-by=${keyPath}] https://packages.sury.org/php/ ${codename} main\n`);
+  return { action: 'added', detail: `${listPath} (${codename}), key ${keyPath}` };
+}
+
+async function rpmInstalled(name) {
+  const r = await exec('rpm', ['-q', '--', name], { allowFailure: true, timeoutMs: 60_000 });
+  return r.code === 0;
+}
+
+async function ensureEpel(ctx) {
+  ctx.assertAllowedPath(yumReposDir(), 'read');
+  if (await rpmInstalled('epel-release')) return { action: 'present', detail: 'epel-release is installed' };
+  ctx.assertAllowedPath(yumReposDir(), 'write');
+  await exec('dnf', ['-y', '-q', 'install', '--', 'epel-release'], { timeoutMs: LONG, maxBuffer: BIG });
+  return { action: 'added', detail: 'epel-release installed' };
+}
+
+async function ensureRemi(os, ctx) {
+  ctx.assertAllowedPath(yumReposDir(), 'read');
+  if (await rpmInstalled('remi-release')) return { action: 'present', detail: 'remi-release is installed' };
+  const major = Number.parseInt(String(os.versionId || ''), 10);
+  if (!REMI_MAJORS.includes(major)) return { action: 'unsupported', detail: `Remi provides packages for Enterprise Linux ${REMI_MAJORS.join(', ')}; this host reports version ${os.versionId || 'unknown'}` };
+  ctx.assertAllowedPath(yumReposDir(), 'write');
+  await exec('dnf', ['-y', '-q', 'install', '--', `https://rpms.remirepo.net/enterprise/remi-release-${major}.rpm`], { timeoutMs: LONG, maxBuffer: BIG });
+  return { action: 'added', detail: `remi-release-${major} installed` };
+}
+
+const combine = (steps) => ({ action: steps.some((s) => s.action === 'unsupported') ? 'unsupported' : steps.some((s) => s.action === 'added') ? 'added' : 'present', detail: steps.map((s) => s.detail).filter(Boolean).join('; ') });
+
+defineOp('pkg.repo.ensure', {
+  description: 'Make sure one of the curated package repositories (php, python, epel, remi) is configured; idempotent, never refreshes the index',
+  timeoutMs: LONG,
+  schema: z.object({ repo: z.enum(['php', 'python', 'epel', 'remi']) }).strict(),
+  run: async ({ repo }, ctx) => {
+    const os = readOsRelease(ctx);
+    const base = { repo, family: os.family };
+    if (os.family === 'debian') {
+      if (repo === 'epel' || repo === 'remi') return { ...base, action: 'unsupported', detail: `${repo} is an Enterprise Linux repository; this host is ${os.id || 'Debian-family'}` };
+      if (os.id === 'ubuntu') return { ...base, ...(await ensurePpa(repo, ctx)) };
+      if (os.id === 'debian') {
+        if (repo === 'php') return { ...base, ...(await ensureSury(os.codename, ctx)) };
+        return { ...base, action: 'unsupported', detail: 'Debian ships one Python version; the deadsnakes PPA is Ubuntu only' };
+      }
+      return { ...base, action: 'unsupported', detail: `No ${repo} repository is known for ${os.id || 'this Debian derivative'}` };
+    }
+    if (os.family === 'rhel') {
+      if (repo === 'epel') return { ...base, ...(await ensureEpel(ctx)) };
+      if (repo === 'remi') return { ...base, ...(await ensureRemi(os, ctx)) };
+      if (repo === 'php') {
+        const epel = await ensureEpel(ctx);
+        const remi = await ensureRemi(os, ctx);
+        return { ...base, ...combine([epel, remi]) };
+      }
+      return { ...base, action: 'present', detail: 'Python versions come from AppStream' };
+    }
+    return { ...base, action: 'unsupported', detail: `Unknown distribution family (ID=${os.id || '?'})` };
+  },
+});
+
+defineOp('pkg.repo.status', {
+  description: 'Whether one of the curated repositories is configured and whether it publishes packages for this release; never writes',
+  timeoutMs: 60_000,
+  schema: z.object({ repo: z.enum(['php', 'python', 'epel', 'remi']) }).strict(),
+  run: async ({ repo }, ctx) => {
+    const os = readOsRelease(ctx);
+    const base = { repo, family: os.family };
+    if (os.family === 'debian') {
+      if (repo === 'epel' || repo === 'remi') return { ...base, present: false, supported: false, detail: `${repo} is an Enterprise Linux repository; this host is ${os.id || 'Debian-family'}` };
+      if (os.id === 'ubuntu') {
+        const ppa = PPAS[repo];
+        const found = ppaPresent(ppa, ctx);
+        if (found) return { ...base, present: true, supported: true, detail: `ppa:${ppa} in ${found}` };
+        const probe = await probePpaSeries(ppa, os.codename);
+        if (probe.supported === false) return { ...base, present: false, supported: false, detail: unsupportedPpa(ppa, os) };
+        return { ...base, present: false, supported: probe.supported, detail: probe.supported ? `ppa:${ppa} publishes ${os.codename}` : `ppa:${ppa} could not be checked: ${probe.error}` };
+      }
+      if (os.id === 'debian') {
+        if (repo === 'php') { const sources = aptSourcesDir(); ctx.assertAllowedPath(sources, 'read'); const found = sourceMentioning(sources, ['packages.sury.org/php']); return { ...base, present: Boolean(found), supported: true, detail: found ? `packages.sury.org in ${found}` : 'packages.sury.org supports every stable Debian release' }; }
+        return { ...base, present: false, supported: false, detail: 'Debian ships one Python version; the deadsnakes PPA is Ubuntu only' };
+      }
+      return { ...base, present: false, supported: false, detail: `No ${repo} repository is known for ${os.id || 'this Debian derivative'}` };
+    }
+    if (os.family === 'rhel') {
+      if (repo === 'python') return { ...base, present: true, supported: true, detail: 'Python versions come from AppStream' };
+      ctx.assertAllowedPath(yumReposDir(), 'read');
+      const epel = repo !== 'remi' ? await rpmInstalled('epel-release') : null;
+      const remi = repo !== 'epel' ? await rpmInstalled('remi-release') : null;
+      const major = Number.parseInt(String(os.versionId || ''), 10);
+      const remiOk = REMI_MAJORS.includes(major);
+      if (repo === 'epel') return { ...base, present: epel, supported: true, detail: epel ? 'epel-release is installed' : 'epel-release is installable' };
+      const present = repo === 'remi' ? remi : Boolean(epel && remi);
+      if (!present && !remiOk) return { ...base, present, supported: false, detail: `Remi provides packages for Enterprise Linux ${REMI_MAJORS.join(', ')}; this host reports version ${os.versionId || 'unknown'}` };
+      return { ...base, present, supported: true, detail: present ? 'remi-release is installed' : `remi-release-${major} is installable` };
+    }
+    return { ...base, present: false, supported: false, detail: `Unknown distribution family (ID=${os.id || '?'})` };
+  },
+});
+
+// --- Node.js builds under /opt/keel/node/<major> ---------------------------
+
+const nodeMajor = z.number().int().min(16).max(30);
+const NODE_ARCH = { x64: 'x64', arm64: 'arm64' };
+const NODE_LINKS = ['node', 'npm', 'npx'];
+
+export function pickNodeTarball(shasums, major, arch) {
+  const re = new RegExp(`^([0-9a-f]{64})\\s+(node-v(${Number(major)}\\.\\d+\\.\\d+)-linux-${arch}\\.tar\\.xz)\\s*$`);
+  for (const line of String(shasums || '').split('\n')) {
+    const m = re.exec(line.trim());
+    if (m) return { file: m[2], sha256: m[1], version: `v${m[3]}` };
+  }
+  return null;
+}
+
+export function verifySha256(buffer, hex) {
+  const actual = crypto.createHash('sha256').update(buffer).digest();
+  let expected;
+  try { expected = Buffer.from(String(hex).trim().toLowerCase(), 'hex'); } catch { return false; }
+  return expected.length === 32 && crypto.timingSafeEqual(actual, expected);
+}
+
+const versionOf = (stdout, re = /v?(\d+\.\d+(?:\.\d+)?)/) => stdout.match(re)?.[1] ?? null;
+
+async function probeVersion(bin, argv = ['--version'], re) {
+  if (!hasBinary(bin)) return null;
+  try {
+    // cwd pinned to / so composer (and anything else that looks at the working directory) never boots project plugins or scripts from an account tree.
+    const r = await exec(bin, argv, { allowFailure: true, timeoutMs: PROBE_TIMEOUT, cwd: '/', env: { COMPOSER_ALLOW_SUPERUSER: '1', COMPOSER_NO_INTERACTION: '1' } });
+    return versionOf(`${r.stdout}\n${r.stderr}`, re);
+  } catch { return null; }
+}
+
+// Every entry of <extracted>/bin must belong to the user running the agent (root on a real host); a foreign uid means tar kept the archive's ownership and the tree is not safe to expose through /usr/local/bin.
+function assertOwnedByUs(binDir, file) {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  if (uid === null) return;
+  const entries = [binDir, ...fs.readdirSync(binDir).map((n) => path.join(binDir, n))];
+  for (const p of entries) {
+    const st = fs.lstatSync(p);
+    if (st.uid !== uid) throw new OpError('extract_failed', `${file}: ${p} is owned by uid ${st.uid} after extraction, expected ${uid}; nothing was installed`);
+  }
+}
+
+async function nodeVersionAt(bin) {
+  try { const r = await exec(bin, ['--version'], { allowFailure: true, timeoutMs: PROBE_TIMEOUT }); return r.code === 0 ? r.stdout.trim() || null : null; } catch { return null; }
+}
+
+async function listNode(ctx) {
+  const dir = nodeDir();
+  if (dir !== NODE_DIR) ctx.assertAllowedPath(dir, 'read');
+  const versions = [];
+  for (const name of safeReaddir(dir).sort((a, b) => Number(a) - Number(b))) {
+    if (!/^\d+$/.test(name)) continue;
+    const bin = path.join(dir, name, 'bin', 'node');
+    if (!fs.existsSync(bin)) continue;
+    versions.push({ major: Number(name), version: await nodeVersionAt(bin), path: path.join(dir, name), bin });
+  }
+  const systemPath = resolveBinary('node');
+  const system = systemPath ? { version: await nodeVersionAt(systemPath), path: systemPath } : null;
+  return { system, versions };
+}
+
+defineOp('pkg.node.list', {
+  description: 'Node.js builds under /opt/keel/node plus the system node on PATH',
+  run: async (_args, ctx) => listNode(ctx),
+});
+
+// Only a link that already points into the Node.js tree is replaced; anything
+// else at that name belongs to the operator and is reported, not overwritten.
+function placeSymlink(link, target, root) {
+  let st = null;
+  try { st = fs.lstatSync(link); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  if (st) {
+    if (!st.isSymbolicLink()) return { link, placed: false, reason: 'exists and is not a symbolic link' };
+    const current = fs.readlinkSync(link);
+    if (current !== target && !current.startsWith(`${root}/`)) return { link, placed: false, reason: `points to ${current}` };
+  }
+  const tmp = path.join(path.dirname(link), `.${path.basename(link)}.whm-${randomSuffix()}`);
+  fs.symlinkSync(target, tmp);
+  try { fs.renameSync(tmp, link); } catch (err) { fs.rmSync(tmp, { force: true }); throw err; }
+  return { link, placed: true };
+}
+
+defineOp('pkg.node.install', {
+  description: 'Install the latest official nodejs.org build of a major version under /opt/keel/node/<major> with node<major>/npm<major>/npx<major> links; the system node is never touched',
+  timeoutMs: 15 * 60_000,
+  schema: z.object({ major: nodeMajor, wait }).strict(),
+  run: async ({ major }, ctx) => {
+    const arch = NODE_ARCH[process.arch];
+    if (!arch) throw new OpError('unsupported', `No official Node.js build exists for the ${process.arch} architecture`);
+    const root = nodeDir();
+    const binDir = localBinDir();
+    ctx.assertAllowedPath(root, 'write');
+    ctx.assertAllowedPath(binDir, 'write');
+    fs.mkdirSync(root, { recursive: true, mode: 0o755 });
+    const output = [];
+    const tmpdir = fs.mkdtempSync(path.join(root, '.tmp-'));
+    try {
+      const index = await exec('curl', [...CURL_LONG, `https://nodejs.org/dist/latest-v${major}.x/SHASUMS256.txt`], { timeoutMs: 620_000, maxBuffer: BIG });
+      const pick = pickNodeTarball(index.stdout, major, arch);
+      if (!pick) throw new OpError('not_found', `nodejs.org publishes no linux-${arch} build for Node.js ${major}.x`);
+      output.push(`Downloading ${pick.file} (${pick.version})`);
+      const archive = path.join(tmpdir, pick.file);
+      await exec('curl', [...CURL_LONG, '-o', archive, `https://nodejs.org/dist/latest-v${major}.x/${pick.file}`], { timeoutMs: 620_000, maxBuffer: BIG });
+      const st = fs.lstatSync(archive);
+      if (!st.isFile()) throw new OpError('download_failed', `${archive} is not a regular file`);
+      if (!verifySha256(fs.readFileSync(archive), pick.sha256)) throw new OpError('checksum_mismatch', `${pick.file} does not match the SHA-256 published by nodejs.org; nothing was installed`);
+      output.push(`Checksum verified (${pick.sha256.slice(0, 12)})`);
+      // Running as root, GNU tar defaults to --same-owner/-p and would hand the tree to the uid recorded in the archive (nodejs.org builds carry uid 1000, an ordinary hosting account). Pin ownership and modes to the extracting user and verify before the tree is put in place.
+      await exec('tar', ['--no-same-owner', '--no-same-permissions', '-xJf', archive, '-C', tmpdir], { timeoutMs: 10 * 60_000, maxBuffer: BIG });
+      fs.rmSync(archive, { force: true });
+      const extracted = path.join(tmpdir, pick.file.replace(/\.tar\.xz$/, ''));
+      if (!fs.existsSync(path.join(extracted, 'bin', 'node'))) throw new OpError('extract_failed', `${pick.file} did not contain bin/node`);
+      assertOwnedByUs(path.join(extracted, 'bin'), pick.file);
+      const target = path.join(root, String(major));
+      let old = null;
+      if (fs.existsSync(target)) { old = path.join(root, `.old-${randomSuffix()}`); fs.renameSync(target, old); }
+      try { fs.renameSync(extracted, target); } catch (err) { if (old) fs.renameSync(old, target); throw err; }
+      if (old) { fs.rmSync(old, { recursive: true, force: true }); output.push(`Replaced the previous Node.js ${major} build`); }
+      const symlinks = [];
+      const conflicts = [];
+      for (const name of NODE_LINKS) {
+        const placed = placeSymlink(path.join(binDir, `${name}${major}`), path.join(target, 'bin', name), root);
+        if (placed.placed) symlinks.push(placed.link); else { conflicts.push(placed); output.push(`Left ${placed.link} alone: it ${placed.reason}`); }
+      }
+      const version = (await nodeVersionAt(path.join(target, 'bin', 'node'))) || pick.version;
+      output.push(`Node.js ${version} installed under ${target}`);
+      return { major, version, path: target, bin: path.join(target, 'bin', 'node'), symlinks, ...(conflicts.length ? { conflicts } : {}), output };
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  },
+});
+
+defineOp('pkg.node.remove', {
+  description: 'Remove a Node.js build under /opt/keel/node/<major> and the node<major>/npm<major>/npx<major> links that point into it',
+  destructive: true,
+  schema: z.object({ major: nodeMajor }).strict(),
+  run: async ({ major }, ctx) => {
+    const root = nodeDir();
+    const binDir = localBinDir();
+    ctx.assertAllowedPath(root, 'write');
+    ctx.assertAllowedPath(binDir, 'write');
+    const target = path.join(root, String(major));
+    const symlinks = [];
+    for (const name of NODE_LINKS) {
+      const link = path.join(binDir, `${name}${major}`);
+      try {
+        const st = fs.lstatSync(link);
+        if (st.isSymbolicLink() && fs.readlinkSync(link).startsWith(`${target}/`)) { fs.unlinkSync(link); symlinks.push(link); }
+      } catch (err) { if (err.code !== 'ENOENT') throw err; }
+    }
+    let removed = false;
+    try {
+      const st = fs.lstatSync(target);
+      if (st.isSymbolicLink()) throw new OpError('refused', `${target} is a symbolic link; refusing to follow it`);
+      fs.rmSync(target, { recursive: true, force: true });
+      removed = true;
+    } catch (err) { if (err.code !== 'ENOENT') throw err; }
+    return { major, removed, path: target, symlinks };
+  },
+});
+
+// --- what is installed, for the one-click catalog ----------------------------
+
+const PYTHON_MINORS = ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14'];
+
+defineOp('pkg.runtime.detect', {
+  description: 'Installed language runtimes (PHP, Node.js, Python, Ruby, Go, Composer, Perl) found by probing their binaries; installs nothing',
+  timeoutMs: 120_000,
+  run: async (_args, ctx) => {
+    const os = readOsRelease(ctx);
+    const php = [];
+    for (const v of discoverPhp().versions) {
+      let version = null;
+      try { const r = await exec(v.binary, ['-n', '-r', 'echo PHP_VERSION;'], { allowFailure: true, timeoutMs: PROBE_TIMEOUT }); version = r.stdout.trim().match(/^\d[\d.]*/)?.[0] ?? null; } catch { /* unreadable binary */ }
+      php.push({ id: v.id, version });
+    }
+    const node = await listNode(ctx);
+    const python = [];
+    for (const minor of PYTHON_MINORS) {
+      const bin = resolveBinary(`python${minor}`);
+      if (!bin) continue;
+      python.push({ minor, version: await probeVersion(`python${minor}`, ['--version'], /Python (\d+\.\d+(?:\.\d+)?)/), bin });
+    }
+    return {
+      os, php, node, python,
+      ruby: await probeVersion('ruby', ['--version'], /ruby (\d+\.\d+(?:\.\d+)?)/),
+      go: await probeVersion('go', ['version'], /go(\d+\.\d+(?:\.\d+)?)/),
+      composer: await probeVersion('composer', ['--version', '--no-ansi', '--no-interaction', '--no-plugins', '--no-scripts'], /Composer(?: version)? (\d+\.\d+(?:\.\d+)?)/),
+      perl: await probeVersion('perl', ['-e', 'print $^V'], /v?(\d+\.\d+(?:\.\d+)?)/),
+    };
   },
 });

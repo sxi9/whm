@@ -1141,3 +1141,139 @@ Reports are the account's own files, rendered and read back as the account; noth
   `MESSAGE_STATUSES`) and a case-insensitive `q` over sender/recipient/subject/detail/id, then paged (`pageSize` ≤ 100,
   default 25). Route `GET /api/panel/email/usage/messages`. `GET /email/usage` keeps its `recent` (100 rows) for
   compatibility.
+
+## 51. Software: one-click runtime installs (`ctx.software.runtimes`, agent `pkg.repo.ensure` / `pkg.node.*` / `pkg.runtime.detect`)
+- **Purpose:** *Software › Install Software* (nav slug stays `install-distro-packages`, no new nav function) offers a
+  curated catalog of PHP, Node.js, Python, Ruby, Go, Composer and common tools with one-click installs, and every page
+  that finds a package missing installs it in place (`InstallPackages` / `RuntimeInstaller` in the client) instead of
+  sending the operator to the raw package search, which stays as the *Search* tab. The catalog is static data in
+  `services/software-runtimes.js`: `RUNTIMES` (`php` 8.5…7.4 with the ondrej/sury/Remi package lists per version,
+  `nodejs` 24/22/20/18 via `installer: 'node'`, `python` 3.13…3.9, and the `single` runtimes `ruby`, `go`, `composer`),
+  `TOOLS` (`git`, `imagemagick`, `ffmpeg`, `redis`, `memcached`, `certbot`, `unzip`, `build-essential`, `python3-pip`,
+  `cpanminus`, `php-pear`, `openssh-server`, `bind`, `iproute2`, `locales`, `goaccess`, `clamav`; each a `debian` and a
+  `rhel` package list), with `resolveInstall({ runtime, version, tool }, family)` → `{ kind, key, label, version,
+  packages, repos, installer, major? }` (422 for a version outside the catalog, a missing version, or a family with no
+  packages; `single` runtimes ignore `version`), `reposFor`, `packagesFor`, `runtimeNote` and `detectedVersion` exported
+  for tests.
+- **Agent ops** (`ops/pkg.js`; `DEFAULT_ALLOWED_ROOTS` gains `/etc/apt/sources.list.d`, `/etc/apt/keyrings`,
+  `/etc/yum.repos.d`, `/opt/keel/node`, `/usr/local/bin`; test overrides `WHM_APT_SOURCES_DIR` / `WHM_APT_KEYRINGS_DIR` /
+  `WHM_YUM_REPOS_DIR` / `WHM_NODE_DIR` must stay under an allowed root, as `PKG_RUN_DIR` does):
+  `pkg.os.release` (read-only) → `{ id, idLike, versionId, codename, family: 'debian' | 'rhel' | null }` from
+  `/etc/os-release` (pure `parseOsRelease(text)`).
+  `pkg.repo.ensure { repo: 'php' | 'python' | 'epel' | 'remi' }` (enum, nothing free-form; idempotent) → `{ repo, family,
+  action: 'present' | 'added' | 'unsupported', detail }`: Ubuntu adds `ppa:ondrej/php` / `ppa:deadsnakes/ppa` through
+  `add-apt-repository -y --no-update` (installing `software-properties-common` first when missing; present when a file
+  under `/etc/apt/sources.list.d` mentions `ppa.launchpadcontent.net/<owner>/<ppa>` or the legacy `ppa.launchpad.net`
+  host); Debian `php` fetches `https://packages.sury.org/php/apt.gpg` (`curl -fsSL --proto =https --max-time 60` into a
+  temp file under `/etc/apt/keyrings`, renamed to `keel-sury-php.gpg`, 0644) and writes
+  `/etc/apt/sources.list.d/keel-sury-php.list` (`deb [signed-by=…] https://packages.sury.org/php/ <codename> main`);
+  Debian `python` → `unsupported` (distro version only); RHEL `epel` → `dnf -y -q install epel-release`, `remi` →
+  `dnf -y -q install https://rpms.remirepo.net/enterprise/remi-release-<major>.rpm` (`<major>` 8, 9 or 10, else
+  `unsupported`), present when `rpm -q <name>` exits 0; `php` on RHEL ensures epel then remi, `python` on RHEL is
+  `present` (AppStream). Writes go through `writeAtomic` / `O_EXCL|O_NOFOLLOW`; the op never refreshes the index (the
+  caller runs `pkg.update_index`).
+  `pkg.node.list` → `{ system: { version, path } | null, versions: [{ major, version, path, bin }] }` from
+  `/opt/keel/node/<major>/bin/node` plus `node` on PATH. `pkg.node.install { major: int 16–30, wait? }` installs the
+  official nodejs.org build side by side under `/opt/keel/node/<major>`: `SHASUMS256.txt` of `latest-v<major>.x` (pure
+  `pickNodeTarball(shasums, major, arch)` → `{ file, sha256, version }`, arch `x64` / `arm64`), download with
+  `curl -fsSL --proto =https --max-time 600` into a mkdtemp `/opt/keel/node/.tmp-<rand>`, sha256 verified with
+  `node:crypto` (pure `verifySha256(buffer, hex)`; a mismatch refuses and leaves no partial directory), `tar -xJf`,
+  atomic rename (an existing major is renamed to `.old-<rand>` and removed), then symlinks `/usr/local/bin/node<major>`,
+  `npm<major>`, `npx<major>` (lstat-checked: only a symlink that already points under `/opt/keel/node` is replaced) →
+  `{ major, version, path, bin, symlinks }`. `pkg.node.remove { major }` (destructive) removes the directory and the three
+  symlinks when they point into it. `pkg.runtime.detect` (read-only, probes with `hasBinary` + `--version`, 15 s each,
+  never installs) → `{ os, php: [{ id, version }], node: <pkg.node.list>, python: [{ minor, version, bin }] (3.8–3.14 on
+  PATH), ruby, go, composer, perl: version | null }`.
+- **Service** (`services/software.js`, `ctx.software.runtimes`): `catalog()` → `{ family, os, manager, capability,
+  runtimes: [{ key, label, single, installer, versions: [{ id, label, installed, version, packages, repo, note, path?,
+  bin? }] }], tools: [{ key, label, packages, installed }] }` from ONE `pkg.runtime.detect` plus ONE `pkg.list_installed`
+  (prefix list over every tool package; `installed: null` without a package manager); `note` carries the hints
+  ("deadsnakes on Ubuntu, distro version only on Debian", "installed under /opt/keel/node/<major>, the panel's own
+  Node.js stays untouched", "Remi collection, /opt/remi/php<nn>"). `install({ runtime, version } | { tool }, user, req)`
+  → `{ job, target, packages }` (202; job type `software.runtime.install`, audit `software.runtime.install` with target
+  `php:8.3` / `nodejs:22` / `bind`). `remove({ runtime: 'nodejs', version })` → job `software.runtime.remove`
+  (`pkg.node.remove`); PHP and Python packages are removed from the *Installed* tab as before. `recent()` → the last 20
+  jobs of either type. `modules.installers()` adds `family` and `packages: { php: [php-pear, php-dev], perl:
+  [cpanminus], ruby: [ruby-full], python3: [python3-pip] }` (RHEL: `php-pear php-devel`, `perl-App-cpanminus`,
+  `ruby ruby-devel`, `python3-pip`) so Module Installers and Install a Perl Module install a missing installer in place.
+- **Job steps** (`software.runtime.install`, each logged with progress): (1) for every repo in `plan.repos`
+  `pkg.repo.ensure { repo }` — `'unsupported'` fails the job with the agent's `detail`, and one `'added'` triggers a single
+  `pkg.update_index` through `runLongOp`; (2) `runLongOp(job, 'pkg.install', { packages })` with the exact catalog list,
+  or `runLongOp(job, 'pkg.node.install', { major })` for Node.js (no distro package); (3) PHP only:
+  `pkg.php.versions().defaultId` is read before the install and, when the installer moved the CLI default (ondrej's
+  alternatives prefer the newest), `pkg.php.default.set` puts the previous default back and the job log says so;
+  (4) `capabilities.refresh()`; (5) `pkg.runtime.detect` again — a runtime still missing fails the job; result
+  `{ kind, runtime | tool, version, packages, installed: true, detected, path?, bin?, symlinks? }`.
+- **Routes** (`routes/categories/software.js`, all `requireRoot`): `GET /api/software/runtimes`,
+  `GET /api/software/runtimes/recent`, `POST /api/software/runtimes/install` with `{ runtime: enum(RUNTIME_KEYS),
+  version?: /^\d+(\.\d+)?$/ }` or `{ tool: enum(TOOL_KEYS) }` (strict, exactly one of the two, no version with a tool)
+  → 202, `POST /api/software/runtimes/remove { runtime: 'nodejs', version }` → 202. A version outside the catalog is a
+  422 from the service; package installs without a package manager answer 501 while the catalog itself always loads.
+- **Invariants:** repositories are picked from the enum only, never from a request string; the panel's own Node.js
+  (`node` on PATH) is never replaced — catalog builds live under `/opt/keel/node/<major>` and are reached as
+  `node<major>`; the PHP CLI default the operator chose survives a PHP install; the agent writes only under the added
+  allowed roots and every command is an argv array; nothing was removed from the raw package search. Node tarballs are
+  extracted with `tar --no-same-owner --no-same-permissions` and every entry of the extracted `bin/` must be owned by
+  the agent's own uid (root) before the tree is renamed into `/opt/keel/node/<major>` — a foreign uid fails the op with
+  `extract_failed`, so no hosting account ever owns a binary that root or `node<major>` users execute; every `curl`
+  fetch (sury key, SHASUMS256.txt, tarball) carries `--proto =https --proto-redir =https`, so a redirect can never
+  downgrade to plaintext; `pkg.runtime.detect` probes composer with `--no-plugins --no-scripts` and every probe runs
+  with `cwd: '/'`, so no project `composer.json` can load code into a root process.
+
+## 52. PHP Version Manager (`ctx.software.php.catalog/remove/setOffered/offeredVersions/usage`, agent `pkg.php.remove`, `pkg.repo.status`)
+- **Purpose:** *Software › PHP Version Manager* (nav key/route stay `software/multiphp-manager` via `{ slug }`) shows EVERY
+  PHP version of the one-click catalog (§51) plus whatever else is installed, with Install / Remove / Set as default
+  and an "Offered to accounts" switch per version; the account panel (`/panel/php/versions`) lets the holder pick a
+  version per domain or for all domains at once, restricted to what the root offers and the plan allows.
+- **Agent, PPA series probe (`probePpaSeries(ppa, codename)`, exported):** `curl -fsSI --proto =https --proto-redir
+  =https --max-time 20 -o /dev/null -w %{http_code} https://ppa.launchpadcontent.net/<owner>/<ppa>/ubuntu/dists/<codename>/InRelease`
+  (`allowFailure`) → `{ supported: true }` on 200, `{ supported: false, status }` on 404, `{ supported: null, error }` when
+  the probe itself failed. `ensurePpa` (inside `pkg.repo.ensure`) probes before `add-apt-repository` and answers
+  `{ action: 'unsupported', detail: 'ppa:<owner>/<ppa> has no packages for Ubuntu <version> <codename>; …' }` on a 404
+  series (ondrej/php has no `resolute` series; an added absent series breaks every later `apt-get update`); a failed
+  probe falls through to the add so offline installs keep working.
+- **Agent, `pkg.repo.status { repo: php|python|epel|remi }`** (read-only, never writes) →
+  `{ repo, family, present: bool, supported: true|false|null, detail }`. Ubuntu: `present` = the PPA is in
+  `sources.list.d`, `supported` = true when present else the probe; Debian php: present = sury list exists, supported true;
+  Debian python: supported false; RHEL: epel/remi/php via `rpm -q`, Remi only on EL 8/9/10, python always
+  present+supported (AppStream); unknown family: supported false.
+- **Agent, `pkg.php.remove { version: phpVersionId, purge?: false, wait?: true }`** (destructive): resolves the version with
+  `discoverPhp()` (`phpDiscovery.discover`, swappable by tests), `OpError('refused')` when it is the CLI default or the only
+  installed version, `not_found` when unknown or when no package of the build is installed. Packages come from the
+  package manager under the layout glob (`phpPackageGlob`: Debian `php<ver>-*` via `dpkg-query -W -f '${binary:Package}\n'`,
+  Remi/SCL `<id>-php-*`, EA4 `<id>-*`, RHEL stock `php-*` + `php` via `rpm -qa --qf '%{NAME}\n'`), filtered to the prefix
+  and the package-name alphabet, then `apt-get remove|purge -y -q <APT_DPKG_OPTS> -- <pkgs>` / `dnf|yum -y -q remove --
+  <pkgs>` through `runLong` (kind `remove`, `wait: false` capable) → `{ version, manager, packages, purge, background,
+  code|run, output }`. `/etc/php/<ver>` stays unless `purge: true`.
+- **Service (`ctx.software.php`):** `catalog()` → `{ family, os, manager, capability, phpCapability, effectiveDefault,
+  configuredDefault, offered: string[]|null, versions: [{ id, catalogVersion, label, state: 'installed'|'available'|
+  'unsupported'|'unknown', installed, version, binary, iniPath, fpmInstalled, fpmActive, fpmUnit, isDefault (CLI),
+  isSystemDefault, offered, domains, packages, repo, repoStatus: { present, supported, detail }|null, advisories, note }] }`
+  from ONE `pkg.php.versions` (skipped without the `php` capability), ONE `runtimes.catalog()` and ONE `pkg.repo.status`
+  per distinct repo (a failing probe → `repoStatus: null`, state `'unknown'`, Install still allowed). State: installed →
+  `installed`; not installed and (`repo === null` or `repoStatus.present` or `repoStatus.supported === true`) →
+  `available`; `supported === false` → `unsupported` with `note = repoStatus.detail`; otherwise `unknown`. Installed versions
+  outside the catalog (ea-php83, a distro-only build) are appended as `installed` with `catalogVersion: null`; `id` is
+  the installed id when a catalog row matched an installed build, the catalog version otherwise. `usage()` → `{ [id]:
+  count }` from one SQL over `account_domains.php_version` (a main domain without a row inherits and counts for nothing).
+  `offeredVersions()` → ids or null (= every installed version). `setOffered(ids|null, user, req)` validates each id
+  against the installed versions (422 `versions`), persists setting `php.offered_versions`, audits `software.php.offered`,
+  returns `{ offered }`. `remove(version, user, req)` → 422 (`version` field) when not installed, when it is
+  `effectiveDefault`, when it is the only installed version or when `usage()[version] > 0` (message carries the count);
+  otherwise job `software.php.remove { version }` → `runLongOp(job, 'pkg.php.remove', { version })`, `capabilities.refresh()`,
+  the id dropped from `php.offered_versions`; audit `software.php.remove`; returns `{ job, version }` (202); job result
+  `{ version, packages, removed: true }`. `runtimes.remove` stays Node.js-only and points PHP to this manager.
+- **Routes (`/api/software`, all `requireRoot`):** `GET /php/catalog`, `GET /php/usage`, `PUT /php/offered { versions:
+  phpVersionId[] (≤50) | null }`, `POST /php/remove { version }` → 202 `{ job, version }`.
+- **Account panel (`ctx.panelPhp`):** `versions(scope)` filters by the plan's `php_versions` AND the root's offered list; a
+  version pinned on one of the account's web domains stays listed with `legacy: true` (never selectable); each entry carries
+  `usage` (this account's domains on it) and the answer adds `offered: bool` (a root list exists), `usage: { [id]: n }`,
+  `recommended` (first non-legacy id without a `critical` advisory). `setAll(scope, version|null, { domains? }, req)` →
+  `PUT /api/panel/php/domains { version: phpVersionId|null, domains?: hostname[] }` — omitted domains = every web hostname
+  (main/addon/sub, never parked/alias; a foreign or parked name is a 404), one `software.php.setDomainVersion` call (job
+  when more than one domain), audit `panel.php.version_all`, returns `{ domains, phpVersion, job: { id }|null, results }`
+  (202 with a job). `setVersion` uses the same selectability check (422 on a non-offered or legacy version).
+- **Invariants:** the system default and a version any domain is pinned to are never removed; the last installed
+  version is never removed; the offered list is a panel-only filter — root and reseller listings (`GET /php/versions`)
+  are unchanged; a PPA is added only after its series answered 200 (or the probe could not run); `pkg.repo.status` never
+  writes; every package name on the removal argv came from the package manager's own listing under a fixed glob.

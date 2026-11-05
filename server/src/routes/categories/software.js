@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
 import { createSoftwareService } from '../../services/software.js';
+import { RUNTIME_KEYS, TOOL_KEYS } from '../../services/software-runtimes.js';
 
 // These mirror the agent's pkg.js schemas so bad names are refused with a 422
 // before any op call, and the agent refuses them again regardless.
@@ -22,6 +23,12 @@ const iniBody = z.object({ content: z.string().max(4 * 1024 * 1024).optional(), 
   .refine((b) => b.content != null || b.directives != null, { message: 'Provide content or directives', path: ['content'] });
 const packagesBody = z.object({ packages: z.array(pkgName).min(1).max(200) });
 const profileBody = z.object({ name: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,63}$/, 'Letters, digits, spaces, ".", "_", "+" or "-"'), description: z.string().max(500).optional(), packages: z.object({ debian: z.array(pkgName).max(500).default([]), rhel: z.array(pkgName).max(500).default([]) }).strict() }).strict();
+const catalogVersion = z.string().regex(/^\d+(\.\d+)?$/, 'Version such as 8.3 or 22');
+// Exactly one of runtime / tool; the service checks the version against the catalog (422).
+const runtimeInstallBody = z.object({ runtime: z.enum(RUNTIME_KEYS).optional(), version: catalogVersion.optional(), tool: z.enum(TOOL_KEYS).optional() }).strict()
+  .refine((b) => Boolean(b.runtime) !== Boolean(b.tool), { message: 'Give either runtime or tool', path: ['runtime'] })
+  .refine((b) => !(b.tool && b.version), { message: 'Tools have no version', path: ['version'] });
+const runtimeRemoveBody = z.object({ runtime: z.literal('nodejs'), version: catalogVersion }).strict();
 const idParam = z.object({ id: fields.id });
 const domainParam = z.object({ domain: fields.hostname });
 const httpUrl = z.string().max(2048).url().refine((u) => /^https?:\/\//i.test(u), 'Must be an http(s) URL');
@@ -73,6 +80,12 @@ export async function register(ctx) {
   r.post('/pkg/remove', requireRoot, validate({ body: packagesBody.extend({ purge: z.boolean().default(false) }).strict() }), accepted((req) => s.pkg.remove(req.body.packages, req.user, req, { purge: req.body.purge })));
   r.post('/pkg/update-index', requireRoot, accepted((req) => s.pkg.updateIndex(req.user, req)));
 
+  // Install Software: one-click runtimes and tools (contract §51)
+  r.get('/runtimes', requireRoot, wrap(() => s.runtimes.catalog()));
+  r.get('/runtimes/recent', requireRoot, wrap(() => s.runtimes.recent()));
+  r.post('/runtimes/install', requireRoot, validate({ body: runtimeInstallBody }), accepted((req) => s.runtimes.install(req.body, req.user, req)));
+  r.post('/runtimes/remove', requireRoot, validate({ body: runtimeRemoveBody }), accepted((req) => s.runtimes.remove(req.body, req.user, req)));
+
   // System Update
   // Page loads get the recorded check; ?refresh=true runs the simulation again.
   r.get('/update/status', requireRoot, validate({ query: z.object({ refresh: z.enum(['true', 'false']).default('false') }) }), wrap((req) => s.update.status({ cached: req.query.refresh !== 'true' })));
@@ -97,7 +110,11 @@ export async function register(ctx) {
   r.post('/panel/update/check', requireRoot, wrap((req) => s.panel.check(req)));
   r.put('/panel/update/settings', requireRoot, validate({ body: z.object({ url: z.union([z.literal(''), httpUrl]).optional(), tier: z.enum(['stable', 'release', 'edge']).optional(), autoUpdate: z.boolean().optional() }).strict() }), wrap((req) => s.panel.updateSettings(req.body, req)));
 
-  // MultiPHP Manager
+  // PHP Version Manager (contract §52)
+  r.get('/php/catalog', requireRoot, wrap(() => s.php.catalog()));
+  r.get('/php/usage', requireRoot, wrap(() => s.php.usage()));
+  r.put('/php/offered', requireRoot, validate({ body: z.object({ versions: z.array(phpVersionId).max(50).nullable() }).strict() }), wrap((req) => s.php.setOffered(req.body.versions, req.user, req)));
+  r.post('/php/remove', requireRoot, validate({ body: z.object({ version: phpVersionId }).strict() }), accepted((req) => s.php.remove(req.body.version, req.user, req)));
   r.get('/php/versions', requireReseller, validate({ query: z.object({ modules: z.enum(['true', 'false']).default('false') }) }), wrap((req) => s.php.versions({ modules: req.query.modules === 'true', user: req.user })));
   r.put('/php/default', requireRoot, validate({ body: z.object({ version: phpVersionId }).strict() }), maybeAccepted((req) => s.php.setSystemDefault(req.body.version, req.user, req)));
   r.get('/php/domains', requireReseller, validate({ query: pagination.extend({ account: fields.username.optional(), pageSize: z.coerce.number().int().min(1).max(500).default(500), sort: z.enum(['domain', 'account', 'type', 'effective']).optional() }) }), wrap((req) => s.php.domains(req.user, req.query)));

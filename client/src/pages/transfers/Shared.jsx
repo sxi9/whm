@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, formatDate, formatBytes } from '../../components/Common.jsx';
+import { InstallPackages } from '../../components/InstallPackages.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
 import { Button, FormActions, Select, Toggle, Field } from '../../components/Form.jsx';
 import { ProgressLog } from '../../components/ProgressLog.jsx';
@@ -14,17 +15,27 @@ export const stepPill = (status) => <StatusPill status={STEP_TONE[status] || sta
 
 // Which local tools the transfer features need; shown on every page so a missing
 // package is explained before a run fails.
-export function ToolingNotice({ caps, needs = [] }) {
-  if (!caps) return null;
-  const missing = needs.filter((n) => caps[n] && !caps[n].installed);
+// caps[n].packages is a hint of the form 'debian-name / rhel-name' (or a single name); the install button needs the one for this host.
+export const toolPackages = (hint, family) => {
+  const names = String(hint || '').split(' / ').map((s) => s.trim()).filter(Boolean);
+  if (!names.length) return [];
+  if (names.length === 1) return names[0].split(/\s+/);
+  if (!family) return [];
+  return (family === 'rhel' ? names[1] : names[0]).split(/\s+/);
+};
+
+export function ToolingNotice({ caps, needs = [], onInstalled }) {
+  const missing = caps ? needs.filter((n) => caps[n] && !caps[n].installed) : [];
+  const pkg = useApi('/software/pkg/detect', { enabled: missing.length > 0 });
   if (!missing.length) return null;
+  const family = pkg.data?.family;
   return (
     <div className="banner banner-warning">
       <AlertTriangle size={18} />
       <div>
         <strong>Missing tools on this server</strong>
-        <ul>{missing.map((n) => <li key={n}>{caps[n].label}: install <code>{caps[n].packages}</code></li>)}</ul>
-        <p className="muted">Install them under <Link to="/software/install-distro-packages">Install Distro Packages</Link>. Steps that need them finish as pending or are refused until then.</p>
+        <ul>{missing.map((n) => <li key={n} style={{ marginBottom: 6 }}>{caps[n].label}: <code>{caps[n].packages}</code> <InstallPackages packages={toolPackages(caps[n].packages, family)} label={`Install ${caps[n].label}`} onFinished={onInstalled} /></li>)}</ul>
+        <p className="muted">Steps that need them finish as pending or are refused until they are installed.</p>
       </div>
     </div>
   );

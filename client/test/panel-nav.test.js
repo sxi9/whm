@@ -142,4 +142,13 @@ describe('auth/home.js resolves the shell per role', () => {
     expect(landingFor({ role: 'root' }, undefined)).toBe('/');
     expect(landingFor({ role: 'user' }, null)).toBe('/panel');
   });
+
+  it('the panel shell sends every role to /panel and keeps only panel locations', () => {
+    expect(homePathFor({ role: 'root' }, 'panel')).toBe('/panel');
+    expect(homePathFor(null, 'panel')).toBe('/panel');
+    expect(inShellFor({ role: 'root' }, '/account-information/list-accounts', 'panel')).toBe(false);
+    expect(inShellFor({ role: 'root' }, '/panel/domains', 'panel')).toBe(true);
+    expect(landingFor({ role: 'reseller' }, '/packages/add-a-package', 'panel')).toBe('/panel');
+    expect(landingFor({ role: 'root' }, '/packages/add-a-package', 'admin')).toBe('/packages/add-a-package');
+  });
 });

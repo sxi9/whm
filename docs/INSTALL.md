@@ -111,11 +111,15 @@ In both modes the ops, their argument schemas and the allowed path roots are ide
 |---|---|---|---|
 | **2086/tcp** | whm-panel | `WHM_HOST` (default `0.0.0.0`) | HTTP interface and API. Always opened. With TLS configured (and `httpRedirect` left on) it only redirects browsers to 2087 and refuses API calls with `426 tls_required`; `GET /api/health` keeps answering. |
 | **2087/tcp** | whm-panel | `WHM_HOST` | HTTPS interface; opened only when both `WHM_TLS_CERT` and `WHM_TLS_KEY` (or `tlsCert`/`tlsKey` in `whm.conf`) are set. Minimum TLS 1.2. |
+| **2083/tcp** | whm-panel | `WHM_HOST` | HTTPS **account panel** listener (`WHM_PANEL_PORT`): serves only `/panel`, the login page and the panel API (`/api/panel`, `/api/auth`, `/api/branding`, `/api/health`); every other `/api` path answers `403 wrong_port`, every other page redirects to `/panel`, and an administrator or reseller login is refused with `403 wrong_port` (sign in on 2087). Opened only with TLS, like 2087. `0`/`off` disables it; a bind failure is logged and 2087 keeps serving. |
+| **2082/tcp** | whm-panel | `WHM_HOST` | Plain account-panel listener (`WHM_PANEL_HTTP_PORT`): with TLS it only redirects browsers to 2083 and refuses API calls (`426`), like 2086; without TLS (development) it serves the account panel in clear. |
 | **7443/tcp** | whm-hub | `host` (default `0.0.0.0`) | Hub HTTPS: `/v1/*` license API, `/v1/market/*`, `/v1/dev/*`, `/v1/admin/*`, `/v1/reseller/*`, `/v1/portal/*`, and the portal SPA at `/` when `serve_ui` is on. |
 | **7440/tcp** | whm-hub | `127.0.0.1` only | `/healthz` and `/metrics`. `loopback_port: 0` disables it. Never expose it. |
 | `/run/whm-agent.sock` | whm-agentd | Unix socket, `0660 root:whmpanel` | Panel → agent requests (split mode). |
 
-Open 2086 and 2087 (and 7443 on a hub host) in your firewall; the installer prints the reminder.
+Open 2082, 2083, 2086 and 2087 (and 7443 on a hub host) in your firewall; the installer prints the reminder.
+Administrators use `https://<host>:2087/`, account holders `https://<host>:2083/` (the 2087 origin still
+serves `/panel` for "Log in as").
 
 ### 2.3 Daemons the panel manages
 
@@ -848,6 +852,8 @@ Precedence (`loadConfig()` in `server/src/config.js`): environment variables →
 | `WHM_HOST` | `host` | `0.0.0.0` | Bind address for both listeners. |
 | `WHM_PORT` | `port` | `2086` | HTTP port. |
 | `WHM_TLS_PORT` | `tlsPort` | `2087` | HTTPS port (only with cert + key). |
+| `WHM_PANEL_PORT` | `panelPort` | `2083` | HTTPS account-panel port (only with cert + key); serves only the account panel. `0`/`off`/`false`/`no` disables the listener. |
+| `WHM_PANEL_HTTP_PORT` | `panelHttpPort` | `2082` | Plain account-panel port: redirects to `panelPort` / refuses `/api` with TLS, serves the panel in clear without. `0`/`off` disables it. |
 | `WHM_TLS_CERT` | `tlsCert` | `null` | PEM certificate; HTTPS is enabled when both cert and key are set. |
 | `WHM_TLS_KEY` | `tlsKey` | `null` | PEM private key. |
 | `WHM_HTTP_REDIRECT` | `httpRedirect` | `true` | Only with cert + key: the HTTP port answers `GET`/`HEAD` navigations with a `301` to `https://<host>:<tlsPort><path>` and everything under `/api` (except `GET /api/health`) or non-GET with `426 { error: { code: 'tls_required' } }`. `false`/`0`/`no`/`off` serves the full panel on both ports; any other value (including a typo) keeps the redirect on. Cluster peers must then be addressed as `https://host:2087`. |

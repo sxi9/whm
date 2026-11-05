@@ -4,6 +4,7 @@ import { KeyRound, RefreshCw, ShieldOff, Clock, AlertTriangle, Info } from 'luci
 import { api, queryString } from '../../api/client.js';
 import { useApi, useMutation } from '../../hooks/useApi.js';
 import { Card, KeyValue, Loading, StatusPill, formatDate } from '../../components/Common.jsx';
+import { InstallPackages } from '../../components/InstallPackages.jsx';
 import { DataTable, useTableState } from '../../components/DataTable.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { Modal, useConfirm } from '../../components/Modal.jsx';
@@ -46,7 +47,7 @@ export function GrantResult({ result, onClose }) {
   );
 }
 
-export function GrantForm({ status, onGranted }) {
+export function GrantForm({ status, onGranted, onInstalled }) {
   const toast = useToast();
   const [form, setForm] = useState({ label: '', hours: null, ssh: true, apiToken: true, scope: '', note: '' });
   const { mutate, loading, error, fieldErrors } = useMutation((body) => api.post('/support/access', body));
@@ -73,7 +74,7 @@ export function GrantForm({ status, onGranted }) {
 
   return (
     <Card title="Grant access" subtitle={`Creates a fresh SSH key authorized for root and an API token. The key line carries sshd's expiry-time option (OpenSSH ${status?.sshdMinVersion || '7.7'} or newer, stamped in the host's local time${status?.expiryTimeZone ? `, ${status.expiryTimeZone}` : ''}) so the daemon refuses it after the deadline, and the panel removes both when the time box ends.`}>
-      {sshdMissing && <div className="banner banner-info"><Info size={18} /><div><strong>sshd is not installed</strong><p>{status.sshdDetail} Only an API token can be issued until <Link to="/software/install-distro-packages">openssh-server</Link> is installed.</p></div></div>}
+      {sshdMissing && <div className="banner banner-info"><Info size={18} /><div><strong>sshd is not installed</strong><p>{status.sshdDetail} Only an API token can be issued until <code>openssh-server</code> is installed.</p><InstallPackages packages={['openssh-server']} label="Install openssh-server" onFinished={onInstalled} /></div></div>}
       {sshdBlocked && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>sshd would refuse a root key</strong><p>{status.sshdPolicy.detail} {status.sshdPolicy.fix && <Link to={status.sshdPolicy.fix.path}>{status.sshdPolicy.fix.label}</Link>}</p></div></div>}
       {status?.sshdPolicy?.known === false && <div className="banner banner-info"><Info size={18} /><div><strong>sshd configuration could not be read</strong><p>{status.sshdPolicy.detail}</p></div></div>}
       <p className="muted">Granting is only possible from a signed-in root session, never through an API token, so a support token cannot extend its own time box. The box itself is cooperative: root access can be made persistent by its holder, so revoke the grant as soon as the engagement ends.</p>
@@ -177,7 +178,7 @@ export function AccessGrants() {
       {status.data?.active?.length > 0 && (
         <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>{status.data.active.length} active support grant{status.data.active.length > 1 ? 's' : ''}</strong><p>{status.data.active.map((g) => `${g.label} (until ${formatDate(g.expiresAt)})`).join(', ')}. Revoke below as soon as the engineer is done.</p></div></div>
       )}
-      <GrantForm status={status.data} onGranted={(r) => { setResult(r); setTick((t) => t + 1); status.refetch(); }} />
+      <GrantForm status={status.data} onInstalled={() => status.refetch()} onGranted={(r) => { setResult(r); setTick((t) => t + 1); status.refetch(); }} />
       <GrantList refreshKey={tick} onChanged={() => status.refetch()} />
       <GrantResult result={result} onClose={() => setResult(null)} />
     </>

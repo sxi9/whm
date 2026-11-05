@@ -5,6 +5,8 @@ import { requireAuth } from '../middleware/auth.js';
 import { issueCsrfToken } from '../middleware/csrf.js';
 import { badRequest, notFound, unauthorized, conflict, HttpError } from '../lib/errors.js';
 import { constantTimeEqual } from '../lib/crypto.js';
+import { redirectHostname } from '../middleware/tls-redirect.js';
+import { accountPanelUrl, adminLoginUrl as adminLoginUrlFor } from '../middleware/shell.js';
 
 const providerName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/);
 const OIDC_STATE_TTL_MS = 10 * 60 * 1000;
@@ -32,9 +34,23 @@ export function authRoutes(ctx) {
 
   r.get('/csrf', (req, res) => res.json({ data: { csrfToken: issueCsrfToken(req, crypto) } }));
 
+  // The account-panel listeners (middleware/shell.js) sign in account users
+  // only: services/auth.js refuses an administrator or reseller with a
+  // wrong_port error before recording the login, and the route tells them
+  // where their shell lives. The administration shell accepts every role.
+  const adminLoginUrl = (req) => adminLoginUrlFor(ctx.config, redirectHostname(req.get('host')) || settings.get('basic.hostname'));
+  const isWrongPort = (err) => err instanceof HttpError && err.code === 'wrong_port' && Boolean(err.user);
+  const auditWrongPort = (req, err, args) => req.audit({ action: 'auth.login.wrong_port', target: err.user.username, args: { role: err.user.role, ...args }, result: 'refused' });
+  const wrongPort = (req, res, err, via) => {
+    auditWrongPort(req, err, { via });
+    delete req.session.pending2fa;
+    delete req.session.pendingNewIp;
+    res.status(403).json({ error: { code: 'wrong_port', message: err.message, adminUrl: adminLoginUrl(req) } });
+  };
+
   r.post('/login', validate({ body: z.object({ username: fields.username, password: z.string().min(1).max(256) }).strict() }), async (req, res, next) => {
     try {
-      const result = await auth.login({ ...req.body, ip: req.ip });
+      const result = await auth.login({ ...req.body, ip: req.ip, shell: req.shell });
       if (result.pending2fa) {
         req.session.pending2fa = result.userId;
         req.session.pendingNewIp = Boolean(result.newIp);
@@ -42,17 +58,23 @@ export function authRoutes(ctx) {
       }
       req.audit({ action: 'auth.login', target: req.body.username, args: result.newIp ? { newIp: true } : null });
       res.json({ data: await establish(req, result) });
-    } catch (err) { next(err); }
+    } catch (err) {
+      if (isWrongPort(err)) return wrongPort(req, res, err, 'password');
+      next(err);
+    }
   });
 
   r.post('/2fa', validate({ body: z.object({ code: z.string().regex(/^\d{6}$/, 'Enter the 6-digit code') }).strict() }), async (req, res, next) => {
     try {
       if (!req.session.pending2fa) throw badRequest('No login is awaiting verification');
-      const result = await auth.verify2fa({ userId: req.session.pending2fa, code: req.body.code, ip: req.ip, newIp: Boolean(req.session.pendingNewIp) });
+      const result = await auth.verify2fa({ userId: req.session.pending2fa, code: req.body.code, ip: req.ip, newIp: Boolean(req.session.pendingNewIp), shell: req.shell });
       req.user = result.user;
       req.audit({ action: 'auth.login.2fa', target: result.user.username, args: result.newIp ? { newIp: true } : null });
       res.json({ data: await establish(req, result) });
-    } catch (err) { next(err); }
+    } catch (err) {
+      if (isWrongPort(err)) return wrongPort(req, res, err, '2fa');
+      next(err);
+    }
   });
 
   r.post('/logout', (req, res) => {
@@ -67,6 +89,10 @@ export function authRoutes(ctx) {
     res.json({ data: {
       user: auth.publicUser(req.user), csrfToken: issueCsrfToken(req, crypto), hostname: settings.get('basic.hostname'),
       mustEnroll2fa: Boolean(req.session?.mustEnroll2fa), policy: auth.policy(),
+      // Which listener served this session; administrators also get the
+      // account holders' sign-in address for the Account panel settings page.
+      shell: req.shell || 'admin',
+      panelUrl: req.user.role === 'user' ? undefined : `${accountPanelUrl(ctx.config, settings.get('basic.hostname') || redirectHostname(req.get('host')) || 'localhost')}/`,
       // The Server Profile decides which sidebar categories the shell shows.
       profile: ctx.serverConfig?.profile?.summary?.() ?? { name: 'standard', hiddenCategories: [] },
       // Grace/degraded banner in the shell.
@@ -181,7 +207,7 @@ export function authRoutes(ctx) {
 
       const linked = ea.findLinkedUser(req.params.name, identity.subject);
       if (!linked) return backToLogin(res, { error: 'external_not_linked', provider: req.params.name });
-      const result = await auth.externalLogin({ userId: linked.user_id ?? linked.userId, ip: req.ip, provider: req.params.name });
+      const result = await auth.externalLogin({ userId: linked.user_id ?? linked.userId, ip: req.ip, provider: req.params.name, shell: req.shell });
       if (result.pending2fa) {
         req.session.pending2fa = result.userId;
         req.session.pendingNewIp = Boolean(result.newIp);
@@ -192,6 +218,12 @@ export function authRoutes(ctx) {
       await establish(req, result);
       res.redirect('/');
     } catch (err) {
+      if (isWrongPort(err)) {
+        auditWrongPort(req, err, { via: 'external', provider: req.params.name });
+        // The admin sign-in link never travels through the location: the login
+        // page takes it from the branding response, not from a query string.
+        return backToLogin(res, { error: 'wrong_port', message: err.message });
+      }
       if (err instanceof HttpError && err.status < 500) return backToLogin(res, { error: 'external_failed', message: err.message });
       next(err);
     }

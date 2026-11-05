@@ -8,6 +8,8 @@ export class ApiError extends Error {
     this.capability = err.capability || null;
     this.details = err.details || null;
     this.requestId = err.requestId || null;
+    // 403 wrong_port on the account-panel listener: where this role signs in.
+    this.adminUrl = err.adminUrl || null;
   }
 }
 
@@ -40,6 +42,8 @@ export const api = {
     const text = await res.text();
     if (text) { try { json = JSON.parse(text); } catch { json = null; } }
     if (!res.ok) {
+      // Only a 401 ends the session; a 403 (incl. wrong_port on the panel
+      // listener) is thrown as-is so the caller can show it, never retried.
       if (res.status === 401 && onUnauthorized && !path.startsWith('/auth/login')) onUnauthorized();
       throw new ApiError(res.status, json);
     }

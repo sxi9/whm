@@ -6,7 +6,11 @@ import { PageHeader, Card, Loading, StatusPill, KeyValue, formatDate } from '../
 import { Field, Toggle, Select, Button, FormActions } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
+import { InstallPackages } from '../../../components/InstallPackages.jsx';
 import { RequestError, JobCard, LastJob, CronField } from '../../server-configuration/Shared.jsx';
+
+// Empty until the host family is known so the button never posts the wrong family's package names.
+export const generatorPackages = (packages, family) => (packages && family ? (family === 'rhel' ? packages.dnf : packages.apt) || packages.apt || [] : []);
 
 const GENERATORS = [
   { key: 'awstats', label: 'AWStats', blurb: 'Detailed visitor, referrer, robot and bandwidth reports, with a per-domain config in /etc/awstats.' },
@@ -18,6 +22,7 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
   const { data, loading, error, refetch } = useApi('/server-config/stats');
+  const pkg = useApi('/software/pkg/detect', { enabled: Boolean(data && Object.values(data.detect?.generators || {}).some((g) => !g.installed)) });
   const [draft, setDraft] = useState(null);
   const [busy, setBusy] = useState(false);
   const [jobId, setJobId] = useState(null);
@@ -59,7 +64,7 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
                   return (
                     <tr key={g.key}>
                       <td><strong>{g.label}</strong><br /><small className="muted">{g.blurb}</small></td>
-                      <td>{d.installed ? <StatusPill status="installed">{d.version ? `v${d.version}` : 'installed'}</StatusPill> : <><StatusPill status="not-installed">not installed</StatusPill><br /><small className="muted">{d.packages ? <Link to="/software/install-distro-packages">install {d.packages.apt?.[0]}</Link> : null}</small></>}</td>
+                      <td>{d.installed ? <StatusPill status="installed">{d.version ? `v${d.version}` : 'installed'}</StatusPill> : <><StatusPill status="not-installed">not installed</StatusPill><br />{generatorPackages(d.packages, pkg.data?.family).length > 0 && <InstallPackages packages={generatorPackages(d.packages, pkg.data?.family)} onFinished={refetch} />}</>}</td>
                       <td><Toggle checked={Boolean(draft.generators[g.key])} onChange={(v) => setDraft((x) => ({ ...x, generators: { ...x.generators, [g.key]: v } }))} /></td>
                       <td><Button size="sm" disabled={!d.installed} onClick={() => run(g.key)}>Run {g.label}</Button></td>
                     </tr>

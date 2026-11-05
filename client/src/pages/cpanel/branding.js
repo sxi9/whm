@@ -9,7 +9,13 @@ import { api } from '../../api/client.js';
 const CACHE_KEY = 'whm.branding';
 const STYLE_ID = 'whm-branding-css';
 const EVENT = 'whm:branding-changed';
-export const DEFAULT_BRANDING = { companyName: 'Keel', tagline: 'Hosting control panel', primaryColor: '', chromeColor: '', helpUrl: '', docsUrl: '', supportUrl: '', loginNotice: '', footerText: '', logo: null, favicon: null };
+// `shell` names the listener this origin is served by ('panel' on the account
+// panel ports, 'admin' otherwise); the login page and the index route read it.
+export const DEFAULT_BRANDING = { companyName: 'Keel', tagline: 'Hosting control panel', primaryColor: '', chromeColor: '', helpUrl: '', docsUrl: '', supportUrl: '', loginNotice: '', footerText: '', logo: null, favicon: null, shell: 'admin' };
+
+export function isPanelShell(branding) {
+  return branding?.shell === 'panel';
+}
 
 let current = null;
 let inflight = null;

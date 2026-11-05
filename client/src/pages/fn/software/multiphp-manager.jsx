@@ -1,14 +1,14 @@
-import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
 import { DataTable, useTableState } from '../../../components/DataTable.jsx';
-import { Field, Select, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
+import { Select, Toggle, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { RequestError, PhpVersionPill, useJobRunner, JobPanel } from '../../software/Shared.jsx';
+import { RequestError, PhpVersionPill, useJobRunner, JobPanel, runtimeInstallBody, CodeList } from '../../software/Shared.jsx';
 
 // Security Center's advisory rules (setting security.advisories) mark versions
 // with a known vulnerability; the Security Advisor page carries the details.
@@ -27,30 +27,70 @@ export function PhpAdvisoryBadge({ advisories }) {
   );
 }
 
+const STATE_PILL = {
+  installed: ['installed', 'Installed'],
+  available: ['info', 'Available'],
+  unsupported: ['failed', 'Not available for this OS'],
+  unknown: ['unknown', 'Unknown'],
+};
+
+export function PhpStatePill({ state }) {
+  const [status, text] = STATE_PILL[state] || STATE_PILL.unknown;
+  return <StatusPill status={status}>{text}</StatusPill>;
+}
+
+// Why a version cannot be removed right now; null when it can.
+export function removeBlocker(v, installedCount = 2) {
+  if (!v.installed) return null;
+  if (v.isSystemDefault) return 'This is the system default; set another version as default first';
+  if (v.isDefault) return 'This is the CLI default (/usr/bin/php); set another version as default first';
+  if (installedCount < 2) return 'This is the only installed version; install another one first';
+  if (v.domains > 0) return `${v.domains} domain(s) run this version; move them to another version first`;
+  if (v.webDefault) return 'Apache Configuration pins this version as the web default; change it there first';
+  if (v.plans > 0) return `${v.plans} package(s) default to this version; change them first`;
+  if (v.vhosts > 0) return `${v.vhosts} web vhost(s) are rendered with this version; move them first`;
+  return null;
+}
+
+// The offered list after toggling one version; null (= every installed version)
+// is expanded to the installed ids so the server gets an explicit list.
+export function toggleOffered(catalog, id, on) {
+  const installed = (catalog?.versions || []).filter((v) => v.installed).map((v) => v.id);
+  const current = catalog?.offered == null ? installed : catalog.offered.filter((x) => installed.includes(x));
+  const next = on ? [...new Set([...current, id])] : current.filter((x) => x !== id);
+  return installed.filter((x) => next.includes(x));
+}
+
+const versionLabel = (v) => `${v.label || `PHP ${v.id}`}${v.version ? ` (${v.version})` : ''}`;
+
 export default function MultiPhpManager({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
   const { user } = useAuth();
   const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
   const isRoot = user?.role === 'root';
   const versions = useApi('/software/php/versions');
+  const catalog = useApi('/software/php/catalog', { enabled: isRoot });
   const table = useTableState({ pageSize: 50, sort: 'domain', dir: 'asc' });
   const domains = useApi(`/software/php/domains${queryString(table.state)}`);
   const pools = useApi('/software/php/pools', { enabled: isRoot });
-  const [defaultDraft, setDefaultDraft] = useState('');
   const [bulkVersion, setBulkVersion] = useState('');
   const [selected, setSelected] = useState([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  const runner = useJobRunner({ onFinished: () => { versions.refetch(); domains.refetch(); } });
+  const refetchAll = () => { versions.refetch(); catalog.refetch(); domains.refetch(); pools.refetch(); };
+  const runner = useJobRunner({ onFinished: refetchAll });
+  const deepLinked = useRef(false);
 
   const installed = versions.data?.versions || [];
   const options = installed.map((v) => ({ value: v.id, label: `${v.label || v.id}${v.version ? ` (${v.version})` : ''}${v.isDefault ? ' · CLI default' : ''}` }));
-  const current = versions.data?.effectiveDefault;
+  const current = catalog.data?.effectiveDefault ?? versions.data?.effectiveDefault;
   const rows = domains.data?.domains || [];
+  const matrix = catalog.data?.versions || [];
 
-  const setDefault = async () => {
-    const version = defaultDraft || current;
+  const setDefault = async (version) => {
+    if (!version || version === current) return;
     if (!(await confirm({ title: `Make ${version} the system default?`, message: 'The default is saved at once; every domain without an explicit version is then re-pinned to it through the web server by a background job (one vhost rewrite per domain, Apache reloaded at the end). The CLI /usr/bin/php alternative is updated when the distribution supports it. A default pinned in Apache Configuration takes precedence.', confirmLabel: 'Set default' }))) return;
     setBusy(true); setError(null);
     try {
@@ -63,7 +103,7 @@ export default function MultiPhpManager({ fn }) {
       } else {
         toast[web.state === 'applied' || web.state === 'not-loaded' || web.state === 'skipped' ? 'success' : 'warning'](`System default PHP is now ${version}${cliNote} — web: ${web.detail || web.state}`);
       }
-      versions.refetch(); domains.refetch();
+      refetchAll();
     } catch (err) { setError(err); toast.error(err); } finally { setBusy(false); }
   };
   const apply = async (list, version) => {
@@ -79,22 +119,85 @@ export default function MultiPhpManager({ fn }) {
         if (failed.length) toast.warning(`${list.length} domain(s) recorded, but the web server rejected ${failed[0].domain}: ${failed[0].web.replace(/^failed: /, '')}`);
         else toast.success(`${list.length} domain(s) set to ${version || 'inherit'}${pending ? ' (recorded; the web server category applies the handler when it is loaded)' : ''}`);
       }
-      setSelected([]); domains.refetch();
+      setSelected([]); domains.refetch(); catalog.refetch();
     } catch (err) { setError(err); toast.error(err); } finally { setBusy(false); }
   };
+  const install = async (v) => {
+    if (!(await confirm({ title: `Install ${versionLabel(v)}?`, message: <>Installs {v.packages?.length ? <CodeList names={v.packages} /> : 'the version packages'} side by side with PHP-FPM; the CLI default stays as it is.{v.state === 'unknown' && v.note ? ` ${v.note}` : ''}</>, confirmLabel: 'Install' }))) return;
+    runner.start(() => api.post('/software/runtimes/install', runtimeInstallBody('php', v.id)), `Install ${versionLabel(v)}`);
+  };
+  const remove = async (v) => {
+    if (!(await confirm({ title: `Remove ${versionLabel(v)}?`, message: `Removes every php${v.id}-* package; /etc/php/${v.id} is kept. Nothing runs on it (no domain is pinned to it and it is not the system default).`, confirmLabel: 'Remove', danger: true }))) return;
+    runner.start(() => api.post('/software/php/remove', { version: v.id }), `Remove ${versionLabel(v)}`);
+  };
+  const setOffered = async (v, on) => {
+    setBusy(true); setError(null);
+    try {
+      await api.put('/software/php/offered', { versions: toggleOffered(catalog.data, v.id, on) });
+      toast.success(`${v.label || `PHP ${v.id}`} is ${on ? 'now' : 'no longer'} offered to accounts`);
+      catalog.refetch();
+    } catch (err) { setError(err); toast.error(err); } finally { setBusy(false); }
+  };
+
+  useEffect(() => {
+    const wanted = params.get('install');
+    if (!wanted || deepLinked.current || !catalog.data) return;
+    deepLinked.current = true;
+    const v = matrix.find((x) => x.id === wanted);
+    setParams((p) => { const n = new URLSearchParams(p); n.delete('install'); return n; }, { replace: true });
+    if (v && !v.installed && v.state !== 'unsupported') install(v);
+  }, [params, catalog.data]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <>
       <PageHeader fn={fn} actions={<Link className="btn" to="/software/multiphp-ini-editor">INI editor</Link>} />
       <RequestError error={versions.error} onRetry={versions.refetch} />
-      {versions.loading && !versions.data && <Loading text="Detecting PHP versions…" />}
-      {versions.data && (
+      <RequestError error={catalog.error} onRetry={catalog.refetch} />
+      {(versions.loading && !versions.data) && <Loading text="Detecting PHP versions…" />}
+      {isRoot && catalog.data && (
+        <Card title="PHP versions" subtitle={`Every version of the catalog for ${catalog.data.os?.id || catalog.data.family || 'this host'}${catalog.data.os?.versionId ? ` ${catalog.data.os.versionId}` : ''}: install, remove, pick the system default and choose what accounts may select.`} actions={<Button onClick={refetchAll}>Re-detect</Button>} padded={false}>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Version</th><th>State</th><th>PHP-FPM</th><th>Default</th><th>Domains</th><th>Offered to accounts</th><th /></tr></thead>
+              <tbody>
+                {matrix.length === 0 && <tr><td colSpan={7} className="table-state">The catalog is empty for this OS. Add a version with <Link to="/software/easyapache-4">EasyApache 4</Link> or install packages by hand.</td></tr>}
+                {matrix.map((v) => {
+                  const blocker = removeBlocker(v, matrix.filter((x) => x.installed).length);
+                  return (
+                    <tr key={v.id}>
+                      <td><strong>{v.label || `PHP ${v.id}`}</strong> {v.version && <span className="muted">{v.version}</span>} <PhpAdvisoryBadge advisories={v.advisories} />
+                        {v.installed && v.binary && <><br /><code className="small">{v.binary}</code></>}
+                        {!v.installed && v.note && <><br /><span className="muted small">{v.note}</span></>}
+                      </td>
+                      <td><PhpStatePill state={v.state} /></td>
+                      <td>{v.installed ? (v.fpmInstalled ? <StatusPill status={v.fpmActive ? 'active' : v.fpmActive === false ? 'inactive' : 'unknown'}>{v.fpmUnit || 'FPM'}{v.fpmActive === false ? ' · stopped' : ''}</StatusPill> : <StatusPill status="not-installed">no FPM</StatusPill>) : <span className="muted">—</span>}</td>
+                      <td>{v.isSystemDefault && <StatusPill status="ok">system default</StatusPill>}{v.isDefault && !v.isSystemDefault && <StatusPill status="info">CLI</StatusPill>}</td>
+                      <td>{v.installed ? v.domains ?? 0 : <span className="muted">—</span>}</td>
+                      <td><Toggle checked={Boolean(v.offered)} disabled={!v.installed || busy} onChange={(on) => setOffered(v, on)} label={v.installed ? (v.offered ? 'Offered' : 'Hidden') : 'Install first'} /></td>
+                      <td className="actions-col">
+                        {!v.installed && <Button size="sm" variant="primary" loading={runner.busy} disabled={v.state === 'unsupported'} title={v.state === 'unsupported' ? v.note || 'Not available for this OS' : undefined} onClick={() => install(v)}>Install</Button>}
+                        {v.installed && !v.isSystemDefault && <Button size="sm" loading={busy} onClick={() => setDefault(v.id)}>Set as default</Button>}
+                        {v.installed && <Button size="sm" variant="danger" loading={runner.busy} disabled={Boolean(blocker)} title={blocker || undefined} onClick={() => remove(v)}>Remove</Button>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ padding: '0 16px 12px' }}>
+            <ErrorBanner error={error || runner.error} />
+            <p className="muted small">Accounts see only the versions switched to <em>Offered</em> (all installed ones until you hide one); a version a domain already runs stays selectable for that domain. A plan's own version list narrows it further.</p>
+          </div>
+        </Card>
+      )}
+      {!isRoot && versions.data && (
         <Card title="Installed PHP versions" subtitle="Detected from /etc/php/*, /opt/cpanel/ea-php*, Remi SCL and the stock php package." actions={<Button onClick={() => versions.refetch()}>Re-detect</Button>}>
           <div className="table-wrap">
             <table>
               <thead><tr><th>Version</th><th>Binary</th><th>PHP-FPM</th><th>php.ini</th><th>Default</th></tr></thead>
               <tbody>
-                {installed.length === 0 && <tr><td colSpan={5} className="table-state">No PHP installation found. Add one with <Link to="/software/easyapache-4">EasyApache 4</Link> or Install Distro Packages.</td></tr>}
+                {installed.length === 0 && <tr><td colSpan={5} className="table-state">No PHP installation found on this server.</td></tr>}
                 {installed.map((v) => (
                   <tr key={v.id}>
                     <td><strong>{v.label || v.id}</strong> <span className="muted">{v.version}</span> <PhpAdvisoryBadge advisories={v.advisories} /></td>
@@ -107,18 +210,10 @@ export default function MultiPhpManager({ fn }) {
               </tbody>
             </table>
           </div>
-          {isRoot && installed.length > 0 && (
-            <div className="form-narrow" style={{ marginTop: 16 }}>
-              <Field label="System default PHP version" help="Used by every domain that does not override it.">
-                <Select value={defaultDraft || current || ''} onChange={setDefaultDraft} options={options} />
-              </Field>
-              <FormActions><Button variant="primary" loading={busy} disabled={(defaultDraft || current) === current} onClick={setDefault}>Apply default</Button></FormActions>
-            </div>
-          )}
           <ErrorBanner error={error} />
         </Card>
       )}
-      <JobPanel runner={runner} title="Applying PHP version to the web server" />
+      <JobPanel runner={runner} title="PHP version job" />
       <Card title="PHP version per domain" subtitle={domains.data ? `${domains.meta?.total ?? domains.data.domains.length} domains · system default ${domains.data.systemDefault.effective || 'not set'}` : undefined} padded={false}>
         <RequestError error={domains.error} onRetry={domains.refetch} />
         {selected.length > 0 && (

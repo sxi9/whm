@@ -99,7 +99,8 @@ describe('Customization (branding)', () => {
     const anon = await request(app.ctx.app).get('/api/branding').expect(200);
     expect(anon.body.data).toMatchObject({ companyName: 'Keel', tagline: 'Hosting control panel', logo: null, favicon: null, loginNotice: '' });
     expect(anon.body.data.links).toEqual({ help: '', docs: '', support: '' });
-    expect(Object.keys(anon.body.data).sort()).toEqual(['chromeColor', 'companyName', 'docsUrl', 'favicon', 'footerText', 'helpUrl', 'links', 'loginNotice', 'logo', 'primaryColor', 'supportUrl', 'tagline']);
+    expect(Object.keys(anon.body.data).sort()).toEqual(['chromeColor', 'companyName', 'docsUrl', 'favicon', 'footerText', 'helpUrl', 'links', 'loginNotice', 'logo', 'primaryColor', 'shell', 'supportUrl', 'tagline']);
+    expect(anon.body.data.shell).toBe('admin');
     const res = await get('/api/branding').expect(200);
     expect(res.body.data).toEqual(anon.body.data);
     const r2 = await plainUser.get('/api/cpanel/branding').expect(200);

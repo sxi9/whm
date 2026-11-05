@@ -3,6 +3,7 @@ import { Star, AlertTriangle, Download, Info } from 'lucide-react';
 import { useFavorites } from '../hooks/useFavorites.js';
 import { useT } from '../i18n/useT.js';
 import { useShell } from '../panel/ShellContext.js';
+import { InstallPackages, normalizePackages } from './InstallPackages.jsx';
 
 export function PageHeader({ fn, title, description, actions, children }) {
   const { isFavorite, toggle } = useFavorites();
@@ -78,16 +79,19 @@ export function EmptyState({ title, children, icon: Icon = Info }) {
 }
 
 // Shown when the API says the feature's daemon is missing on this host.
-export function CapabilityNotice({ error, onRetry }) {
+export function CapabilityNotice({ error, onRetry, packages }) {
   if (!error) return null;
   if (error.code !== 'capability_missing' && error.code !== 'binary_not_found' && error.status !== 501) return null;
+  const names = normalizePackages(packages);
   return (
     <div className="banner banner-warning">
       <AlertTriangle size={18} />
       <div>
         <strong>Service not installed</strong>
         <p>{error.message}</p>
-        <p className="muted">Install the required software on this server (for example via <Link to="/software/install-distro-packages">Install Distro Packages</Link>) and refresh. The rest of the panel keeps working.</p>
+        {names.length > 0
+          ? <div style={{ marginTop: 6 }}><InstallPackages packages={names} onFinished={onRetry} /> <span className="muted small">The rest of the panel keeps working meanwhile.</span></div>
+          : <p className="muted">Install the required software on this server (<Link to="/software/install-distro-packages?tab=search">Install Software</Link>) and refresh. The rest of the panel keeps working.</p>}
       </div>
       {onRetry && <button className="btn btn-sm" onClick={onRetry}>Re-check</button>}
     </div>

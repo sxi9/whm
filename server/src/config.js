@@ -8,6 +8,15 @@ const isProd = process.env.NODE_ENV === 'production';
 // a typo or an unexpected type keeps it on.
 const REDIRECT_OFF = /^(false|0|no|off)$/i;
 export const httpRedirectEnabled = (value) => !REDIRECT_OFF.test(String(value ?? '').trim());
+// Account-panel listener ports: 0/off/false/no (or an unparsable value)
+// disables that listener; anything else must be a TCP port.
+const PORT_OFF = /^(false|0|no|off)$/i;
+export const listenerPort = (value) => {
+  const text = String(value ?? '').trim();
+  if (!text || PORT_OFF.test(text)) return 0;
+  const n = Number(text);
+  return Number.isInteger(n) && n > 0 && n < 65536 ? n : 0;
+};
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const defaults = {
@@ -20,6 +29,11 @@ const defaults = {
   // With TLS on, the plain listener only redirects (GET/HEAD) or refuses (426);
   // GET /api/health stays reachable. Ignored without a certificate.
   httpRedirect: true,
+  // Account-panel listeners (cPanel's 2083/2082): they serve only /panel, the
+  // login page and the panel API. panelPort opens only with TLS; panelHttpPort
+  // redirects/refuses like `port` does with TLS and serves in clear without.
+  panelPort: 2083,
+  panelHttpPort: 2082,
   dataDir: isProd ? '/var/lib/whm' : path.resolve(process.cwd(), 'data'),
   mode: 'monolithic',
   agentSocket: '/run/whm-agent.sock',
@@ -71,6 +85,8 @@ function envOverrides() {
   if (e.WHM_TLS_CERT) out.tlsCert = e.WHM_TLS_CERT;
   if (e.WHM_TLS_KEY) out.tlsKey = e.WHM_TLS_KEY;
   if (e.WHM_HTTP_REDIRECT) out.httpRedirect = httpRedirectEnabled(e.WHM_HTTP_REDIRECT);
+  if (e.WHM_PANEL_PORT !== undefined) out.panelPort = e.WHM_PANEL_PORT;
+  if (e.WHM_PANEL_HTTP_PORT !== undefined) out.panelHttpPort = e.WHM_PANEL_HTTP_PORT;
   if (e.WHM_DATA_DIR) out.dataDir = path.resolve(e.WHM_DATA_DIR);
   if (e.WHM_MODE) out.mode = e.WHM_MODE;
   if (e.WHM_AGENT_SOCKET) out.agentSocket = e.WHM_AGENT_SOCKET;
@@ -101,6 +117,27 @@ function persistedSecret(dataDir, name, bytes = 32) {
   return value;
 }
 
+// A panel port equal to an administration port (or to the other panel port)
+// could not bind anyway, but shellFor() would still classify every request on
+// that admin port as the panel shell and lock every administrator out. Such
+// a listener is disabled and reported so index.js can warn about it.
+export function disablePanelPortCollisions(cfg) {
+  const disabled = [];
+  const adminPorts = [['port', Number(cfg.port)], ['tlsPort', Number(cfg.tlsPort)]];
+  for (const key of ['panelPort', 'panelHttpPort']) {
+    if (!cfg[key]) continue;
+    const hit = adminPorts.find(([, port]) => port === cfg[key]);
+    if (!hit) continue;
+    disabled.push({ key, port: cfg[key], collidesWith: hit[0] });
+    cfg[key] = 0;
+  }
+  if (cfg.panelHttpPort && cfg.panelHttpPort === cfg.panelPort) {
+    disabled.push({ key: 'panelHttpPort', port: cfg.panelHttpPort, collidesWith: 'panelPort' });
+    cfg.panelHttpPort = 0;
+  }
+  return disabled;
+}
+
 export function loadConfig(overrides = {}) {
   const cfg = { ...defaults, ...readConfigFile(), ...envOverrides(), ...overrides };
   if (!['monolithic', 'split'].includes(cfg.mode)) {
@@ -112,6 +149,9 @@ export function loadConfig(overrides = {}) {
   cfg.masterKeyHex = persistedSecret(cfg.dataDir, 'master.key');
   cfg.tls = Boolean(cfg.tlsCert && cfg.tlsKey);
   cfg.httpRedirect = httpRedirectEnabled(cfg.httpRedirect);
+  cfg.panelPort = listenerPort(cfg.panelPort);
+  cfg.panelHttpPort = listenerPort(cfg.panelHttpPort);
+  cfg.disabledPanelPorts = disablePanelPortCollisions(cfg);
   cfg.pluginsDir = path.resolve(cfg.pluginsDir || path.join(cfg.dataDir, 'plugins'));
   cfg.pluginDataDir = path.resolve(cfg.pluginDataDir || path.join(cfg.dataDir, 'plugin-data'));
   return cfg;

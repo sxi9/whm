@@ -600,14 +600,36 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
 - **Server:** `POST /perl/install` → `202` job using `cpanm` when available, otherwise `cpan` with
   default answers.
 
-#### 22.2 Install Distro Packages
+#### 22.2 Install Software (formerly Install Distro Packages)
 
-- **Purpose:** install or remove OS packages.
+- **Purpose:** one-click installs of PHP versions, Node.js, Python, Ruby, Go, Composer and common tools, plus
+  any OS package through the raw search. Nothing moved: the URL is still `/software/install-distro-packages`.
 - **Who:** root.
-- **Screen:** detected manager; search (`GET /pkg/search`), package info, *Packages* list with install (option
-  *no recommends*) and *Remove* (option *purge*), *update index*, recent operations.
-- **Server:** `POST /pkg/install` / `/pkg/remove` / `/pkg/update-index` answer `202` with jobs.
-- **Gotchas:** package names cannot start with `-`; the agent re-validates them.
+- **Screen:** tabs *Runtimes* (default), *Tools*, *Search*, *Installed*, *History*. *Runtimes* shows one card per
+  runtime with a row per catalog version — PHP 8.5 … 7.4, Node.js 24/22/20/18, Python 3.13 … 3.9 — and one row for
+  Ruby, Go and Composer; each row has an **Install** button or an *Installed* pill with the detected version, and a
+  note about where the packages come from (Ubuntu: `ppa:ondrej/php` and `ppa:deadsnakes/ppa`; Debian:
+  `packages.sury.org` for PHP, distro Python only; RHEL: Remi for PHP under `/opt/remi/php<nn>`, EPEL for Composer).
+  Node.js rows show the path (`/usr/local/bin/node<major>`, with `npm<major>` / `npx<major>`) and a **Remove**
+  button; the panel's own Node.js is never touched. *Tools* is a grid (Git, ImageMagick, FFmpeg, Redis, Memcached,
+  Certbot, unzip, build tools, pip, cpanminus, PEAR/PECL, OpenSSH server, BIND, iproute2, locales, GoAccess,
+  ClamAV) with the host-family package names. *Search* is the previous page: detected manager, search
+  (`GET /pkg/search`), package info, install (option *no recommends*), *update index*; deep links
+  `?tab=search&q=<term>` open it with a term and `?install=a,b` pre-select packages (nothing starts on its own).
+  *Installed* lists and removes packages (option *purge*); *History* shows package and runtime jobs with their logs.
+  Other pages that find a tool missing (transfers, access grants, DNS cluster, Module Installers, PHP Version Manager,
+  statistics software, quotas, phpMyAdmin, locales, IP functions) now show an **Install** button in place.
+- **Server:** `GET /software/runtimes` (catalog with installed state), `POST /software/runtimes/install`
+  `{ runtime, version }` or `{ tool }` → `202` job `software.runtime.install` (adds the repository when needed,
+  refreshes the index only when one was added, installs the exact package list or the official nodejs.org build
+  under `/opt/keel/node/<major>`, restores the PHP CLI default the installer may have switched, re-detects and fails
+  when the runtime is still missing); `POST /software/runtimes/remove { runtime: 'nodejs', version }` → `202`;
+  `GET /software/runtimes/recent`. `POST /pkg/install` / `/pkg/remove` / `/pkg/update-index` answer `202` with jobs
+  as before.
+- **Gotchas:** a version outside the catalog is refused (`422`); Python versions beyond the distro's are Ubuntu only
+  (deadsnakes) — on Debian the job fails with that message before installing anything; PHP and Python are removed
+  from the *Installed* tab, only Node.js builds have their own *Remove*; package names cannot start with `-`; the
+  agent re-validates them.
 
 #### 22.3 Module Installers
 
@@ -628,15 +650,31 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
 - **Server:** `PUT /php/ini/:version` writes the version's INI through the agent; `PUT /php/ini/domain/:domain`
   writes the domain's pool/user INI. Directive values are single-line; the file is capped at 4 MB.
 
-#### 22.5 MultiPHP Manager
+#### 22.5 PHP Version Manager
 
-- **Purpose:** PHP version per domain and the system default.
-- **Who:** root or reseller (own domains); the system default is root.
-- **Screen:** *Installed PHP versions* (detected from `/etc/php/*`, `/opt/cpanel/ea-php*`, Remi SCL and the stock
-  `php` package); *System default PHP version*; *PHP version per domain* (bulk selection, `inherit`); *PHP-FPM
-  pools*; *Applying PHP version to the web server* progress.
-- **Server:** `PUT /php/domains` calls `ctx.web.setPhpVersion` per domain (a job when more than one
-  domain); `PUT /php/default` updates the default and FPM.
+- **Purpose:** every PHP version in one place — install, remove, the system default, which versions
+  accounts may pick — plus the version per domain. (The route stays `/software/multiphp-manager`.)
+- **Who:** root for the version matrix, the default and the offered list; root or reseller (own domains)
+  for the per-domain table.
+- **Screen:** *PHP versions* — one row per catalog version (8.5 … 7.4) and per extra installed version
+  (EA4 `ea-php*`, Remi SCL, the stock `php` package) with its state (*Installed*, *Available*, *Not available
+  for this OS* with the reason, *Unknown* when the repository probe failed), PHP-FPM unit, *System default* /
+  *CLI* pill, the number of domains pinned to it, the *Offered to accounts* switch (installed versions
+  only) and the row action: *Install* (job through *Install Software*'s runtime installer; disabled on an
+  unsupported row), *Set as default* (the existing default flow: saved at once, inherited domains re-pinned
+  by a job), *Remove* (confirm; disabled with the reason while the version is the system default or a
+  domain runs it). `?install=<version>` opens the install confirm for that version. Then *PHP version per
+  domain* (bulk selection, `inherit`), *PHP-FPM pools* and the job log.
+- **Server:** `GET /php/catalog` merges the runtime catalog with the detected versions and asks the agent
+  `pkg.repo.status` once for the PHP repository — on Ubuntu the `ondrej/php` PPA is probed for the host's
+  series before anything is added, so a release the PPA does not carry yet (26.04 "resolute") shows *Not
+  available for this OS* instead of breaking `apt-get update`; `PUT /php/offered { versions | null }`
+  stores `php.offered_versions` (`null` = every installed version; a version is always kept selectable for a
+  domain already on it); `POST /php/remove { version }` → `202` job `software.php.remove` → agent
+  `pkg.php.remove` (refused for the system default, the only installed version or a version domains use;
+  `/etc/php/<ver>` is kept); `PUT /php/domains` calls `ctx.web.setPhpVersion` per domain (a job when
+  more than one domain); `PUT /php/default` updates the default and FPM. Audit `software.php.offered`,
+  `software.php.remove`. Contract §52.
 
 #### 22.6 NGINX Manager
 

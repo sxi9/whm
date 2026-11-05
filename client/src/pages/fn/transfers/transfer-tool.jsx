@@ -16,7 +16,7 @@ const OPTION_FIELDS = [
 ];
 const EMPTY_CONN = { host: '', port: 22, user: 'root', authType: 'key', password: '', privateKey: '' };
 
-function ConnectStep({ caps, onConnected }) {
+function ConnectStep({ caps, onInstalled, onConnected }) {
   const toast = useToast();
   const confirm = useConfirm();
   const { data: sessions, refetch } = useApi('/transfers/sessions');
@@ -44,8 +44,8 @@ function ConnectStep({ caps, onConnected }) {
 
   return (
     <>
-      <ToolingNotice caps={caps} needs={['ssh', 'rsync']} />
-      {form.authType === 'password' && <ToolingNotice caps={caps} needs={['sshpass']} />}
+      <ToolingNotice caps={caps} needs={['ssh', 'rsync']} onInstalled={onInstalled} />
+      {form.authType === 'password' && <ToolingNotice caps={caps} needs={['sshpass']} onInstalled={onInstalled} />}
       <form onSubmit={connect}>
         <Card title="Connect to the source server" subtitle="Credentials are tested over SSH and kept encrypted for the duration of the transfer session.">
           <CapabilityNotice error={error} />
@@ -83,7 +83,7 @@ function ConnectStep({ caps, onConnected }) {
   );
 }
 
-function AccountsStep({ session, caps, onBack, onStarted }) {
+function AccountsStep({ session, caps, onInstalled, onBack, onStarted }) {
   const confirm = useConfirm();
   const [refreshing, setRefreshing] = useState(false);
   const { data, loading, error, refetch } = useApi(`/transfers/sessions/${session.id}/accounts`);
@@ -123,7 +123,7 @@ function AccountsStep({ session, caps, onBack, onStarted }) {
           data?.fetchedAt && ['Account list', `${accounts.length} account(s) · fetched ${formatDate(data.fetchedAt)}`],
         ]} />
       </Card>
-      <ToolingNotice caps={caps} needs={options.skipHome ? [] : ['rsync']} />
+      <ToolingNotice caps={caps} needs={options.skipHome ? [] : ['rsync']} onInstalled={onInstalled} />
       <Card title="Select accounts" subtitle={`${selected.length} of ${accounts.length} selected. Override the local username, domain or package per account when needed; passwords are copied from the source's /etc/shadow unless you enter a new one.`} padded={false}>
         <ErrorBanner error={error} onRetry={refetch} />
         <DataTable
@@ -187,7 +187,7 @@ function HostKeys({ keys, verbose = false }) {
 }
 
 export default function TransferTool({ fn }) {
-  const { data: caps } = useApi('/transfers/capabilities');
+  const { data: caps, refetch: refetchCaps } = useApi('/transfers/capabilities');
   const [session, setSession] = useState(null);
   const [run, setRun] = useState(null);
   const [historyKey, setHistoryKey] = useState(0);
@@ -197,8 +197,8 @@ export default function TransferTool({ fn }) {
     <>
       <PageHeader fn={fn} description="Moves accounts from another server over SSH: the Linux account is created here, the home directory is copied with rsync, MySQL databases are dumped on the source and imported, and DNS zones, addon domains and mail routing are recreated. Each run is a job you can watch and review." />
       <Steps step={step} labels={['Connect', 'Choose accounts and options', 'Transfer']} />
-      {step === 1 && <ConnectStep caps={caps} onConnected={setSession} />}
-      {step === 2 && <AccountsStep session={session} caps={caps} onBack={() => setSession(null)} onStarted={(r) => { setRun(r); setHistoryKey((k) => k + 1); }} />}
+      {step === 1 && <ConnectStep caps={caps} onInstalled={refetchCaps} onConnected={setSession} />}
+      {step === 2 && <AccountsStep session={session} caps={caps} onInstalled={refetchCaps} onBack={() => setSession(null)} onStarted={(r) => { setRun(r); setHistoryKey((k) => k + 1); }} />}
       {step === 3 && <RunPanel job={run.job} runId={run.run.id} title={`Transferring from ${session.host}`} resetLabel="Transfer more accounts" onReset={() => setRun(null)} />}
       <RunHistory kind="transfer" refreshKey={historyKey} />
     </>

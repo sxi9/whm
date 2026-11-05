@@ -7,7 +7,10 @@ import { DataTable } from '../../../components/DataTable.jsx';
 import { Button, Toggle, Field } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
+import { InstallPackages } from '../../../components/InstallPackages.jsx';
 import { RequestError, JobCard, LastJob, YesNo } from '../../server-configuration/Shared.jsx';
+
+export const quotaPackages = (data) => (Array.isArray(data?.packages) && data.packages.length ? data.packages : Array.isArray(data?.installPackages) ? data.installPackages : []);
 
 function quotaState(f) {
   if (f.active.user === true) return <StatusPill status="active">active</StatusPill>;
@@ -58,7 +61,7 @@ export default function InitialQuotaSetup({ fn }) {
                 <div style={{ marginTop: 12 }}>
                   <CapabilityNotice error={{ code: 'capability_missing', message: `The quota tools are not installed. Install the "${data.installPackages.join('", "')}" package, then enable quotas below.` }} onRetry={refetch} />
                   <div className="row-actions" style={{ marginTop: 8 }}>
-                    {data.pkgAvailable ? <Button variant="primary" loading={busy === 'install'} onClick={installTools}>Install quota tools</Button> : <Link className="btn" to="/software/install-distro-packages">Open Install Distro Packages</Link>}
+                    {data.pkgAvailable ? <Button variant="primary" loading={busy === 'install'} onClick={installTools}>Install quota tools</Button> : quotaPackages(data).length ? <InstallPackages packages={quotaPackages(data)} label="Install quota tools" onFinished={refetch} /> : <Link className="btn" to="/software/install-distro-packages?tab=search&q=quota">Open Install Software</Link>}
                   </div>
                 </div>
               )}

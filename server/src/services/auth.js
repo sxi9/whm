@@ -96,6 +96,18 @@ export function createAuthService(ctx) {
     return ageDays > p.passwordMaxAgeDays;
   }
 
+  // The account-panel listeners sign in account users only. Decided as soon
+  // as the credential is accepted and before anything is recorded, so a
+  // refused administrator leaves no successful login behind (last_login_*,
+  // login_attempts, the new-address notification) and no session.
+  const wrongPortError = () => new HttpError(403, 'wrong_port', `Administrators and resellers sign in on port ${Number(ctx.config?.tlsPort) || 2087}`);
+  function assertShellAllows(user, shell) {
+    if (shell !== 'panel' || user.role === 'user') return;
+    const err = wrongPortError();
+    err.user = publicUser(user);
+    throw err;
+  }
+
   const needsEnrollment = (user, p) => !user.totp_enabled && ((user.role === 'root' && p.require2faForRoot) || (user.role === 'reseller' && p.require2faForResellers));
 
   const isNewAddress = (user, ip, p) => Boolean(p.verifiedIpLogin && user.last_login_ip && user.last_login_ip !== ip && !stmts.knownIp.get(user.username, ip, KNOWN_IP_WINDOW));
@@ -119,7 +131,7 @@ export function createAuthService(ctx) {
     publicUser,
     policy,
 
-    async login({ username, password, ip }) {
+    async login({ username, password, ip, shell }) {
       enforceBruteForce(ip);
       const user = stmts.byUsername.get(username);
       const ok = user && !user.suspended && (await crypto.verifyPassword(password, user.password_hash));
@@ -127,6 +139,7 @@ export function createAuthService(ctx) {
         recordFailure(ip, username);
         throw unauthorized('Invalid username or password');
       }
+      assertShellAllows(user, shell);
       const p = policy();
       const newIp = isNewAddress(user, ip, p);
       stmts.recordAttempt.run(ip, username, 1);
@@ -134,7 +147,7 @@ export function createAuthService(ctx) {
       return finishLogin(user, ip, p, { newIp });
     },
 
-    async verify2fa({ userId, code, ip, newIp = false }) {
+    async verify2fa({ userId, code, ip, newIp = false, shell }) {
       enforceBruteForce(ip);
       const user = stmts.byId.get(userId);
       if (!user?.totp_enabled) throw badRequest('Two-factor authentication is not pending for this session');
@@ -142,15 +155,17 @@ export function createAuthService(ctx) {
         recordFailure(ip, user.username);
         throw unauthorized('Invalid verification code');
       }
+      assertShellAllows(user, shell);
       return finishLogin(user, ip, policy(), { newIp, via: '2fa' });
     },
 
     // A verified external (OpenID Connect) identity linked to a panel user.
     // TOTP still applies when the user has it enabled.
-    async externalLogin({ userId, ip, provider }) {
+    async externalLogin({ userId, ip, provider, shell }) {
       enforceBruteForce(ip);
       const user = stmts.byId.get(userId);
       if (!user || user.suspended) throw unauthorized('This panel user cannot log in');
+      assertShellAllows(user, shell);
       const p = policy();
       const newIp = isNewAddress(user, ip, p);
       stmts.recordAttempt.run(ip, user.username, 1);

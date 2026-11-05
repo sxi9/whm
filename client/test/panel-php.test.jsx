@@ -41,7 +41,7 @@ const versionsData = {
     { id: '8.3', label: 'PHP 8.3', version: '8.3.6', isDefault: true, advisories: [{ id: 'CVE-2026-1', severity: 'critical', title: 'Remote code execution', fixedIn: '8.3.36' }] },
     { id: '8.2', label: 'PHP 8.2', version: '8.2.20', isDefault: false, advisories: [] },
   ],
-  defaultId: '8.3', planDefault: null, restricted: false,
+  defaultId: '8.3', planDefault: null, restricted: false, usage: { '8.3': 1, '8.2': 1 }, recommended: '8.2',
 };
 const domainsData = {
   systemDefault: '8.3',
@@ -80,6 +80,34 @@ describe('PHP versions', () => {
     expect(html).toContain('href="/panel/php/ini"');
     expect(html).toContain('Search domains');
     expect(html).not.toContain('>Save</button>');
+  });
+
+  it('shows the recommended pill, the usage column and the Set-all card only with several domains', () => {
+    responses = { '/panel/php/versions': { data: versionsData }, '/panel/php/domains': { data: domainsData } };
+    const html = render(<PhpVersions fn={fns.versions} />);
+    expect(html).toContain('<th>Your domains</th>');
+    expect(html).toContain('>Recommended<');
+    expect(html).toContain('<td>1</td>');
+    expect(html).toContain('Set all domains');
+    expect(html).toContain('aria-label="PHP version for all domains"');
+    expect(html).toContain('Apply to 2 domains');
+    expect(html).toContain('PHP 8.2 (8.2.20)</td>');
+    responses = { '/panel/php/versions': { data: versionsData }, '/panel/php/domains': { data: { ...domainsData, domains: domainsData.domains.slice(0, 1) } } };
+    const single = render(<PhpVersions fn={fns.versions} />);
+    expect(single).not.toContain('Set all domains');
+    expect(single).not.toContain('Apply to 1 domains');
+  });
+
+  it('keeps a version a domain still runs after the admin stops offering it, labelled as such', () => {
+    const legacy = { ...versionsData, versions: [versionsData.versions[0], { ...versionsData.versions[1], legacy: true }], usage: { '8.3': 1, '8.2': 1 }, recommended: '8.3' };
+    responses = { '/panel/php/versions': { data: legacy }, '/panel/php/domains': { data: domainsData } };
+    const html = render(<PhpVersions fn={fns.versions} />);
+    expect(html).toContain('no longer offered; domains already on it keep it');
+    expect(html).toContain('<option value="8.2" selected="">PHP 8.2 (8.2.20) (no longer offered)</option>');
+    expect(versionOptions(legacy, '8.3').map((o) => o.label)).toEqual(['Server default (PHP 8.3 (8.3.6))', 'PHP 8.3 (8.3.6)', 'PHP 8.2 (8.2.20) (no longer offered)']);
+    const allPicker = html.slice(html.indexOf('aria-label="PHP version for all domains"'), html.indexOf('</select>', html.indexOf('aria-label="PHP version for all domains"')));
+    expect(allPicker).toContain('value="8.3"');
+    expect(allPicker).not.toContain('value="8.2"');
   });
 
   it('shows the empty state without web domains', () => {

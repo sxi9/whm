@@ -3,6 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { compareVersions, pickBasic, BASIC_DIRECTIVES, EA4_CATALOG } from '../src/services/software.js';
+import { RUNTIMES, TOOLS, resolveInstall, reposFor, detectedVersion } from '../src/services/software-runtimes.js';
 
 const BIN_FULL = { 'apt-get': true, 'dpkg-query': true, php: true, 'php-fpm': true, nginx: true, perl: true, cpan: true, gem: true, pip3: true, apache2ctl: true, systemctl: true };
 const PHP = { id: '8.3', label: 'PHP 8.3', binary: '/usr/bin/php8.3', layout: 'debian', version: '8.3.6', iniPath: '/etc/php/8.3/fpm/php.ini', iniPaths: { fpm: '/etc/php/8.3/fpm/php.ini', cli: '/etc/php/8.3/cli/php.ini' }, poolDir: '/etc/php/8.3/fpm/pool.d', fpmUnit: 'php8.3-fpm', isDefault: true, fpmActive: true, fpmInstalled: true };
@@ -11,6 +12,17 @@ const INI = '[PHP]\nmemory_limit = 128M\nupload_max_filesize = 2M\n;display_erro
 let installedPkgs = [{ name: 'apache2', version: '2.4.58', arch: 'amd64', summary: 'Apache HTTP Server' }, { name: 'php-fpm', version: '8.3', arch: 'all', summary: 'FPM' }, { name: 'curl', version: '8.5.0', arch: 'amd64', summary: 'cli' }, { name: 'libapache2-mod-evasive', version: '1.1', arch: 'amd64', summary: 'evasive' }];
 let nginxState = { installed: true, active: true, proxyConfigured: false, content: null };
 let rpmPresent = false;
+// One-click installs: repo state per enum key, Node.js builds under /opt/keel/node, PHP CLI default.
+let repoState = { php: 'added', python: 'unsupported', epel: 'present' };
+let nodeVersions = [{ major: 22, version: 'v22.11.0', path: '/opt/keel/node/22', bin: '/opt/keel/node/22/bin/node' }];
+let phpCliDefault = '8.3';
+const detectRuntimes = () => ({
+  os: { id: 'ubuntu', idLike: ['debian'], versionId: '26.04', codename: 'resolute', family: 'debian' },
+  php: [...new Set(installedPkgs.map((p) => /^php(\d\.\d)-fpm$/.exec(p.name)?.[1]).filter(Boolean)), '8.3', '8.2'].map((id) => ({ id, version: `${id}.6` })),
+  node: { system: { version: 'v22.11.0', path: '/usr/bin/node' }, versions: nodeVersions },
+  python: [{ minor: '3.12', version: '3.12.3', bin: '/usr/bin/python3.12' }, ...(installedPkgs.some((p) => p.name === 'python3.11') ? [{ minor: '3.11', version: '3.11.9', bin: '/usr/bin/python3.11' }] : [])],
+  ruby: installedPkgs.some((p) => p.name === 'ruby-full') ? '3.3.0' : null, go: null, composer: null, perl: '5.38.2',
+});
 
 let app;
 let csrf;
@@ -59,8 +71,14 @@ beforeAll(async () => {
     'pkg.pip.install': ({ package: name }) => ({ installer: 'pip3', package: name, output: [`Successfully installed ${name}`] }),
     'pkg.pecl.list': () => ({ extensions: [] }),
     'pkg.pecl.install': ({ extension }) => ({ installer: 'pecl', extension, output: ['Build complete.'], iniHint: `extension=${extension}.so` }),
-    'pkg.php.versions': () => ({ versions: [PHP, PHP82], defaultId: '8.3', defaultBinary: '/usr/bin/php8.3' }),
-    'pkg.php.default.set': ({ version }) => ({ version, binary: `/usr/bin/php${version}`, tool: 'update-alternatives' }),
+    'pkg.php.versions': () => ({ versions: [PHP, PHP82], defaultId: phpCliDefault, defaultBinary: `/usr/bin/php${phpCliDefault}` }),
+    'pkg.php.default.set': ({ version }) => { phpCliDefault = version; return { version, binary: `/usr/bin/php${version}`, tool: 'update-alternatives' }; },
+    'pkg.os.release': () => detectRuntimes().os,
+    'pkg.repo.ensure': ({ repo }) => ({ repo, family: 'debian', action: repoState[repo] ?? 'present', detail: repoState[repo] === 'unsupported' ? 'Debian ships one Python version; deadsnakes is Ubuntu only' : `ppa for ${repo}` }),
+    'pkg.node.list': () => ({ system: { version: 'v22.11.0', path: '/usr/bin/node' }, versions: nodeVersions }),
+    'pkg.node.install': ({ major }) => { const entry = { major, version: `v${major}.0.0`, path: `/opt/keel/node/${major}`, bin: `/opt/keel/node/${major}/bin/node`, symlinks: [`/usr/local/bin/node${major}`, `/usr/local/bin/npm${major}`, `/usr/local/bin/npx${major}`] }; nodeVersions = [...nodeVersions.filter((n) => n.major !== major), entry]; return { ...entry, output: [`Node.js ${entry.version} installed under ${entry.path}`] }; },
+    'pkg.node.remove': ({ major }) => { nodeVersions = nodeVersions.filter((n) => n.major !== major); return { major, removed: true, symlinks: [`/usr/local/bin/node${major}`] }; },
+    'pkg.runtime.detect': () => detectRuntimes(),
     'pkg.php.ini.read': ({ version, sapi }) => { if (!['8.3', '8.2'].includes(version)) throw Object.assign(new Error(`PHP version "${version}" is not installed on this server`), { agentError: true, code: 'not_found', details: {} }); return { version, path: sapi ? `/etc/php/${version}/${sapi}/php.ini` : `/etc/php/${version}/fpm/php.ini`, sapis: PHP.iniPaths, content: INI, directives: { memory_limit: '128M', upload_max_filesize: '2M' } }; },
     'pkg.php.ini.write': ({ version, directives, content }) => ({ version, path: `/etc/php/${version}/fpm/php.ini`, bytes: 100, directives: { memory_limit: directives?.memory_limit ?? '128M', ...(content ? { from: 'content' } : {}) }, fpmUnit: `php${version}-fpm` }),
     'pkg.php.userini.read': ({ docroot }) => ({ docroot, path: `${docroot}/.user.ini`, exists: false, content: '', directives: {} }),
@@ -125,7 +143,8 @@ describe('module registration and RBAC', () => {
     expect(typeof app.ctx.software.php.versionForDomain).toBe('function');
     expect(typeof app.ctx.software.nginx.sync).toBe('function');
     expect(typeof app.ctx.software.update.status).toBe('function');
-    for (const t of ['software.pkg.install', 'software.pkg.remove', 'software.system.update', 'software.update.check', 'software.perl.install', 'software.module.install', 'software.nginx.install', 'software.nginx.sync', 'software.rpmdb.rebuild', 'software.php.resync', 'software.php.apply', 'software.ea4.build']) expect(app.ctx.jobs.types()).toContain(t);
+    for (const t of ['software.pkg.install', 'software.pkg.remove', 'software.system.update', 'software.update.check', 'software.perl.install', 'software.module.install', 'software.nginx.install', 'software.nginx.sync', 'software.rpmdb.rebuild', 'software.php.resync', 'software.php.apply', 'software.ea4.build', 'software.runtime.install', 'software.runtime.remove']) expect(app.ctx.jobs.types()).toContain(t);
+    expect(typeof app.ctx.software.runtimes.catalog).toBe('function');
     expect(app.ctx.scheduler.list().find((s) => s.name === 'os-update-check')?.cron).toBe('41 5 * * *');
     // Hourly, and paused at boot because the proxy is off: no skipped job rows pile up.
     expect(app.ctx.scheduler.list().find((s) => s.name === 'nginx-proxy-sync')).toMatchObject({ cron: '23 * * * *', job_type: 'software.nginx.sync', enabled: 0 });
@@ -150,10 +169,12 @@ describe('module registration and RBAC', () => {
   });
 
   it('server-wide functions are root only', async () => {
-    for (const url of ['/api/software/pkg/detect', '/api/software/pkg/installed', '/api/software/pkg/search?q=curl', '/api/software/update/status', '/api/software/rpmdb', '/api/software/perl/modules', '/api/software/modules/installers', '/api/software/panel/update', '/api/software/php/pools', '/api/software/php/ini/8.3', '/api/software/nginx', '/api/software/ea4/profiles']) {
+    for (const url of ['/api/software/pkg/detect', '/api/software/pkg/installed', '/api/software/pkg/search?q=curl', '/api/software/update/status', '/api/software/rpmdb', '/api/software/perl/modules', '/api/software/modules/installers', '/api/software/panel/update', '/api/software/php/pools', '/api/software/php/ini/8.3', '/api/software/nginx', '/api/software/ea4/profiles', '/api/software/runtimes', '/api/software/runtimes/recent']) {
       expect((await reseller.get(url)).status, url).toBe(403);
     }
     expect((await mutate(reseller, 'post', '/api/software/pkg/install', { packages: ['nginx'] }, resellerCsrf)).status).toBe(403);
+    expect((await mutate(reseller, 'post', '/api/software/runtimes/install', { runtime: 'php', version: '8.4' }, resellerCsrf)).status).toBe(403);
+    expect((await mutate(reseller, 'post', '/api/software/runtimes/remove', { runtime: 'nodejs', version: '22' }, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'post', '/api/software/update/run', {}, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'put', '/api/software/php/default', { version: '8.2' }, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'put', '/api/software/php/ini/8.3', { directives: { memory_limit: '1G' } }, resellerCsrf)).status).toBe(403);
@@ -442,6 +463,182 @@ describe('Install Distro Packages', () => {
   });
 });
 
+describe('Install Software (one-click runtimes and tools)', () => {
+  it('catalog helpers resolve packages per family and refuse what is not in the catalog', () => {
+    expect(resolveInstall({ runtime: 'php', version: '8.4' }, 'debian').packages).toEqual(RUNTIMES.php.debian('8.4'));
+    expect(resolveInstall({ runtime: 'php', version: '8.4' }, 'rhel')).toMatchObject({ packages: expect.arrayContaining(['php84-php-fpm', 'php84-php-pecl-imagick']), repos: ['php', 'epel'] });
+    expect(resolveInstall({ runtime: 'python', version: '3.11' }, 'debian').repos).toEqual(['python']);
+    expect(resolveInstall({ runtime: 'composer' }, 'debian').repos).toEqual([]);
+    expect(resolveInstall({ runtime: 'composer' }, 'rhel').repos).toEqual(['epel']);
+    expect(resolveInstall({ runtime: 'ruby', version: '9.9' }, 'debian')).toMatchObject({ version: null, packages: ['ruby-full'] });
+    expect(resolveInstall({ runtime: 'nodejs', version: '22' }, null)).toMatchObject({ installer: 'node', major: 22, packages: [] });
+    expect(resolveInstall({ tool: 'bind' }, 'rhel').packages).toEqual(['bind', 'bind-utils']);
+    expect(() => resolveInstall({ runtime: 'php', version: '5.6' }, 'debian')).toThrow(/not in the catalog/);
+    expect(() => resolveInstall({ runtime: 'php' }, 'debian')).toThrow(/needs a version/);
+    expect(() => resolveInstall({ runtime: 'php', version: '8.4' }, null)).toThrow(/No packages are known/);
+    expect(() => resolveInstall({ tool: 'nope' }, 'debian')).toThrow(/Unknown tool/);
+    expect(reposFor(RUNTIMES.composer, 'debian')).toEqual([]);
+    expect(TOOLS.every((t) => Array.isArray(t.debian) && Array.isArray(t.rhel))).toBe(true);
+    expect(detectedVersion('php', '8.3', { php: [{ id: 'ea-php83', version: '8.3.1' }] })).toMatchObject({ installed: true, version: '8.3.1' });
+    expect(detectedVersion('nodejs', '20', { node: { versions: [{ major: 22 }] } }).installed).toBe(false);
+    expect(detectedVersion('go', null, { go: null }).installed).toBe(false);
+  });
+
+  it('lists the catalog with installed state from one runtime detection and one package listing', async () => {
+    installedPkgs.push({ name: 'git', version: '2.43', arch: 'amd64', summary: 'git' });
+    app.agent.calls.length = 0;
+    const res = await get('/api/software/runtimes');
+    expect(res.status).toBe(200);
+    const d = res.body.data;
+    expect(d).toMatchObject({ family: 'debian', manager: 'apt', capability: true, os: { id: 'ubuntu', family: 'debian' } });
+    expect(d.runtimes.map((r) => r.key)).toEqual(['php', 'nodejs', 'python', 'ruby', 'go', 'composer']);
+    const php = d.runtimes.find((r) => r.key === 'php');
+    expect(php.versions.map((v) => [v.id, v.installed])).toEqual([['8.5', false], ['8.4', false], ['8.3', true], ['8.2', true], ['8.1', false], ['7.4', false]]);
+    expect(php.versions.find((v) => v.id === '8.3')).toMatchObject({ label: 'PHP 8.3', version: '8.3.6', repo: 'php', packages: RUNTIMES.php.debian('8.3') });
+    expect(php.versions[0].note).toMatch(/ondrej/);
+    const node = d.runtimes.find((r) => r.key === 'nodejs');
+    expect(node.versions.find((v) => v.id === '22')).toMatchObject({ installed: true, version: 'v22.11.0', path: '/opt/keel/node/22', bin: '/usr/local/bin/node22', packages: [], repo: null });
+    expect(node.versions.find((v) => v.id === '20')).toMatchObject({ installed: false, bin: '/usr/local/bin/node20' });
+    expect(node.versions[0].note).toMatch(/\/opt\/keel\/node/);
+    const python = d.runtimes.find((r) => r.key === 'python');
+    expect(python.versions.find((v) => v.id === '3.12')).toMatchObject({ installed: true, version: '3.12.3', packages: ['python3.12', 'python3.12-venv', 'python3.12-dev'] });
+    expect(python.versions.find((v) => v.id === '3.11').installed).toBe(false);
+    expect(d.runtimes.find((r) => r.key === 'ruby')).toMatchObject({ single: true, versions: [{ id: 'ruby', installed: false, packages: ['ruby-full'] }] });
+    // composer's EPEL repo is RHEL-only.
+    expect(d.runtimes.find((r) => r.key === 'composer').versions[0].repo).toBeNull();
+    expect(d.tools.find((t) => t.key === 'git')).toEqual({ key: 'git', label: 'Git', packages: ['git'], installed: true });
+    expect(d.tools.find((t) => t.key === 'bind')).toMatchObject({ packages: ['bind9', 'bind9utils'], installed: false });
+    expect(d.tools.find((t) => t.key === 'cpanminus').packages).toEqual(['cpanminus']);
+    expect(app.agent.callsTo('pkg.runtime.detect')).toHaveLength(1);
+    expect(app.agent.callsTo('pkg.list_installed')).toHaveLength(1);
+    expect(app.agent.callsTo('pkg.list_installed')[0].args.prefix).toEqual(expect.arrayContaining(['git', 'bind9', 'clamav-daemon']));
+  });
+
+  it('installs a PHP version: repo.ensure -> update_index (only when added) -> pkg.install with the exact list -> CLI default restored', async () => {
+    repoState.php = 'added';
+    phpCliDefault = '8.3';
+    // ondrej's alternatives pick the newest php on install; the panel puts the previous default back.
+    app.agent.set('pkg.install', ({ packages }) => { installedPkgs = [...installedPkgs, ...packages.map((name) => ({ name, version: '1.0', arch: 'amd64', summary: 'installed by test' }))]; if (packages.includes('php8.4-fpm')) phpCliDefault = '8.4'; return { manager: 'apt', packages, output: [`Setting up ${packages.join(' ')}`] }; });
+    app.agent.calls.length = 0;
+    try {
+      const res = await post('/api/software/runtimes/install', { runtime: 'php', version: '8.4' });
+      expect(res.status).toBe(202);
+      expect(res.body.data).toMatchObject({ target: 'php:8.4', job: { type: 'software.runtime.install' } });
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status).toBe('done');
+      expect(job.result).toMatchObject({ runtime: 'php', version: '8.4', installed: true, detected: '8.4.6', packages: RUNTIMES.php.debian('8.4') });
+      const order = app.agent.calls.map((c) => c.name).filter((n) => ['pkg.repo.ensure', 'pkg.update_index', 'pkg.install', 'pkg.php.default.set', 'pkg.runtime.detect'].includes(n));
+      expect(order).toEqual(['pkg.repo.ensure', 'pkg.update_index', 'pkg.install', 'pkg.php.default.set', 'pkg.runtime.detect']);
+      expect(app.agent.callsTo('pkg.repo.ensure').map((c) => c.args)).toEqual([{ repo: 'php' }]);
+      expect(app.agent.callsTo('pkg.install').pop().args).toEqual({ packages: RUNTIMES.php.debian('8.4'), wait: false });
+      expect(app.agent.callsTo('pkg.php.default.set').pop().args).toEqual({ version: '8.3' });
+      expect(phpCliDefault).toBe('8.3');
+      expect(job.logs.some((l) => /switched the php CLI default to 8\.4; restored 8\.3/.test(l.line))).toBe(true);
+      expect(job.logs.some((l) => /repository php: added/.test(l.line))).toBe(true);
+      expect(app.ctx.db.prepare("SELECT target FROM audit_log WHERE action = 'software.runtime.install' ORDER BY id DESC LIMIT 1").get().target).toBe('php:8.4');
+      expect((await get('/api/software/runtimes')).body.data.runtimes.find((r) => r.key === 'php').versions.find((v) => v.id === '8.4')).toMatchObject({ installed: true, version: '8.4.6' });
+      const recent = await get('/api/software/runtimes/recent');
+      expect(recent.body.data[0]).toMatchObject({ id: job.id, type: 'software.runtime.install' });
+
+      // Repo already present: no index refresh, and an unchanged CLI default is left alone.
+      repoState.php = 'present';
+      app.agent.calls.length = 0;
+      const again = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.1' })).body.data.job.id);
+      expect(again.status).toBe('done');
+      expect(app.agent.callsTo('pkg.update_index')).toHaveLength(0);
+      expect(app.agent.callsTo('pkg.php.default.set')).toHaveLength(0);
+      expect(app.agent.callsTo('pkg.install').pop().args.packages).toEqual(RUNTIMES.php.debian('8.1'));
+    } finally {
+      app.agent.set('pkg.install', ({ packages }) => { installedPkgs = [...installedPkgs, ...packages.filter((p) => !installedPkgs.some((i) => i.name === p)).map((name) => ({ name, version: '1.0', arch: 'amd64', summary: 'installed by test' }))]; return { manager: 'apt', packages, output: [`Setting up ${packages.join(' ')}`] }; });
+    }
+  });
+
+  it('installs and removes a Node.js major through pkg.node.* without touching distro packages', async () => {
+    app.agent.calls.length = 0;
+    const res = await post('/api/software/runtimes/install', { runtime: 'nodejs', version: '20' });
+    expect(res.status).toBe(202);
+    const job = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(job.status).toBe('done');
+    expect(job.result).toMatchObject({ runtime: 'nodejs', version: '20', installed: true, detected: 'v20.0.0', path: '/opt/keel/node/20', symlinks: ['/usr/local/bin/node20', '/usr/local/bin/npm20', '/usr/local/bin/npx20'] });
+    expect(app.agent.callsTo('pkg.node.install').map((c) => c.args)).toEqual([{ major: 20, wait: false }]);
+    expect(app.agent.callsTo('pkg.install')).toHaveLength(0);
+    expect(app.agent.callsTo('pkg.repo.ensure')).toHaveLength(0);
+    expect(job.logs.some((l) => l.line.includes('installed under /opt/keel/node/20'))).toBe(true);
+    expect((await get('/api/software/runtimes')).body.data.runtimes.find((r) => r.key === 'nodejs').versions.find((v) => v.id === '20')).toMatchObject({ installed: true, version: 'v20.0.0' });
+    const rm = await post('/api/software/runtimes/remove', { runtime: 'nodejs', version: '20' });
+    expect(rm.status).toBe(202);
+    const removed = await waitForJob(app.ctx, rm.body.data.job.id);
+    expect(removed.status).toBe('done');
+    expect(removed.result).toMatchObject({ runtime: 'nodejs', version: '20', removed: true });
+    expect(app.agent.callsTo('pkg.node.remove').pop().args).toEqual({ major: 20 });
+    expect((await get('/api/software/runtimes')).body.data.runtimes.find((r) => r.key === 'nodejs').versions.find((v) => v.id === '20').installed).toBe(false);
+    expect((await get('/api/software/runtimes/recent')).body.data.map((j) => j.type).slice(0, 2)).toEqual(['software.runtime.remove', 'software.runtime.install']);
+  });
+
+  it('fails the job with the repository message when the distribution has no repo for it, installing nothing', async () => {
+    app.agent.calls.length = 0;
+    const res = await post('/api/software/runtimes/install', { runtime: 'python', version: '3.11' });
+    expect(res.status).toBe(202);
+    const job = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(/Python 3\.11 cannot be installed on this distribution: Debian ships one Python version/);
+    expect(app.agent.callsTo('pkg.install')).toHaveLength(0);
+    expect(app.agent.callsTo('pkg.update_index')).toHaveLength(0);
+    // A runtime still missing after the installer finished is a failure, not a silent "done".
+    app.agent.set('pkg.runtime.detect', () => ({ ...detectRuntimes(), ruby: null }));
+    try {
+      const ruby = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'ruby' })).body.data.job.id);
+      expect(ruby.status).toBe('failed');
+      expect(ruby.error).toMatch(/Ruby is still not detected/);
+      expect(app.agent.callsTo('pkg.install').pop().args.packages).toEqual(['ruby-full']);
+    } finally { app.agent.set('pkg.runtime.detect', () => detectRuntimes()); }
+  });
+
+  it('installs a catalog tool with the host family packages', async () => {
+    const res = await post('/api/software/runtimes/install', { tool: 'bind' });
+    expect(res.status).toBe(202);
+    const job = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(job.status).toBe('done');
+    expect(job.result).toMatchObject({ tool: 'bind', packages: ['bind9', 'bind9utils'], installed: true });
+    expect(app.agent.callsTo('pkg.install').pop().args.packages).toEqual(['bind9', 'bind9utils']);
+    expect((await get('/api/software/runtimes')).body.data.tools.find((t) => t.key === 'bind').installed).toBe(true);
+    expect(app.ctx.db.prepare("SELECT target FROM audit_log WHERE action = 'software.runtime.install' ORDER BY id DESC LIMIT 1").get().target).toBe('bind');
+  });
+
+  it('refuses versions outside the catalog and malformed bodies with 422 before any job', async () => {
+    const before = app.ctx.jobs.list({ limit: 500 }).length;
+    for (const body of [{ runtime: 'php', version: '5.6' }, { runtime: 'php' }, { runtime: 'nodejs', version: '21' }, { runtime: 'python', version: '2.7' }, { runtime: 'php', version: '8.4', tool: 'git' }, {}, { tool: 'git', version: '1' }, { tool: 'vim' }, { runtime: 'perl' }, { runtime: 'php', version: '8.4;id' }, { runtime: 'php', version: '8.4', extra: true }]) {
+      expect((await post('/api/software/runtimes/install', body)).status, JSON.stringify(body)).toBe(422);
+    }
+    for (const body of [{ runtime: 'php', version: '8.2' }, { runtime: 'nodejs' }, { runtime: 'nodejs', version: '99' }, { runtime: 'nodejs', version: '22', purge: true }]) {
+      expect((await post('/api/software/runtimes/remove', body)).status, JSON.stringify(body)).toBe(422);
+    }
+    expect(app.ctx.jobs.list({ limit: 500 }).length).toBe(before);
+    // Single runtimes ignore the version.
+    const ruby = await post('/api/software/runtimes/install', { runtime: 'ruby', version: '3.3' });
+    expect(ruby.status).toBe(202);
+    expect((await waitForJob(app.ctx, ruby.body.data.job.id)).result).toMatchObject({ runtime: 'ruby', version: null, packages: ['ruby-full'] });
+  });
+
+  it('the catalog never fails without a package manager, and package installs answer 501 there', async () => {
+    await provision(false);
+    try {
+      const res = await get('/api/software/runtimes');
+      expect(res.status).toBe(200);
+      expect(res.body.data.capability).toBe(false);
+      expect(res.body.data.tools.every((t) => t.installed === null)).toBe(true);
+      expect((await post('/api/software/runtimes/install', { runtime: 'php', version: '8.4' })).status).toBe(501);
+      expect((await post('/api/software/runtimes/install', { tool: 'git' })).status).toBe(501);
+    } finally { await provision(true); }
+  });
+
+  it('module installers carry the distro packages that bring each installer', async () => {
+    const inst = await get('/api/software/modules/installers');
+    expect(inst.body.data.family).toBe('debian');
+    expect(inst.body.data.packages).toEqual({ php: ['php-pear', 'php-dev'], perl: ['cpanminus'], ruby: ['ruby-full'], python3: ['python3-pip'] });
+  });
+});
+
 describe('System Update', () => {
   it('shows pending updates and runs the upgrade job', async () => {
     app.ctx.settings.set('software.updates.last_check', null);
@@ -690,6 +887,167 @@ describe('MultiPHP Manager', () => {
       expect(unloaded.body.data.web.state).toBe('not-loaded');
       expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'software.php.default'").get().n).toBeGreaterThanOrEqual(4);
     } finally { app.ctx.web = prevWeb; }
+  });
+});
+
+describe('PHP Version Manager', () => {
+  const REPO_404 = { repo: 'php', family: 'debian', present: false, supported: false, detail: 'ppa:ondrej/php has no packages for Ubuntu 26.04 resolute; the distribution ships its own versions only' };
+  const stockVersions = () => ({ versions: [PHP, PHP82], defaultId: phpCliDefault, defaultBinary: `/usr/bin/php${phpCliDefault}` });
+
+  it('registers the removal job and keeps the PHP routes root-only', async () => {
+    expect(app.ctx.jobs.types()).toContain('software.php.remove');
+    expect((await reseller.get('/api/software/php/catalog')).status).toBe(403);
+    expect((await reseller.get('/api/software/php/usage')).status).toBe(403);
+    expect((await mutate(reseller, 'put', '/api/software/php/offered', { versions: ['8.3'] }, resellerCsrf)).status).toBe(403);
+    expect((await mutate(reseller, 'post', '/api/software/php/remove', { version: '8.2' }, resellerCsrf)).status).toBe(403);
+  });
+
+  it('lists every catalog version with its state from one repo probe, appending installed extras', async () => {
+    await put('/api/software/php/default', { version: '8.3' });
+    await put('/api/software/php/domains', { domains: ['alice.com', 'bob.com'], version: null });
+    app.agent.set('pkg.repo.status', () => REPO_404);
+    app.agent.set('pkg.php.versions', () => ({ ...stockVersions(), versions: [PHP, PHP82, { id: 'system', label: 'System PHP', binary: '/usr/bin/php', layout: 'unknown', version: '8.6.1', iniPath: null, fpmUnit: 'php-fpm', isDefault: false, fpmActive: null, fpmInstalled: false }] }));
+    app.agent.calls.length = 0;
+    try {
+      const res = await get('/api/software/php/catalog');
+      expect(res.status).toBe(200);
+      const d = res.body.data;
+      expect(d).toMatchObject({ family: 'debian', manager: 'apt', capability: true, phpCapability: true, effectiveDefault: '8.3', offered: null });
+      expect(d.versions.map((v) => [v.id, v.state])).toEqual([['8.5', 'unsupported'], ['8.4', 'unsupported'], ['8.3', 'installed'], ['8.2', 'installed'], ['8.1', 'unsupported'], ['7.4', 'unsupported'], ['system', 'installed']]);
+      const v83 = d.versions.find((v) => v.id === '8.3');
+      expect(v83).toMatchObject({ catalogVersion: '8.3', label: 'PHP 8.3', installed: true, version: '8.3.6', binary: '/usr/bin/php8.3', fpmUnit: 'php8.3-fpm', fpmActive: true, isDefault: true, isSystemDefault: true, offered: true, domains: 0, repo: 'php', repoStatus: { present: false, supported: false } });
+      expect(v83.packages).toEqual(RUNTIMES.php.debian('8.3'));
+      expect(v83.advisories.length).toBeGreaterThan(0);
+      const v84 = d.versions.find((v) => v.id === '8.4');
+      expect(v84).toMatchObject({ installed: false, offered: false, isSystemDefault: false, domains: 0, binary: null });
+      expect(v84.note).toMatch(/no packages for Ubuntu 26.04 resolute/);
+      expect(d.versions.find((v) => v.id === 'system')).toMatchObject({ catalogVersion: null, state: 'installed', installed: true, version: '8.6.1', offered: true, packages: [], repo: null, repoStatus: null });
+      expect(app.agent.callsTo('pkg.repo.status')).toHaveLength(1);
+      expect(app.agent.callsTo('pkg.repo.status')[0].args).toEqual({ repo: 'php' });
+      expect(app.agent.callsTo('pkg.php.versions')).toHaveLength(1);
+      expect(app.agent.callsTo('pkg.runtime.detect')).toHaveLength(1);
+      // A probe that fails (offline) leaves the row installable but marked unknown.
+      app.agent.fail('pkg.repo.status', 'command_failed', 'curl: (6) could not resolve host');
+      const offline = (await get('/api/software/php/catalog')).body.data;
+      expect(offline.versions.find((v) => v.id === '8.4').state).toBe('unknown');
+      expect(offline.versions.find((v) => v.id === '8.3').state).toBe('installed');
+      app.agent.set('pkg.repo.status', () => ({ repo: 'php', family: 'debian', present: false, supported: null, detail: 'ppa:ondrej/php could not be checked: probe failed (curl exit 6)' }));
+      const unknown = (await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === '8.4');
+      expect(unknown).toMatchObject({ state: 'unknown', note: 'ppa:ondrej/php could not be checked: probe failed (curl exit 6)' });
+      app.agent.set('pkg.repo.status', () => ({ repo: 'php', family: 'debian', present: true, supported: true, detail: 'ppa:ondrej/php in ondrej.list' }));
+      const online = (await get('/api/software/php/catalog')).body.data;
+      expect(online.versions.find((v) => v.id === '8.4')).toMatchObject({ state: 'available', note: expect.stringMatching(/ondrej/) });
+    } finally {
+      app.agent.set('pkg.php.versions', stockVersions);
+      app.agent.set('pkg.repo.status', () => REPO_404);
+    }
+  });
+
+  it('the offered list is a panel-only filter persisted as a setting and validated against installed versions', async () => {
+    const res = await put('/api/software/php/offered', { versions: ['8.3'] });
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual({ offered: ['8.3'] });
+    expect(app.ctx.settings.get('php.offered_versions')).toEqual(['8.3']);
+    expect(app.ctx.software.php.offeredVersions()).toEqual(['8.3']);
+    const cat = (await get('/api/software/php/catalog')).body.data;
+    expect(cat.offered).toEqual(['8.3']);
+    expect(cat.versions.filter((v) => v.installed).map((v) => [v.id, v.offered])).toEqual([['8.3', true], ['8.2', false]]);
+    // Root and reseller listings are untouched: offering is the account panel's filter.
+    expect((await get('/api/software/php/versions')).body.data.versions.map((v) => v.id)).toEqual(['8.3', '8.2']);
+    expect((await reseller.get('/api/software/php/versions')).body.data.versions.map((v) => v.id)).toEqual(['8.3', '8.2']);
+    const bad = await put('/api/software/php/offered', { versions: ['8.3', '8.4'] });
+    expect(bad.status).toBe(422);
+    expect(bad.body.error.fields).toHaveProperty('versions');
+    expect((await put('/api/software/php/offered', { versions: ['8.3', 'x;y'] })).status).toBe(422);
+    expect((await put('/api/software/php/offered', { versions: ['8.3'], extra: true })).status).toBe(422);
+    expect(app.ctx.settings.get('php.offered_versions')).toEqual(['8.3']);
+    expect((await put('/api/software/php/offered', { versions: null })).body.data).toEqual({ offered: null });
+    expect(app.ctx.software.php.offeredVersions()).toBeNull();
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'software.php.offered'").get().n).toBeGreaterThanOrEqual(2);
+  });
+
+  it('counts pinned domains per version and refuses to remove the default, a used version or an unknown one', async () => {
+    await put('/api/software/php/domains', { domains: ['bob.com'], version: '8.2' });
+    expect((await get('/api/software/php/usage')).body.data).toEqual({ '8.2': 1 });
+    expect((await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === '8.2').domains).toBe(1);
+    const def = await post('/api/software/php/remove', { version: '8.3' });
+    expect(def.status).toBe(422);
+    expect(def.body.error.message).toMatch(/system default/);
+    const used = await post('/api/software/php/remove', { version: '8.2' });
+    expect(used.status).toBe(422);
+    expect(used.body.error.message).toMatch(/1 domain/);
+    expect((await post('/api/software/php/remove', { version: '9.9' })).status).toBe(422);
+    expect((await post('/api/software/php/remove', { version: 'x;y' })).status).toBe(422);
+    expect((await post('/api/software/php/remove', { version: '8.2', purge: true })).status).toBe(422);
+    expect(app.agent.callsTo('pkg.php.remove')).toHaveLength(0);
+    await put('/api/software/php/domains', { domains: ['bob.com'], version: null });
+  });
+
+  it('refuses the CLI default when it differs from the configured default', async () => {
+    phpCliDefault = '8.2';
+    app.agent.set('pkg.php.versions', () => ({ ...stockVersions(), versions: [PHP, PHP82].map((v) => ({ ...v, isDefault: v.id === phpCliDefault })) }));
+    try {
+      expect((await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === '8.2')).toMatchObject({ isDefault: true, isSystemDefault: false });
+      const res = await post('/api/software/php/remove', { version: '8.2' });
+      expect(res.status).toBe(422);
+      expect(res.body.error.message).toMatch(/CLI default/);
+      expect(res.body.error.fields.version[0]).toMatch(/default first/);
+      expect(app.agent.callsTo('pkg.php.remove')).toHaveLength(0);
+    } finally { phpCliDefault = '8.3'; app.agent.set('pkg.php.versions', stockVersions); }
+  });
+
+  it('refuses the Apache web default, a package default and a rendered vhost version, and the catalog carries the counts', async () => {
+    const prevWeb = app.ctx.web;
+    let pinned = '8.2'; let vhosts = 2;
+    app.ctx.web = { apache: { settings: () => ({ defaultPhpVersion: pinned }) }, vhostsUsingPhp: (version) => (version === '8.2' ? vhosts : 0) };
+    try {
+      const web = await post('/api/software/php/remove', { version: '8.2' });
+      expect(web.status).toBe(422);
+      expect(web.body.error.message).toMatch(/Apache Configuration/);
+      pinned = null;
+      app.ctx.db.prepare("INSERT INTO packages (name, php_version) VALUES ('php82-plan', '8.2')").run();
+      const plans = await post('/api/software/php/remove', { version: '8.2' });
+      expect(plans.status).toBe(422);
+      expect(plans.body.error.message).toMatch(/1 package\(s\)/);
+      const cat = (await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === '8.2');
+      expect(cat).toMatchObject({ webDefault: false, plans: 1, vhosts: 2, domains: 0 });
+      expect((await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === '8.4')).toMatchObject({ webDefault: false, plans: 0, vhosts: 0 });
+      app.ctx.db.prepare("DELETE FROM packages WHERE name = 'php82-plan'").run();
+      const vh = await post('/api/software/php/remove', { version: '8.2' });
+      expect(vh.status).toBe(422);
+      expect(vh.body.error.message).toMatch(/2 web vhost/);
+      vhosts = 0;
+      expect(await app.ctx.software.php.removeBlocker('8.2')).toBeNull();
+      expect(app.agent.callsTo('pkg.php.remove')).toHaveLength(0);
+    } finally { app.ctx.web = prevWeb; }
+  });
+
+  it('the removal job re-checks the guards when it runs, not only when the request was accepted', async () => {
+    await put('/api/software/php/domains', { domains: ['bob.com'], version: '8.2' });
+    app.agent.calls.length = 0;
+    const job = { params: { version: '8.2' }, progress() {}, log() {} };
+    try {
+      await expect(app.ctx.software.php.removeJob(job)).rejects.toThrow(/pinned on 1 domain/);
+      expect(app.agent.callsTo('pkg.php.remove')).toHaveLength(0);
+    } finally { await put('/api/software/php/domains', { domains: ['bob.com'], version: null }); }
+  });
+
+  it('removes a free version through a job: pkg.php.remove, capability refresh, offered list pruned', async () => {
+    await put('/api/software/php/offered', { versions: ['8.3', '8.2'] });
+    app.agent.set('pkg.php.remove', ({ version, purge }) => ({ version, manager: 'apt', packages: [`php${version}-cli`, `php${version}-fpm`], purge, output: [`Removing php${version}-cli`] }));
+    app.agent.calls.length = 0;
+    const res = await post('/api/software/php/remove', { version: '8.2' });
+    expect(res.status, JSON.stringify(res.body)).toBe(202);
+    expect(res.body.data).toMatchObject({ version: '8.2', job: { type: 'software.php.remove' } });
+    const job = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(job.status).toBe('done');
+    expect(job.result).toEqual({ version: '8.2', packages: ['php8.2-cli', 'php8.2-fpm'], removed: true });
+    expect(app.agent.callsTo('pkg.php.remove')[0].args).toEqual({ version: '8.2', wait: false });
+    const names = app.agent.calls.map((c) => c.name);
+    expect(names.indexOf('sys.binaries')).toBeGreaterThan(names.indexOf('pkg.php.remove'));
+    expect(app.ctx.software.php.offeredVersions()).toEqual(['8.3']);
+    expect(app.ctx.db.prepare("SELECT 1 AS x FROM audit_log WHERE action = 'software.php.remove' AND target = '8.2'").get()).toBeTruthy();
+    await put('/api/software/php/offered', { versions: null });
   });
 });
 

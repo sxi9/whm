@@ -97,7 +97,7 @@ function Uploader({ onInspected }) {
   );
 }
 
-function PickArchive({ caps, onInspected }) {
+function PickArchive({ caps, onInstalled, onInspected }) {
   const { data, loading, error, refetch } = useApi('/transfers/archives');
   const [manual, setManual] = useState('');
   const [busy, setBusy] = useState(null);
@@ -108,7 +108,7 @@ function PickArchive({ caps, onInspected }) {
   };
   return (
     <>
-      <ToolingNotice caps={caps} needs={['tar']} />
+      <ToolingNotice caps={caps} needs={['tar']} onInstalled={onInstalled} />
       <Uploader onInspected={onInspected} />
       <Card title="Archives on this server" subtitle={data ? `Looking in ${data.dirs.join(', ')}` : undefined} padded={false} actions={<Button size="sm" variant="ghost" onClick={() => refetch()}>Refresh</Button>}>
         <ErrorBanner error={error} onRetry={refetch} />
@@ -188,7 +188,7 @@ function RestoreForm({ archive, onBack, onStarted }) {
 }
 
 export default function TransferOrRestoreACpanelAccount({ fn }) {
-  const { data: caps } = useApi('/transfers/capabilities');
+  const { data: caps, refetch: refetchCaps } = useApi('/transfers/capabilities');
   const [archive, setArchive] = useState(null);
   const [run, setRun] = useState(null);
   const [historyKey, setHistoryKey] = useState(0);
@@ -199,7 +199,7 @@ export default function TransferOrRestoreACpanelAccount({ fn }) {
         <p className="muted">Migrating from a running server? Use the <Link to="/transfers/transfer-tool">Transfer Tool</Link>.</p>
       </PageHeader>
       <Steps step={step} labels={['Choose archive', 'Options', 'Restore']} />
-      {step === 1 && <PickArchive caps={caps} onInspected={setArchive} />}
+      {step === 1 && <PickArchive caps={caps} onInstalled={refetchCaps} onInspected={setArchive} />}
       {step === 2 && <RestoreForm archive={archive} onBack={() => setArchive(null)} onStarted={(r) => { setRun(r); setHistoryKey((k) => k + 1); }} />}
       {step === 3 && <RunPanel job={run.job} runId={run.run.id} title={`Restoring ${run.run.items?.[0]?.username || archive.username}`} resetLabel="Restore another archive" onReset={() => { setRun(null); setArchive(null); }} />}
       <RunHistory kind="restore" refreshKey={historyKey} />

@@ -51,10 +51,12 @@ The customer-facing **account panel** (`/panel`, what a hosting-account owner us
 
 ## Signing in
 
-The panel listens on **https://server:2087** (the installer generates a self-signed
+The administration shell listens on **https://server:2087** (the installer generates a self-signed
 certificate; see Part B for replacing it). Plain **http://server:2086** only redirects the
-browser to 2087 once a certificate is configured, so sign in at `https://server:2087/login`.
-Without a certificate (development) the panel is served on 2086 itself. Open the address in
+browser to 2087 once a certificate is configured, so administrators and resellers sign in at
+`https://server:2087/login`. Account holders sign in at **https://server:2083/** (plain 2082
+redirects there), which serves only the account panel — see Part C. Without a certificate
+(development) the panel is served on 2086 (and the account panel on 2082) itself. Open the address in
 a browser; the login card shows the vendor branding set under
 *Panel › Customization* and, if one is configured, a login notice.
 
@@ -210,7 +212,7 @@ route.
 6. **Missing daemon.** When the subsystem a function needs is not installed (BIND, Exim,
    Dovecot, Apache, MySQL, quota tools, iptables/nftables, timedatectl, …) the service raises a
    capability error. The API answers `501` and the page replaces the form with a
-   **"Service not installed"** notice that links to *Software › Install Distro Packages*; the
+   **"Service not installed"** notice with an *Install* button for the packages when they are known, otherwise a link to *Software › Install Software*; the
    rest of the panel keeps working. Several pages offer an *Install …* button that enqueues the
    package installation as a job.
 
@@ -962,7 +964,7 @@ on RHEL) with a `:80` block that answers ACME HTTP-01 from `/var/www/html/.well-
 (the webroot AutoSSL uses for the hostname) and redirects everything else to HTTPS, and a `:443`
 block using `/etc/ssl/whm/service/apache/fullchain.pem` + `key.pem` (*Manage Service SSL
 Certificates*); document root `/var/www/keel-host` (created with a landing page linking to
-`https://<hostname>:2087/` and `/panel`; an existing `index.html` is kept); PHP through the
+`https://<hostname>:2087/` (administration) and `https://<hostname>:2083/` (account panel); an existing `index.html` is kept); PHP through the
 distribution's www pool (`/run/php/php<ver>-fpm.sock` / `/run/php-fpm/www.sock`, newest first,
 never a tenant pool); `IncludeOptional /etc/apache2/keel-host.d/*.conf` in both blocks, where web
 applications are published (see below). Both blocks are bound to the main IPs and every account IP

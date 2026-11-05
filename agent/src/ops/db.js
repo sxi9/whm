@@ -919,6 +919,7 @@ defineOp('db.phpmyadmin.detect', {
       published,
       signon: { path: PMA_SIGNON_CONF, exists: signonText != null, managed: Boolean(signonText && signonText.includes(PMA_SIGNON_MARK)), confDir: exists(path.dirname(PMA_SIGNON_CONF)) },
       packageHint: hasBinary('apt-get') ? 'apt-get install phpmyadmin' : hasBinary('dnf') ? 'dnf install phpMyAdmin' : hasBinary('yum') ? 'yum install phpMyAdmin' : null,
+      package: hasBinary('apt-get') ? 'phpmyadmin' : hasBinary('dnf') || hasBinary('yum') ? 'phpMyAdmin' : null,
     };
   },
 });

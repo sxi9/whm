@@ -209,10 +209,10 @@ const CATEGORY_DEFS = [
   ]],
   ['Software', 'Wrench', [
     ['Install a Perl Module', 'Install from CPAN.', 5],
-    ['Install Distro Packages', 'Install OS packages.', 5],
+    ['Install Software', 'One-click PHP, Node.js, Python and tool installs, plus any OS package.', 5, { slug: 'install-distro-packages' }],
     ['Module Installers', 'PHP, Ruby and Perl module installers.', 5],
     ['MultiPHP INI Editor', 'php.ini settings per version and domain.', 5],
-    ['MultiPHP Manager', 'PHP version per domain.', 5],
+    ['PHP Version Manager', 'Every PHP version: install, remove, default, and what accounts may pick.', 5, { slug: 'multiphp-manager' }],
     ['NGINX Manager', 'NGINX reverse proxy and caching.', 5],
     ['Rebuild RPM Database', 'Repair the RPM database.', 5],
     ['System Update', 'Apply operating system updates.', 5],

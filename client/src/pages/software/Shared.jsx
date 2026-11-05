@@ -3,12 +3,102 @@ import { Link } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
-import { Card, StatusPill, KeyValue, formatDate } from '../../components/Common.jsx';
+import { Card, StatusPill, KeyValue, Loading, formatDate } from '../../components/Common.jsx';
 import { Field, TextInput, Button, ErrorBanner } from '../../components/Form.jsx';
 import { ProgressLog } from '../../components/ProgressLog.jsx';
 import { useToast } from '../../components/Toast.jsx';
+import { useConfirm } from '../../components/Modal.jsx';
 
-export { RequestError, Tabs, isCapabilityError } from '../security/Shared.jsx';
+import { RequestError, Tabs, isCapabilityError } from '../security/Shared.jsx';
+
+export { RequestError, Tabs, isCapabilityError };
+export { InstallPackages, installPackagesBody, normalizePackages } from '../../components/InstallPackages.jsx';
+
+export function runtimeInstallBody(runtime, version) {
+  return version == null || version === '' ? { runtime } : { runtime, version: String(version) };
+}
+
+export function toolInstallBody(tool) {
+  return { tool };
+}
+
+const RUNTIME_SUBTITLES = {
+  php: 'Each version installs side by side with PHP-FPM and the common extensions; the CLI default stays as it is.',
+  nodejs: 'Official nodejs.org builds under /opt/keel/node/<major>; the panel\'s own Node is never touched.',
+  python: 'Interpreter, venv and headers for the version; the distro\'s python3 stays the default.',
+};
+
+// The catalog's row label already carries the runtime name ('PHP 8.4'); only fall back to composing one.
+const rowLabel = (runtime, row) => row.label || `${runtime.label} ${row.id}`;
+
+function RuntimeRow({ runtime, row, busy, onInstall, onRemove }) {
+  const isNode = runtime.key === 'nodejs';
+  return (
+    <tr>
+      <td><strong>{runtime.single ? runtime.label : rowLabel(runtime, row)}</strong>{isNode && <><br /><code className="small">/usr/local/bin/node{row.id}</code></>}</td>
+      <td>{row.installed ? <StatusPill status="installed">{row.version ? `installed · ${row.version}` : 'installed'}</StatusPill> : <StatusPill status="not-installed">not installed</StatusPill>}</td>
+      <td className="muted small">{row.note || (row.packages?.length ? <CodeList names={row.packages.slice(0, 4).concat(row.packages.length > 4 ? [`+${row.packages.length - 4} more`] : [])} /> : '—')}</td>
+      <td className="actions-col">
+        {!row.installed && <Button size="sm" variant="primary" loading={busy} onClick={() => onInstall(runtime, row)}>Install</Button>}
+        {row.installed && !isNode && <StatusPill status="installed">Installed</StatusPill>}
+        {row.installed && isNode && <Button size="sm" variant="danger" loading={busy} onClick={() => onRemove(runtime, row)}>Remove</Button>}
+      </td>
+    </tr>
+  );
+}
+
+// Curated one-click installs for PHP, Node.js, Python and common tools; the
+// raw package search stays available for everything else.
+export function RuntimeInstaller({ only, title, subtitle, onFinished, tools }) {
+  const confirm = useConfirm();
+  const catalog = useApi('/software/runtimes');
+  const runner = useJobRunner({ onFinished: (event) => { catalog.refetch(); onFinished?.(event); } });
+  const data = catalog.data;
+  const runtimes = (data?.runtimes || []).filter((r) => !only || only.includes(r.key));
+  const showTools = tools == null ? !only : Boolean(tools);
+  const cardTitle = (runtime) => (title && only?.length === 1 ? title : runtime.label);
+
+  const install = (runtime, row) => runner.start(() => api.post('/software/runtimes/install', runtimeInstallBody(runtime.key, runtime.single ? undefined : row.id)), `Install ${runtime.single ? runtime.label : rowLabel(runtime, row)}`);
+  const remove = async (runtime, row) => {
+    if (!(await confirm({ title: `Remove ${rowLabel(runtime, row)}?`, message: `Deletes /opt/keel/node/${row.id} and the node${row.id}, npm${row.id} and npx${row.id} links in /usr/local/bin. Sites started with this Node stop working until it is installed again.`, confirmLabel: 'Remove', danger: true }))) return;
+    runner.start(() => api.post('/software/runtimes/remove', runtimeInstallBody(runtime.key, row.id)), `Remove ${rowLabel(runtime, row)}`);
+  };
+  const installTool = (tool) => runner.start(() => api.post('/software/runtimes/install', toolInstallBody(tool.key)), `Install ${tool.label}`);
+
+  return (
+    <>
+      <RequestError error={catalog.error} onRetry={catalog.refetch} />
+      {catalog.loading && !data && <Loading text="Detecting installed runtimes…" />}
+      {data && runtimes.map((runtime) => (
+        <Card key={runtime.key} title={cardTitle(runtime)} subtitle={subtitle || RUNTIME_SUBTITLES[runtime.key]} padded={false}>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Version</th><th>State</th><th>Packages / note</th><th /></tr></thead>
+              <tbody>
+                {runtime.versions.map((row) => <RuntimeRow key={row.id} runtime={runtime} row={row} busy={runner.busy} onInstall={install} onRemove={remove} />)}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      ))}
+      {data && showTools && data.tools?.length > 0 && (
+        <Card title="Tools" subtitle={`Common server tools as ${data.manager === 'apt' ? 'APT' : 'DNF'} packages for this ${data.family === 'rhel' ? 'RHEL-family' : 'Debian-family'} host.`}>
+          <div className="stat-grid runtime-tools">
+            {data.tools.map((tool) => (
+              <div className="stat" key={tool.key} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <div className="label">{tool.label}</div>
+                <div className="small"><CodeList names={tool.packages} /></div>
+                <div>{tool.installed ? <StatusPill status="installed">Installed</StatusPill> : <Button size="sm" variant="primary" loading={runner.busy} onClick={() => installTool(tool)}>Install</Button>}</div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+      <ErrorBanner error={runner.error} />
+      <JobPanel runner={runner} title="Install progress" />
+    </>
+  );
+}
 
 // Starts a background job from an API call and shows its live log until it
 // finishes; the caller is told when it did so lists can refresh.

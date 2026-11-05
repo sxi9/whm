@@ -3,7 +3,7 @@ import { Link, useLocation, useNavigate, Navigate, useSearchParams } from 'react
 import { useAuth } from '../auth/AuthContext.jsx';
 import { api } from '../api/client.js';
 import { Field, TextInput, Button, ErrorBanner } from '../components/Form.jsx';
-import { useBranding } from '../pages/cpanel/branding.js';
+import { useBranding, isPanelShell } from '../pages/cpanel/branding.js';
 import { BrandMark } from '../components/Brand.jsx';
 import { landingFor } from '../auth/home.js';
 import { renderMarkdown } from '../pages/plugins/PluginPage.jsx';
@@ -13,7 +13,27 @@ const EXTERNAL_ERRORS = {
   external_not_linked: 'That external identity is not linked to a panel user. Log in with your password, then link it under Security Center › Manage External Authentications.',
   external_denied: 'The identity provider denied the sign-in.',
   external_failed: 'Sign-in with the identity provider failed.',
+  wrong_port: 'Administrators and resellers sign in on the administration port.',
 };
+
+// The account-panel listener refuses administrator and reseller logins; the
+// server names the admin sign-in URL (`error.adminUrl` on the JSON error, the
+// branding's `adminUrl` after an external login redirect) so the person is
+// sent to the right port instead of retrying here. The URL is never read
+// from the page's own query string.
+export function WrongPortBanner({ error, fallbackUrl }) {
+  const candidate = error?.adminUrl || fallbackUrl || '';
+  const href = /^https?:\/\//i.test(candidate) ? candidate : null;
+  return (
+    <div className="banner banner-error" role="alert">
+      <div>
+        <strong>{error.message}</strong>
+        {href && <div><a href={href}>Go to the administration sign-in</a> <small>({href})</small></div>}
+        {error.requestId && <small>Request ID: {error.requestId}</small>}
+      </div>
+    </div>
+  );
+}
 
 export function LoginPage() {
   const { user, ready, login, verify2fa } = useAuth();
@@ -31,17 +51,20 @@ export function LoginPage() {
   const resetDone = params.get('reset') === 'done';
   const [error, setError] = useState(() => {
     const key = params.get('error');
-    return key ? { message: [EXTERNAL_ERRORS[key] || 'Sign-in failed.', params.get('message')].filter(Boolean).join(' ') } : null;
+    if (!key) return null;
+    if (key === 'wrong_port') return { code: 'wrong_port', message: params.get('message') || EXTERNAL_ERRORS.wrong_port };
+    return { message: [EXTERNAL_ERRORS[key] || 'Sign-in failed.', params.get('message')].filter(Boolean).join(' ') };
   });
   const [loading, setLoading] = useState(false);
   const branding = useBranding();
+  const shell = isPanelShell(branding) ? 'panel' : 'admin';
 
   useEffect(() => {
     api.get('/auth/external').then(({ data }) => setProviders(data.providers || [])).catch(() => setProviders([]));
     api.get('/auth/reset').then(({ data }) => setResetEnabled(Boolean(data.enabled))).catch(() => setResetEnabled(false));
   }, []);
 
-  if (ready && user) return <Navigate to={landingFor(user, location.state?.from)} replace />;
+  if (ready && user) return <Navigate to={landingFor(user, location.state?.from, shell)} replace />;
 
   const submit = async (e) => {
     e.preventDefault();
@@ -56,7 +79,7 @@ export function LoginPage() {
       } else {
         signedIn = await verify2fa(code.trim());
       }
-      navigate(landingFor(signedIn, location.state?.from), { replace: true });
+      navigate(landingFor(signedIn, location.state?.from, shell), { replace: true });
     } catch (err) {
       setError(err);
     } finally {
@@ -69,12 +92,12 @@ export function LoginPage() {
       <form className="login-card" onSubmit={submit}>
         <div className="login-brand">
           <BrandMark size={56} />
-          <span>{branding.companyName} · {branding.tagline}</span>
+          <span>{branding.companyName} · {shell === 'panel' ? 'Account panel' : branding.tagline}</span>
         </div>
-        <h1>{stage === 'credentials' ? 'Sign in' : 'Two-factor authentication'}</h1>
+        <h1>{stage === 'credentials' ? (shell === 'panel' ? 'Sign in to your account' : 'Sign in') : 'Two-factor authentication'}</h1>
         {branding.loginNotice && <div className="banner banner-info login-notice"><div className="markdown">{renderMarkdown(branding.loginNotice)}</div></div>}
         {resetDone && stage === 'credentials' && !error && <div className="banner banner-info">Your password was changed. Sign in with the new one.</div>}
-        <ErrorBanner error={error} />
+        {error?.code === 'wrong_port' ? <WrongPortBanner error={error} fallbackUrl={branding.adminUrl} /> : <ErrorBanner error={error} />}
         {stage === 'credentials' ? (
           <>
             <Field label="Username" htmlFor="username"><TextInput id="username" value={username} onChange={setUsername} autoComplete="username" autoFocus required /></Field>

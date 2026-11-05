@@ -4,6 +4,7 @@ import { ExternalLink, AlertTriangle, Info } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, KeyValue } from '../../../components/Common.jsx';
+import { InstallPackages } from '../../../components/InstallPackages.jsx';
 import { Field, TextInput, Button, FormActions } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, useIsRoot } from '../../databases/Shared.jsx';
@@ -42,7 +43,8 @@ export default function PhpMyAdmin({ fn }) {
                 <AlertTriangle size={18} />
                 <div>
                   <strong>phpMyAdmin is not installed</strong>
-                  <p>Install it with the distribution package{data.packageHint ? <> (<code>{data.packageHint}</code>)</> : ''} via <Link to="/software/install-distro-packages">Install Distro Packages</Link>, or unpack a release into one of the detected locations and add an alias in the web server. Checked: {data.candidates?.join(', ')}.</p>
+                  <p>Install it with the distribution package{data.packageHint ? <> (<code>{data.packageHint}</code>)</> : <> (<Link to="/software/install-distro-packages?tab=search&q=phpmyadmin">Install Software</Link>)</>}, or unpack a release into one of the detected locations and add an alias in the web server. Checked: {data.candidates?.join(', ')}.</p>
+                  {data.package && <InstallPackages packages={[data.package]} onFinished={refetch} />}
                 </div>
               </div>
             )}

@@ -13,6 +13,7 @@ import { csrfProtection } from './middleware/csrf.js';
 import { createAudit } from './middleware/audit.js';
 import { errorHandler, notFoundHandler } from './middleware/error.js';
 import { tlsRedirect } from './middleware/tls-redirect.js';
+import { shellDetect, panelApiGuard, panelPrincipalGuard, panelNavigationAllowed, PANEL_SHELL } from './middleware/shell.js';
 import { apiRouter } from './routes/index.js';
 import { requestLogLevel, requestLogMessage, requestLogObject } from './lib/request-log.js';
 
@@ -50,7 +51,9 @@ export async function createApp(ctx) {
       res: (res) => ({ statusCode: res.statusCode }),
     },
   }));
+  app.use(shellDetect(config));
   if (config.tls && config.httpRedirect !== false) app.use(tlsRedirect(config));
+  app.use('/api', panelApiGuard(config));
   app.use(helmet({
     contentSecurityPolicy: {
       directives: {
@@ -86,12 +89,20 @@ export async function createApp(ctx) {
   // OIDC callbacks arrive as top-level navigations with the session cookie; the
   // redirect target lives on the same origin, so the SPA fallback below serves it.
   app.use('/api', attachUser(ctx));
+  app.use('/api', panelPrincipalGuard(config));
   app.use('/api', csrfProtection);
   const audit = createAudit(ctx);
   ctx.auditRecord = audit.record;
   app.use('/api', audit.middleware);
   app.use('/api', await apiRouter(ctx));
   app.use('/api', notFoundHandler);
+
+  // The account-panel listeners open on the account panel: any other page
+  // navigation (not an asset, not the login page) lands on /panel.
+  app.get('*', (req, res, next) => {
+    if (req.shell !== PANEL_SHELL || path.extname(req.path) || panelNavigationAllowed(req.path)) return next();
+    res.redirect(302, '/panel');
+  });
 
   if (config.serveClient && fs.existsSync(path.join(config.clientDist, 'index.html'))) {
     app.use(express.static(config.clientDist, { index: false, maxAge: '1h', immutable: false }));

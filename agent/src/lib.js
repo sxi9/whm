@@ -39,6 +39,8 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/aliases',
   '/etc/resolv.conf',
   '/var/cache/whm',
+  // Curated repositories and side-by-side Node.js builds (pkg.repo.ensure, pkg.node.*).
+  '/etc/apt/sources.list.d', '/etc/apt/keyrings', '/etc/yum.repos.d', '/opt/keel/node', '/usr/local/bin',
   // Web applications published under the server-hostname site (web.host.app.*) and their distro
   // configuration: Debian names, then the RHEL/Remi packages and the bare-tarball locations that
   // webmail.js WEBMAIL_CANDIDATES and db.js PMA_DIRS / PMA_CONFIGS probe (keep the lists in step).

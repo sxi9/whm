@@ -18,7 +18,7 @@ export default function ConvertAddonDomainToAccount({ fn }) {
   const { user } = useAuth();
   // Reassigning a database is the root-only Database Map Tool; the server also leaves the list empty for resellers.
   const canMoveDatabases = user?.role === 'root';
-  const { data: caps } = useApi('/transfers/capabilities');
+  const { data: caps, refetch: refetchCaps } = useApi('/transfers/capabilities');
   const { data: addons, loading, error: listError, refetch } = useApi('/transfers/addon-domains');
   const [domain, setDomain] = useState('');
   const [form, setForm] = useState(EMPTY);
@@ -57,7 +57,7 @@ export default function ConvertAddonDomainToAccount({ fn }) {
       <PageHeader fn={fn} description="Turns an addon domain into a standalone account: a new account is created with the addon domain as its main domain, the document root is copied into its public_html, mailboxes for the domain move along, the DNS zone changes owner and both accounts' virtual hosts are rewritten." />
       {run ? <RunPanel job={run.job} runId={run.run.id} title={`Converting ${domain}`} resetLabel="Convert another addon domain" onReset={reset} /> : (
         <>
-          <ToolingNotice caps={caps} needs={options.copyFiles ? ['rsync'] : []} />
+          <ToolingNotice caps={caps} needs={options.copyFiles ? ['rsync'] : []} onInstalled={refetchCaps} />
           <Card title="Addon domains" padded={false} actions={<Button size="sm" variant="ghost" onClick={() => refetch()}>Refresh</Button>}>
             <ErrorBanner error={listError} onRetry={refetch} />
             <DataTable

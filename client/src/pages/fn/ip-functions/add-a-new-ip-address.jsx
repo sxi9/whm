@@ -40,7 +40,7 @@ export default function AddANewIpAddress({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Binds one address or a consecutive range to a network interface with iproute2, records it in the panel's inventory and persists it so the panel's boot unit re-adds it after a restart. New addresses start free; reserve them to keep them out of allocation." />
-      <Iproute2Notice meta={meta} />
+      <Iproute2Notice meta={meta} onInstalled={refetch} />
       <form onSubmit={submit}>
         <Card title="New IP address">
           <IpRequestError error={error && !error.fields ? error : null} />

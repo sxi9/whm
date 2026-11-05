@@ -37,7 +37,7 @@ export default function ShowOrDeleteCurrentIpAddresses({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Every address the panel knows about, with its live state on the host. The main IP and addresses in use by accounts, the shared IP or remote services cannot be removed." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
-      <Iproute2Notice meta={meta} />
+      <Iproute2Notice meta={meta} onInstalled={refetch} />
       <IpRequestError error={error} onRetry={refetch} />
       <IpRequestError error={actionError} />
       {meta && (

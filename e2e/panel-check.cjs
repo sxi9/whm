@@ -5,7 +5,7 @@
 // page errors, 5xx responses, phone-width overflow and untranslated page text under
 // the pseudo-locale fail the run.
 //
-// Usage: BASE=https://127.0.0.1:2087 PASSWORD='<root password>' node e2e/panel-check.cjs
+// Usage: BASE=https://127.0.0.1:2087 PANEL_BASE=https://127.0.0.1:2083 PASSWORD='<root password>' node e2e/panel-check.cjs
 // (needs the built client served by the API with the /panel routes wired, and playwright installed)
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -13,7 +13,11 @@ const path = require('path');
 
 // The plain port only redirects (301) or refuses (426) once TLS is on, so the
 // default is the TLS listener; the installer's certificate is self-signed.
-const BASE = process.env.BASE || 'https://127.0.0.1:2087';
+const ADMIN_BASE = process.env.BASE || 'https://127.0.0.1:2087';
+// The account-panel listener (2083) serves only /panel; the account user's sweep runs there,
+// root's steps on the administration origin.
+const PANEL_BASE = process.env.PANEL_BASE || 'https://127.0.0.1:2083';
+let BASE = ADMIN_BASE;
 const OUT = process.env.OUT || path.join(__dirname, 'shots', 'panel');
 const PASSWORD = process.env.PASSWORD || 'Sm0ke-Test-Passw0rd!';
 const USER_PASSWORD = process.env.PANEL_USER_PASSWORD || 'Demo-Panel-Passw0rd!7';
@@ -80,7 +84,8 @@ async function logout(page) {
   if (scopeless.status !== 403) errors.push(`expected 403 for admin /api/panel/me without acting-as, got ${scopeless.status}`);
   await logout(page);
 
-  // 2. the account user signs in and lands on /panel.
+  // 2. the account user signs in on the account-panel listener and lands on /panel.
+  BASE = PANEL_BASE;
   await login(page, username, USER_PASSWORD);
   await page.waitForSelector('.panel-home', { timeout: 20000 });
   if (!page.url().startsWith(`${BASE}/panel`)) errors.push(`account user landed on ${page.url()} instead of /panel`);
@@ -217,6 +222,7 @@ async function logout(page) {
   await logout(page);
 
   // 7. "Log in as" from root opens /panel with the acting-as banner (§2.4).
+  BASE = ADMIN_BASE;
   await login(page, 'root', PASSWORD);
   await page.waitForSelector('.home', { timeout: 15000 });
   const acting = await call(page, 'POST', `/api/panel/admin/login-as/${username}`, {});

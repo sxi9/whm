@@ -79,6 +79,14 @@ export async function start() {
 
   const servers = [];
   let stopTlsWatch = () => {};
+  for (const d of config.disabledPanelPorts || []) logger.warn({ port: d.port, collidesWith: d.collidesWith }, `${d.key} (${d.port}) is the same as ${d.collidesWith}; that account-panel listener is disabled`);
+  // The account-panel listeners are optional: a bind failure there (another
+  // service on 2082/2083) is logged and the administration shell keeps serving.
+  const listenOptional = (server, port, shell, scheme) => {
+    server.on('error', (err) => logger.error({ err, port }, `${shell} listener failed; the administration shell is unaffected`));
+    server.listen(port, config.host, () => logger.info({ port }, `${shell} listening (${scheme})`));
+    servers.push(server);
+  };
   if (config.tls) {
     const readPair = () => ({ cert: fs.readFileSync(config.tlsCert), key: fs.readFileSync(config.tlsKey), minVersion: 'TLSv1.2' });
     let pair;
@@ -90,14 +98,22 @@ export async function start() {
       logger.fatal({ err, cert: config.tlsCert, key: config.tlsKey }, 'panel TLS certificate or key cannot be read; fix the files named by tlsCert/tlsKey (WHM_TLS_CERT/WHM_TLS_KEY) and restart whm-panel');
       throw err;
     }
+    const tlsServers = [];
     const tlsServer = https.createServer(pair, app);
     tlsServer.listen(config.tlsPort, config.host, () => logger.info({ port: config.tlsPort }, 'WHM panel listening (https)'));
     servers.push(tlsServer);
+    tlsServers.push(tlsServer);
+    if (config.panelPort) {
+      const panelTlsServer = https.createServer(pair, app);
+      listenOptional(panelTlsServer, config.panelPort, 'account panel', 'https');
+      tlsServers.push(panelTlsServer);
+    }
     // Certificate installs and AutoSSL renewals replace the pair in place; the
-    // listener picks it up on SIGHUP or when the files change, no restart needed.
+    // listeners pick it up on SIGHUP or when the files change, no restart needed.
     const reloadTls = (reason) => {
       try {
-        tlsServer.setSecureContext(readPair());
+        const next = readPair();
+        for (const server of tlsServers) server.setSecureContext(next);
         logger.info({ reason }, 'panel TLS certificate reloaded');
       } catch (err) {
         logger.error({ err, reason }, 'panel TLS certificate reload failed; keeping the previous certificate');
@@ -112,6 +128,7 @@ export async function start() {
   const httpServer = http.createServer(app);
   httpServer.listen(config.port, config.host, () => logger.info({ port: config.port, mode: config.mode, env: config.env, dataDir: config.dataDir, httpRedirect: config.tls && config.httpRedirect }, 'WHM panel listening (http)'));
   servers.push(httpServer);
+  if (config.panelHttpPort) listenOptional(http.createServer(app), config.panelHttpPort, 'account panel', 'http');
 
   // Plugins load once the panel listens, so a slow activation never keeps the
   // operator from reaching Manage Plugins; the job workers start after that so

@@ -14,6 +14,7 @@ export async function register(ctx) {
   const r = panelRouter(ctx, 'php');
   r.get('/versions', wrap((req) => s.versions(req.panel)));
   r.get('/domains', wrap((req) => s.domains(req.panel)));
+  r.put('/domains', validate({ body: z.object({ version: phpVersionId.nullable(), domains: z.array(fields.hostname).min(1).max(500).optional() }).strict() }), (req, res, next) => Promise.resolve(s.setAll(req.panel, req.body.version, { domains: req.body.domains }, req)).then((d) => res.status(d?.job ? 202 : 200).json({ data: d })).catch(next));
   r.put('/domains/:domain', validate({ params: domainParam, body: z.object({ version: phpVersionId.nullable() }).strict() }), wrap((req) => s.setVersion(req.panel, req.params.domain, req.body.version, req)));
   r.get('/domains/:domain/ini', validate({ params: domainParam }), wrap((req) => s.readIni(req.panel, req.params.domain)));
   r.put('/domains/:domain/ini', validate({ params: domainParam, body: z.object({ directives: z.record(iniKey, iniValue.nullable()) }).strict() }), wrap((req) => s.writeIni(req.panel, req.params.domain, req.body, req)));

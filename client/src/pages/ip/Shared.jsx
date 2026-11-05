@@ -1,7 +1,7 @@
-import { Link } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { useApi } from '../../hooks/useApi.js';
 import { StatusPill, CapabilityNotice } from '../../components/Common.jsx';
+import { InstallPackages } from '../../components/InstallPackages.jsx';
 import { Field, Select, ErrorBanner } from '../../components/Form.jsx';
 
 export function isCapabilityError(error) {
@@ -33,14 +33,21 @@ export function BoundPill({ bound }) {
 
 // Shown on list pages when the host has no iproute2: the inventory still works,
 // but nothing can be bound or removed until the package is installed.
-export function Iproute2Notice({ meta }) {
-  if (!meta || meta.iproute2 !== false) return null;
+export const iprouteQuery = (family) => (family === 'rhel' ? ['iproute'] : ['iproute2']);
+
+export function Iproute2Notice({ meta, onInstalled }) {
+  const missing = Boolean(meta) && meta.iproute2 === false;
+  const pkg = useApi('/software/pkg/detect', { enabled: missing });
+  if (!missing) return null;
+  const names = iprouteQuery(pkg.data?.family);
+  const known = Boolean(pkg.data);
   return (
     <div className="banner banner-warning">
       <AlertTriangle size={18} />
       <div>
         <strong>iproute2 is not installed</strong>
-        <p>The <code>ip</code> command was not found, so addresses cannot be bound to or removed from interfaces. The inventory below is read-only until the <code>iproute2</code> package is installed (for example via <Link to="/software/install-distro-packages">Install Distro Packages</Link>).</p>
+        <p>The <code>ip</code> command was not found, so addresses cannot be bound to or removed from interfaces. The inventory below is read-only until the <code>{known ? names[0] : 'iproute2'}</code> package is installed.</p>
+        {known && <InstallPackages packages={names} onFinished={onInstalled} />}
       </div>
     </div>
   );

@@ -2,6 +2,8 @@ import express, { Router } from 'express';
 import { validate, z, fields, patchOf } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
 import { HttpError } from '../../lib/errors.js';
+import { redirectHostname } from '../../middleware/tls-redirect.js';
+import { PANEL_SHELL, adminLoginUrl } from '../../middleware/shell.js';
 import { createCpanelService, AUDIENCES, SEVERITIES, IMAGE_KINDS, UPGRADE_JOB } from '../../services/cpanel.js';
 
 const singleLine = (max) => z.string().trim().max(max).regex(/^[^\r\n\0<>]*$/, 'A single line without angle brackets');
@@ -107,7 +109,14 @@ export async function register(ctx) {
   // the login notice before any session exists. Every mutation stays on the
   // authenticated /cpanel/branding routes above.
   const b = Router();
-  b.get('/', wrap(() => s.branding.get()));
+  // `shell` tells the SPA which listener it was loaded from (middleware/shell.js);
+  // the panel shell also learns the admin sign-in address so the login page
+  // can point a refused administrator there without trusting its own URL.
+  b.get('/', wrap((req) => ({
+    ...s.branding.get(),
+    shell: req.shell || 'admin',
+    ...(req.shell === PANEL_SHELL ? { adminUrl: adminLoginUrl(ctx.config, redirectHostname(req.get('host')) || ctx.settings.get('basic.hostname')) } : {}),
+  })));
   b.get('/:kind', validate({ params: imageKind }), sendImage);
 
   return [{ path: '/cpanel', router: r }, { path: '/branding', router: b, public: true }];

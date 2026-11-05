@@ -4,7 +4,9 @@ import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
 import { Field, TextInput, Textarea, Toggle, Button, ErrorBanner } from '../../../components/Form.jsx';
-import { RequestError, useJobRunner, JobPanel, JobHistory } from '../../software/Shared.jsx';
+import { RequestError, useJobRunner, JobPanel, JobHistory, InstallPackages } from '../../software/Shared.jsx';
+
+export const cpanPackages = (installers) => (installers?.packages?.perl?.length ? installers.packages.perl : installers?.family === 'rhel' ? ['perl-App-cpanminus'] : ['cpanminus']);
 
 const MODULE_RE = /^[A-Za-z][A-Za-z0-9_]*(::[A-Za-z0-9_]+)*$/;
 
@@ -28,7 +30,7 @@ export default function InstallAPerlModule({ fn }) {
     <>
       <PageHeader fn={fn} actions={installers.data && <StatusPill status={installer ? 'ok' : 'not-installed'}>{installer ? `installer: ${installer}${installers.data.versions.perl ? ` · perl ${installers.data.versions.perl}` : ''}` : 'no CPAN client'}</StatusPill>} />
       <Card title="Install from CPAN" subtitle="Modules are built and installed non-interactively as a background job (cpanm when available, otherwise cpan with default answers).">
-        {installers.data && !installer && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>No CPAN client</strong><p>Install <code>cpanminus</code> (Debian/Ubuntu) or <code>perl-App-cpanminus</code> (RHEL) from Install Distro Packages first.</p></div></div>}
+        {installers.data && !installer && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>No CPAN client</strong><p>Install <code>{cpanPackages(installers.data)[0]}</code> first; module installs are refused until it is present.</p><InstallPackages packages={cpanPackages(installers.data)} label="Install cpanminus" onFinished={() => installers.refetch()} /></div></div>}
         <Field label="Module names" help="One per line or separated by spaces, e.g. DBD::mysql, JSON::XS, LWP::UserAgent" error={invalid.length ? [`Not a Perl module name: ${invalid.join(', ')}`] : null} required>
           <Textarea value={text} onChange={setText} rows={4} mono placeholder={'DBD::mysql\nJSON::XS'} />
         </Field>

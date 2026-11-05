@@ -1,5 +1,6 @@
-import { createBrowserRouter } from 'react-router-dom';
+import { createBrowserRouter, Navigate } from 'react-router-dom';
 import { Layout } from './components/Layout.jsx';
+import { useBranding, isPanelShell } from './pages/cpanel/branding.js';
 import { FUNCTIONS } from './nav.js';
 import { PAGE_REGISTRY } from './pages/registry.js';
 import { HomePage } from './pages/Home.jsx';
@@ -19,6 +20,14 @@ const functionRoutes = FUNCTIONS.map((fn) => {
   return { path: fn.path.slice(1), element: Page ? <Page fn={fn} /> : <FunctionPage fn={fn} /> };
 });
 
+// The account-panel listener (port 2083) serves only /panel: the server 302s a
+// full page load of `/`, this covers an in-app navigation to it.
+export function IndexRoute() {
+  const branding = useBranding();
+  if (isPanelShell(branding)) return <Navigate to="/panel" replace />;
+  return <HomePage />;
+}
+
 export const router = createBrowserRouter([
   { path: '/login', element: <LoginPage /> },
   { path: '/login/reset', element: <ResetRequestPage /> },
@@ -28,7 +37,7 @@ export const router = createBrowserRouter([
     path: '/',
     element: <Layout />,
     children: [
-      { index: true, element: <HomePage /> },
+      { index: true, element: <IndexRoute /> },
       { path: 'change-password', element: <ChangePasswordPage /> },
       { path: 'audit-log', element: <AuditLogPage /> },
       ...functionRoutes,

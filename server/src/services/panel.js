@@ -2,6 +2,7 @@ import { json, paginate } from '../db/index.js';
 import { HttpError, forbidden, notFound, conflict, unauthorized, unprocessable } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
 import { issueCsrfToken } from '../middleware/csrf.js';
+import { accountPanelUrl } from '../middleware/shell.js';
 import { PANEL_SCOPES } from '../routes/panel/index.js';
 
 // Customer panel core (ctx.panel):
@@ -608,10 +609,7 @@ export function createPanelService(ctx) {
   // 202, the rest continues detached, so an unknown login and a real one
   // answer alike. Tokens are random, stored hashed, valid RESET_TOKEN_TTL_MS,
   // single-use; a delivered request voids the login's earlier unused ones.
-  const panelUrl = () => {
-    const host = settings.get('basic.hostname') || 'localhost';
-    return config.tls ? `https://${host}:${config.tlsPort}` : `http://${host}:${config.port}`;
-  };
+  const panelUrl = () => accountPanelUrl(config, settings.get('basic.hostname') || 'localhost');
   const companyName = () => {
     try { return ctx.cpanel?.branding?.get?.()?.companyName || 'Keel'; } catch { return 'Keel'; }
   };

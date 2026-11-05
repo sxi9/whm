@@ -166,6 +166,10 @@ describe('db ops on a host without MySQL', () => {
     expect(pma.globalAlias).toMatchObject({ enabled: expect.any(Boolean), a2disconf: expect.any(Boolean) });
     expect(pma.published === null || typeof pma.published.managed === 'boolean').toBe(true);
     for (const w of pma.webConfigs) expect(typeof w.global).toBe('boolean');
+    // `package` is the bare distro package name the panel's one-click install posts; `packageHint` stays the human command.
+    expect(pma.package === null || /^[A-Za-z0-9][A-Za-z0-9+._-]*$/.test(pma.package)).toBe(true);
+    if (pma.packageHint) expect(pma.package).toBe(pma.packageHint.split(/\s+/).pop());
+    else expect(pma.package).toBeNull();
   });
 
   // The disable op runs a2disconf on a real Debian host, so it is only ever

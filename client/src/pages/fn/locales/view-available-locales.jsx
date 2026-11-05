@@ -4,13 +4,17 @@ import { PageHeader, Card, KeyValue, StatusPill, formatDate } from '../../../com
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Button } from '../../../components/Form.jsx';
 import { useAuth } from '../../../auth/AuthContext.jsx';
+import { InstallPackages } from '../../../components/InstallPackages.jsx';
 import { RequestError, useLocales, LocalePills, TranslationProgress, LocaleLinks } from '../../locales/Shared.jsx';
+
+export const localePackages = (family) => (family === 'rhel' ? ['glibc-langpack-en'] : ['locales']);
 
 export default function ViewAvailableLocales({ fn }) {
   const { user } = useAuth();
   const isRoot = user?.role === 'root';
   const { locales, loading, error, refetch, defaultCode, baseKeys } = useLocales();
   const system = useApi('/locales/system', { enabled: isRoot });
+  const pkg = useApi('/software/pkg/detect', { enabled: Boolean(isRoot && system.data && !system.data.capability && !system.data.family) });
 
   return (
     <>
@@ -45,7 +49,12 @@ export default function ViewAvailableLocales({ fn }) {
                     <tbody>{Object.entries(system.data.config.vars).map(([k, v]) => <tr key={k}><td><code>{k}</code></td><td><code>{v}</code></td></tr>)}</tbody></table>
                 </div>
               )}
-              {!system.data.capability && <p className="muted small" style={{ marginTop: 10 }}>Install the <code>locales</code> (Debian/Ubuntu) or <code>glibc-langpack-*</code> (RHEL family) package via <Link to="/software/install-distro-packages">Install Distro Packages</Link> to generate additional system locales. The panel's own interface languages do not depend on it.</p>}
+              {!system.data.capability && (
+                <div style={{ marginTop: 10 }}>
+                  <p className="muted small">Install the <code>{localePackages(system.data.family ?? pkg.data?.family)[0]}</code> package to generate additional system locales. The panel's own interface languages do not depend on it.</p>
+                  {(system.data.family ?? pkg.data?.family) && <InstallPackages packages={localePackages(system.data.family ?? pkg.data?.family)} onFinished={() => system.refetch()} />}
+                </div>
+              )}
             </>
           )}
         </Card>

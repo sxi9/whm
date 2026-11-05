@@ -4,6 +4,7 @@ import { RefreshCw, Info } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, Loading, KeyValue, CapabilityNotice, formatDate } from '../../components/Common.jsx';
+import { InstallPackages } from '../../components/InstallPackages.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
 import { Field, Select, TextInput, Toggle, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { ProgressLog } from '../../components/ProgressLog.jsx';
@@ -12,9 +13,12 @@ import { PeerTable } from './PeerTable.jsx';
 import { ClusterTokens } from './ClusterTokens.jsx';
 import { ExchangeLog } from './ExchangeLog.jsx';
 
+export const bindPackages = (family) => (family === 'rhel' ? ['bind', 'bind-utils'] : ['bind9', 'bind9utils']);
+
 export function DnsCluster() {
   const toast = useToast();
   const overview = useApi('/clusters/dns');
+  const pkg = useApi('/software/pkg/detect', { enabled: Boolean(overview.data && overview.data.dnsModule && !overview.data.bind) });
   const [logVersion, setLogVersion] = useState(0);
   const data = overview.data;
   const refreshAll = () => { overview.refetch(); setLogVersion((v) => v + 1); };
@@ -26,7 +30,7 @@ export function DnsCluster() {
     <>
       {!data.dnsModule && <CapabilityNotice error={{ code: 'capability_missing', message: 'The DNS Functions module is not loaded on this panel, so zones can be neither pushed nor received. Peers and tokens can still be managed.' }} onRetry={refreshAll} />}
       {data.dnsModule && !data.bind && (
-        <div className="banner banner-info"><Info size={18} /><div><strong>BIND is not installed here</strong><p>Zones live in the panel database and are still pushed to peers; this server starts serving them itself once BIND is installed (<Link to="/software/install-distro-packages">Install Distro Packages</Link>).</p></div></div>
+        <div className="banner banner-info"><Info size={18} /><div><strong>BIND is not installed here</strong><p>Zones live in the panel database and are still pushed to peers; this server starts serving them itself once BIND is installed.</p>{pkg.data && <InstallPackages packages={bindPackages(pkg.data.family)} label="Install BIND" onFinished={refreshAll} />}</div></div>
       )}
       <PeerTable peers={data.peers} roles={data.roles} loading={overview.loading} onChanged={refreshAll} focus="dns"
         subtitle={`Other servers running this panel. ${data.hostname} pushes its zones to every enabled write-only or sync peer over the peer's own API.`} />

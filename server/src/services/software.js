@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, badRequest, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot, ownsRow } from '../middleware/rbac.js';
+import { RUNTIMES, TOOLS, RUNTIME_KEYS, resolveInstall, packagesFor, runtimeNote, detectedVersion } from './software-runtimes.js';
 
 // Software. Attached as ctx.software; other categories may call:
 //   software.pkg.detect()                                   -> { manager: 'apt'|'dnf'|'yum'|null, family, rpm, capability }
@@ -15,6 +16,10 @@ import { isRoot, ownsRow } from '../middleware/rbac.js';
 //   software.php.systemDefault()                            -> { configured, detected, effective }
 //   software.php.versionForDomain(domain)                   -> { domain, phpVersion, effective, inherited } or null
 //   software.php.setDomainVersion(domains[], version|null, user, req) -> { results, job } (job when more than one domain)
+//   software.php.catalog()                                  -> every catalog + installed PHP version with state/offered/domains (contract §52)
+//   software.php.offeredVersions()                          -> ids the account panel may pick, or null (= all installed)
+//   software.php.usage()                                    -> { [versionId]: pinned-domain count }
+//   software.php.remove(version, user, req)                 -> { job, version } (refuses the system/CLI default, the last version, versions pinned on domains, plans, vhosts or the Apache web default)
 //   software.nginx.status()                                 -> install + proxy state (never throws CapabilityError); stale: true when the
 //                                                              rendered proxy no longer matches the current domains / certificates
 //   software.nginx.sync(req)                                -> re-render the reverse-proxy config from current domains and certificates;
@@ -23,6 +28,8 @@ import { isRoot, ownsRow } from '../middleware/rbac.js';
 //                                                              or creating / removing a domain (an hourly schedule, enabled only while
 //                                                              the proxy is on, catches the rest)
 // software.update.status({ cached })                      -> pending OS updates; cached: true serves the last recorded check
+//   software.runtimes.catalog()                             -> one-click runtime/tool catalog with installed state (contract §51)
+//   software.runtimes.install({ runtime, version } | { tool }, user, req) -> { job } (job type software.runtime.install)
 // Lazily used when present: ctx.web.setPhpVersion(domain, version, req, { reload }) (the 4th argument is advisory: the web category
 // may skip the Apache reload until the last domain of a batch), ctx.web.setListenPorts({ http, https, bind }, req),
 // ctx.web.apache.settings().defaultPhpVersion, ctx.ssl.certForDomain(domain) + ctx.ssl.bundlePaths(domain).
@@ -118,6 +125,8 @@ export function createSoftwareService(ctx) {
     accountDomain: db.prepare('SELECT d.*, a.username, a.owner_id, a.home_dir, a.suspended FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ?'),
     setDomainPhp: db.prepare('UPDATE account_domains SET php_version = ? WHERE domain = ?'),
     insertMainDomain: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot, php_version) VALUES (?, ?, ?, ?, ?)'),
+    phpUsage: db.prepare("SELECT php_version AS id, COUNT(*) AS n FROM account_domains WHERE php_version IS NOT NULL AND php_version <> '' GROUP BY php_version"),
+    packagesUsingPhp: db.prepare('SELECT COUNT(*) AS n FROM packages WHERE php_version = ?'),
     profiles: db.prepare('SELECT * FROM ea4_profiles ORDER BY stock DESC, name'),
     profileById: db.prepare('SELECT * FROM ea4_profiles WHERE id = ?'),
     profileByName: db.prepare('SELECT * FROM ea4_profiles WHERE name = ?'),
@@ -128,7 +137,7 @@ export function createSoftwareService(ctx) {
 
   const requirePkg = () => capabilities.require('pkg', 'No supported package manager (apt-get, dnf or yum) was found on this server');
   const likeEscape = (text) => String(text).replace(/[\\%_]/g, (c) => `\\${c}`);
-  const requirePhp = () => capabilities.require('php', 'PHP is not installed on this server; install a php package (Install Distro Packages or EasyApache 4)');
+  const requirePhp = () => capabilities.require('php', 'PHP is not installed on this server; install a PHP version (Software › Install Software or EasyApache 4)');
   const enqueue = (type, params, user) => ctx.jobs.enqueue(type, params, { userId: user?.id ?? null });
   const docrootOf = (row) => row.docroot || `${row.home_dir || `/home/${row.username}`}/public_html`;
 
@@ -236,6 +245,113 @@ export function createSoftwareService(ctx) {
     job.progress(100, 'finished');
     return { manager: result.manager, packages: result.packages, purge: result.purge, lines: result.output?.length ?? 0 };
   }
+
+  // --- one-click runtimes and tools (contract §51) ----------------------------
+  const RUNTIME_JOB_TYPES = ['software.runtime.install', 'software.runtime.remove'];
+  const runtimes = {
+    async catalog() {
+      const d = await pkg.detect();
+      const fam = d.family ?? null;
+      let detected = {};
+      try { detected = await op('pkg.runtime.detect'); } catch (err) { logger.warn({ err }, 'runtime detection failed'); }
+      const toolEntries = TOOLS.map((t) => ({ key: t.key, label: t.label, packages: (fam ? packagesFor(t, fam) : null) ?? [] }));
+      let installedSet = null;
+      if (fam && capabilities.has('pkg')) {
+        try {
+          const { packages } = await op('pkg.list_installed', { prefix: [...new Set(toolEntries.flatMap((t) => t.packages))] });
+          installedSet = new Set(packages.map((p) => p.name));
+        } catch (err) { logger.warn({ err }, 'tool package listing failed'); }
+      }
+      const runtimeList = RUNTIME_KEYS.map((key) => {
+        const entry = RUNTIMES[key];
+        const note = runtimeNote(key, fam);
+        const versions = (entry.single ? [null] : entry.versions).map((v) => {
+          const state = detectedVersion(key, v, detected);
+          const packages = entry.installer ? [] : (fam ? packagesFor(entry, fam, v) : null) ?? [];
+          const repo = entry.repo === 'epel' ? (fam === 'rhel' ? 'epel' : null) : entry.repo ?? null;
+          return { id: v ?? key, label: v ? `${entry.label} ${v}` : entry.label, installed: state.installed, version: state.version, packages, repo, note, ...(key === 'nodejs' && v ? { path: state.path ?? `/opt/keel/node/${v}`, bin: `/usr/local/bin/node${v}` } : {}) };
+        });
+        return { key, label: entry.label, single: Boolean(entry.single), installer: entry.installer ?? null, versions };
+      });
+      const tools = toolEntries.map((t) => ({ ...t, installed: installedSet && t.packages.length ? t.packages.every((p) => installedSet.has(p)) : null }));
+      return { family: fam, os: detected.os ?? null, manager: d.manager ?? null, capability: Boolean(d.capability), runtimes: runtimeList, tools };
+    },
+    async install({ runtime, version, tool }, user, req) {
+      // Node.js builds need no package manager; everything else answers 501 before the catalog check.
+      if (RUNTIMES[runtime]?.installer !== 'node') requirePkg();
+      const fam = capabilities.has('pkg') ? await family().catch(() => null) : null;
+      const plan = resolveInstall({ runtime, version, tool }, fam);
+      const job = enqueue('software.runtime.install', { kind: plan.kind, key: plan.key, version: plan.version, family: fam }, user);
+      const target = plan.version ? `${plan.key}:${plan.version}` : plan.key;
+      req?.audit?.({ action: 'software.runtime.install', target, args: { kind: plan.kind, key: plan.key, version: plan.version, packages: plan.packages, jobId: job.id } });
+      return { job, target, packages: plan.packages };
+    },
+    remove({ runtime, version }, user, req) {
+      if (runtime !== 'nodejs') throw unprocessable('Only Node.js builds are removed here; PHP versions are removed in the PHP Version Manager and Python packages from the Installed tab', { runtime: ['nodejs'] });
+      const plan = resolveInstall({ runtime, version }, null);
+      const job = enqueue('software.runtime.remove', { key: 'nodejs', version: plan.version }, user);
+      req?.audit?.({ action: 'software.runtime.remove', target: `nodejs:${plan.version}`, args: { major: plan.major, jobId: job.id } });
+      return { job, target: `nodejs:${plan.version}` };
+    },
+    recent(limit = 20) { return ctx.jobs.list({ limit: 200 }).filter((j) => RUNTIME_JOB_TYPES.includes(j.type)).slice(0, limit); },
+    async installJob(job) {
+      const { kind, key, version } = job.params;
+      const fam = job.params.family ?? (capabilities.has('pkg') ? await job.agent.op('pkg.detect').then((d) => d.family).catch(() => null) : null);
+      const plan = resolveInstall(kind === 'tool' ? { tool: key } : { runtime: key, version }, fam);
+      const label = plan.version ? `${plan.label} ${plan.version}` : plan.label;
+      job.log(`${label}: ${plan.installer === 'node' ? `official Node.js ${plan.major}.x build` : JSON.stringify(plan.packages)}${fam ? ` (${fam})` : ''}`);
+      let added = false;
+      for (const [i, repo] of plan.repos.entries()) {
+        job.progress(5 + i * 5, `checking the ${repo} repository`);
+        const result = await job.agent.op('pkg.repo.ensure', { repo });
+        job.log(`repository ${repo}: ${result.action}${result.detail ? ` (${result.detail})` : ''}`);
+        if (result.action === 'unsupported') throw new Error(`${label} cannot be installed on this distribution: ${result.detail || `the ${repo} repository is not available for it`}`);
+        if (result.action === 'added') added = true;
+      }
+      if (added) {
+        job.progress(20, 'refreshing package index');
+        await runLongOp(job, 'pkg.update_index', {}, 'package index refresh');
+      }
+      let cliDefaultBefore = null;
+      if (plan.key === 'php' && capabilities.has('php')) {
+        try { cliDefaultBefore = (await job.agent.op('pkg.php.versions')).defaultId ?? null; } catch (err) { job.log(`could not read the current PHP CLI default: ${err.message}`, 'warn'); }
+      }
+      job.progress(30, `installing ${label}`);
+      let nodeResult = null;
+      if (plan.installer === 'node') nodeResult = await runLongOp(job, 'pkg.node.install', { major: plan.major }, `${label} install`);
+      else await runLongOp(job, 'pkg.install', { packages: plan.packages }, `${label} install`);
+      if (cliDefaultBefore) {
+        job.progress(85, 'checking the PHP CLI default');
+        try {
+          const after = (await job.agent.op('pkg.php.versions')).defaultId ?? null;
+          if (after && after !== cliDefaultBefore) {
+            await job.agent.op('pkg.php.default.set', { version: cliDefaultBefore });
+            job.log(`the installer switched the php CLI default to ${after}; restored ${cliDefaultBefore}`);
+          }
+        } catch (err) { job.log(`PHP CLI default check failed: ${err.message}`, 'warn'); }
+      }
+      job.progress(90, 're-detecting capabilities');
+      await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after runtime install failed'); job.log(`capability re-detection failed: ${err.message}`, 'warn'); });
+      let detected = null;
+      if (plan.kind === 'runtime') {
+        job.progress(95, 'verifying');
+        const state = detectedVersion(plan.key, plan.version ?? plan.key, await job.agent.op('pkg.runtime.detect'));
+        if (!state.installed) throw new Error(`${label} is still not detected after the install; see the log above`);
+        detected = state.version ?? nodeResult?.version ?? null;
+        job.log(`${label} detected: ${detected ?? 'present'}`);
+      }
+      job.progress(100, 'done');
+      return { kind: plan.kind, [plan.kind === 'tool' ? 'tool' : 'runtime']: plan.key, version: plan.version, packages: plan.packages, installed: true, detected, ...(nodeResult ? { path: nodeResult.path, bin: nodeResult.bin, symlinks: nodeResult.symlinks } : {}) };
+    },
+    async removeJob(job) {
+      const major = Number(job.params.version);
+      job.progress(10, `removing Node.js ${major}`);
+      const result = await job.agent.op('pkg.node.remove', { major });
+      await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after node removal failed'); });
+      job.progress(100, 'done');
+      return { runtime: 'nodejs', version: String(major), removed: true, ...result };
+    },
+  };
 
   // --- system update -------------------------------------------------------
   // The simulation (apt-get -s dist-upgrade / dnf check-update) can take minutes,
@@ -358,7 +474,12 @@ export function createSoftwareService(ctx) {
     async installers() {
       let detected = { present: {}, versions: {}, perl: null, pip: null };
       try { detected = await op('pkg.module.detect'); } catch (err) { logger.warn({ err }, 'module detection failed'); }
-      return { ...detected, capabilities: { perl: capabilities.has('perl'), cpan: capabilities.has('cpan'), pecl: capabilities.has('pecl'), pear: capabilities.has('pear'), gem: capabilities.has('gem'), pip: capabilities.has('pip') } };
+      const fam = await family().catch(() => null);
+      // The distro packages that bring each installer, so the page can install
+      // a missing one in place instead of sending the operator to the search.
+      const toolPackages = (key) => (fam ? packagesFor(TOOLS.find((t) => t.key === key), fam) : null) ?? [];
+      const packages = { php: toolPackages('php-pear'), perl: toolPackages('cpanminus'), ruby: (fam ? packagesFor(RUNTIMES.ruby, fam) : null) ?? [], python3: toolPackages('python3-pip') };
+      return { ...detected, family: fam, packages, capabilities: { perl: capabilities.has('perl'), cpan: capabilities.has('cpan'), pecl: capabilities.has('pecl'), pear: capabilities.has('pear'), gem: capabilities.has('gem'), pip: capabilities.has('pip') } };
     },
     // An installer added outside the panel (apt on a shell) gets one bounded
     // re-detection before the install prompt, so the page follows the host.
@@ -640,6 +761,123 @@ export function createSoftwareService(ctx) {
       return { version, applied, failed, state: failed.length ? 'partial' : 'applied' };
     },
     async pools(version) { requirePhp(); return op('pkg.phpfpm.pools', version ? { version } : {}); },
+
+    // --- PHP Version Manager (contract §52) ---------------------------------
+    // Pinned domains only: a main domain without an account_domains row inherits
+    // the system default and counts for nothing.
+    usage() {
+      const out = {};
+      for (const row of stmts.phpUsage.all()) out[row.id] = row.n;
+      return out;
+    },
+    offeredVersions() {
+      const v = S('php.offered_versions', null);
+      return Array.isArray(v) ? v.map(String) : null;
+    },
+    async setOffered(versionIds, user, req) {
+      let offered = null;
+      if (versionIds !== null) {
+        const { versions } = await php.versions();
+        const unknown = versionIds.filter((id) => !versions.some((v) => v.id === id));
+        if (unknown.length) throw unprocessable(`PHP ${unknown.join(', ')} is not installed on this server`, { versions: ['Only installed versions can be offered to accounts'] });
+        offered = [...new Set(versionIds)];
+      }
+      settings.set('php.offered_versions', offered);
+      req?.audit?.({ action: 'software.php.offered', target: offered ? offered.join(',') : 'all', args: { offered } });
+      return { offered };
+    },
+    // Every version of the one-click catalog plus whatever else is installed,
+    // from one pkg.php.versions, one runtimes.catalog() and one pkg.repo.status
+    // per distinct repository. The catalog loads without PHP (nothing installed
+    // yet) and without the network (repo state 'unknown').
+    async catalog() {
+      let installed = { versions: [], defaultId: null, configuredDefault: S('php.default_version', null), effectiveDefault: null };
+      if (capabilities.has('php')) {
+        try { installed = await php.versions({ modules: false }); } catch (err) { logger.warn({ err }, 'php version listing failed'); }
+      }
+      const rc = await runtimes.catalog();
+      const phpRuntime = rc.runtimes.find((r) => r.key === 'php') ?? { versions: [] };
+      const offered = php.offeredVersions();
+      const usage = php.usage();
+      const dependants = (id) => php.dependants(id);
+      const repoStatus = {};
+      for (const repo of new Set(phpRuntime.versions.map((v) => v.repo).filter(Boolean))) {
+        try { const r = await op('pkg.repo.status', { repo }); repoStatus[repo] = { present: Boolean(r.present), supported: r.supported === true ? true : r.supported === false ? false : null, detail: r.detail ?? null }; } catch (err) { logger.warn({ err, repo }, 'pkg.repo.status failed'); repoStatus[repo] = null; }
+      }
+      const digits = (id) => String(id).replace(/[^0-9]/g, '');
+      const findInstalled = (id) => installed.versions.find((x) => x.id === id || /php(\d+)$/.exec(String(x.id))?.[1] === digits(id) || String(x.version || '').startsWith(`${id}.`)) ?? null;
+      const isOffered = (id, inst) => Boolean(inst) && (offered === null || offered.includes(id));
+      const shapeInstalled = (inst) => ({ installed: true, version: inst.version ?? null, binary: inst.binary ?? null, iniPath: inst.iniPath ?? null, fpmInstalled: inst.fpmInstalled ?? null, fpmActive: inst.fpmActive ?? null, fpmUnit: inst.fpmUnit ?? null, isDefault: Boolean(inst.isDefault), isSystemDefault: inst.id === installed.effectiveDefault, advisories: inst.advisories ?? [] });
+      const seen = new Set();
+      const versions = phpRuntime.versions.map((v) => {
+        const inst = findInstalled(v.id);
+        if (inst) seen.add(inst.id);
+        const id = inst ? inst.id : v.id;
+        const rs = v.repo ? repoStatus[v.repo] ?? null : null;
+        let state = 'installed'; let note = v.note ?? null;
+        if (!inst) {
+          if (v.repo === null || rs?.present || rs?.supported === true) state = 'available';
+          else if (rs?.supported === false) { state = 'unsupported'; note = rs.detail ?? note; }
+          else { state = 'unknown'; note = rs?.detail ?? note; }
+        }
+        return {
+          id, catalogVersion: v.id, label: inst ? inst.label ?? v.label : v.label, state,
+          ...(inst ? shapeInstalled(inst) : { installed: false, version: null, binary: null, iniPath: null, fpmInstalled: null, fpmActive: null, fpmUnit: null, isDefault: false, isSystemDefault: false, advisories: [] }),
+          offered: isOffered(id, inst), domains: usage[id] ?? 0, ...(inst ? dependants(id) : { webDefault: false, plans: 0, vhosts: 0 }), packages: v.packages ?? [], repo: v.repo ?? null, repoStatus: rs, note,
+        };
+      });
+      for (const inst of installed.versions) {
+        if (seen.has(inst.id)) continue;
+        versions.push({ id: inst.id, catalogVersion: null, label: inst.label ?? inst.id, state: 'installed', ...shapeInstalled(inst), offered: isOffered(inst.id, inst), domains: usage[inst.id] ?? 0, ...dependants(inst.id), packages: [], repo: null, repoStatus: null, note: null });
+      }
+      return { family: rc.family, os: rc.os, manager: rc.manager, capability: rc.capability, phpCapability: capabilities.has('php'), effectiveDefault: installed.effectiveDefault ?? null, configuredDefault: installed.configuredDefault ?? null, offered, versions };
+    },
+    // Everything that still resolves to the version: the Apache web default,
+    // package plans and rendered vhosts (contract §52), besides pinned domains.
+    dependants(version) {
+      let webDefault = false; let vhosts = 0;
+      try { webDefault = ctx.web?.apache?.settings?.()?.defaultPhpVersion === version; } catch { webDefault = false; }
+      try { vhosts = Number(ctx.web?.vhostsUsingPhp?.(version) ?? 0) || 0; } catch { vhosts = 0; }
+      return { webDefault, plans: stmts.packagesUsingPhp.get(version).n, vhosts };
+    },
+    // Shared by the request (422) and the job (TOCTOU re-check): the first
+    // reason the version must stay, as [message, field hint], or null.
+    async removeBlocker(version) {
+      const { versions, effectiveDefault, defaultId } = await php.versions();
+      const inst = versions.find((v) => v.id === version);
+      if (!inst) return [`PHP "${version}" is not installed on this server`, 'Pick one of the installed versions'];
+      if (version === effectiveDefault) return [`PHP ${version} is the system default; make another version the default before removing it`, 'Change the system default first'];
+      if (inst.isDefault || version === defaultId) return [`PHP ${version} is the CLI default (/usr/bin/php); make another version the default before removing it`, 'Change the default first'];
+      if (versions.length < 2) return [`PHP ${version} is the only installed version; install another one before removing it`, 'Install another version first'];
+      const count = php.usage()[version] ?? 0;
+      if (count > 0) return [`PHP ${version} is pinned on ${count} domain(s); move them to another version first`, `${count} domain(s) use this version`];
+      const { webDefault, plans, vhosts } = php.dependants(version);
+      if (webDefault) return [`PHP ${version} is the web default pinned in Apache Configuration; clear or change it there first`, 'Change the Apache web default first'];
+      if (plans > 0) return [`PHP ${version} is the default of ${plans} package(s); change those packages first`, `${plans} package(s) use this version`];
+      if (vhosts > 0) return [`PHP ${version} serves ${vhosts} web vhost(s); move them to another version first`, `${vhosts} vhost(s) use this version`];
+      return null;
+    },
+    async remove(version, user, req) {
+      requirePhp();
+      const blocker = await php.removeBlocker(version);
+      if (blocker) throw unprocessable(blocker[0], { version: [blocker[1]] });
+      const job = enqueue('software.php.remove', { version }, user);
+      req?.audit?.({ action: 'software.php.remove', target: version, args: { jobId: job.id } });
+      return { job, version };
+    },
+    async removeJob(job) {
+      const { version } = job.params;
+      const blocker = await php.removeBlocker(version);
+      if (blocker) throw new Error(`Removal of PHP ${version} refused: ${blocker[0]}`);
+      job.progress(5, `removing PHP ${version}`);
+      const result = await runLongOp(job, 'pkg.php.remove', { version }, `PHP ${version} removal`);
+      job.progress(90, 're-detecting capabilities');
+      await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after PHP removal failed'); job.log(`capability re-detection failed: ${err.message}`, 'warn'); });
+      const offered = php.offeredVersions();
+      if (offered?.includes(version)) settings.set('php.offered_versions', offered.filter((id) => id !== version));
+      job.progress(100, 'done');
+      return { version, packages: result.packages ?? [], removed: true };
+    },
   };
 
   // --- php.ini / .user.ini ------------------------------------------------
@@ -1046,8 +1284,11 @@ export function createSoftwareService(ctx) {
     'software.nginx.sync': (job) => nginx.syncJob(job),
     'software.php.resync': (job) => php.resyncJob(job),
     'software.php.apply': (job) => php.applyJob(job),
+    'software.php.remove': (job) => php.removeJob(job),
     'software.ea4.build': (job) => ea4.buildJob(job),
+    'software.runtime.install': (job) => runtimes.installJob(job),
+    'software.runtime.remove': (job) => runtimes.removeJob(job),
   };
 
-  return { pkg, update, rpm, modules, perl, panel, php, ini, nginx, ea4, jobs, resolveDomain, runs };
+  return { pkg, update, rpm, modules, perl, panel, php, ini, nginx, ea4, runtimes, jobs, resolveDomain, runs };
 }

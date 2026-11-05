@@ -190,6 +190,10 @@ export function webmailUrlError(v) {
 export function AccountPanelSettingsCard() {
   const toast = useToast();
   const { data, loading, error, refetch } = useApi('/panel/admin/settings');
+  // The account sign-in URL comes with the session (GET /auth/me carries
+  // panelUrl for administrators once the 2083 listener is configured).
+  const { data: me } = useApi('/auth/me');
+  const panelUrl = me?.panelUrl || null;
   // The draft is derived from the loaded settings so the form renders on the
   // first pass; a refetch drops local edits.
   const [edits, setEdits] = useState(null);
@@ -222,6 +226,11 @@ export function AccountPanelSettingsCard() {
       {draft && (
         <>
           <div className="form-grid">
+            {panelUrl && (
+              <Field label="Account sign-in URL" help="Account holders sign in on the account-panel port; administrators and resellers keep using this address.">
+                <a className="panel-login-url" href={panelUrl} target="_blank" rel="noreferrer"><code>{panelUrl}</code></a>
+              </Field>
+            )}
             <Field label="Availability">
               <Toggle checked={draft.enabled} onChange={set('enabled')} label="Account panel enabled" description="Off: every account panel request is refused and the sign-in page says the panel is switched off. Account logins are still created and kept in sync." />
             </Field>
