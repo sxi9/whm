@@ -23,8 +23,13 @@ const dnsCandidates = () => [
   { name: 'bind', label: 'BIND (named)', binaries: ['named'], units: ['named', 'bind9'], packages: { apt: 'bind9', dnf: 'bind' }, installed: true, unitName: 'named', unit: unit('named') },
   { name: 'powerdns', label: 'PowerDNS Authoritative Server', binaries: ['pdns_server'], units: ['pdns'], packages: { apt: 'pdns-server', dnf: 'pdns' }, installed: false, unitName: null, unit: { unit: null, present: false, active: false } },
 ];
-const HOST_ENSURE = ({ hostname, reload = true }) => ({ hostname, path: '/etc/apache2/sites-available/keel-host.conf', link: '/etc/apache2/sites-enabled/keel-host.conf', docroot: '/var/www/keel-host', docrootCreated: false, indexWritten: false, appsDir: '/etc/apache2/keel-host.d', phpSocket: '/run/php/php8.5-fpm.sock', ssl: true, certificate: { fullchain: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem', present: true }, changed: true, validated: true, reloaded: reload, unit: reload ? 'apache2' : null, warnings: [] });
-const HOST_APP_WRITE = ({ name, alias, root, reload = true }) => ({ name, alias: alias.length > 1 ? alias.replace(/\/+$/, '') : alias, root, path: `/etc/apache2/keel-host.d/${name}.conf`, phpSocket: '/run/php/php8.5-fpm.sock', vhostPresent: true, changed: true, validated: true, reloaded: reload, unit: reload ? 'apache2' : null, warnings: [] });
+const HOST_POOL_SOCKET = (version) => `/run/php/php${version}-fpm-keel-host.sock`;
+// Which PHP trees carry the keel-host pool (the agent's web.host.pool.* state).
+const hostPools = new Set();
+const HOST_POOL_WRITE = ({ version, reload = true }) => { const changed = !hostPools.has(version); hostPools.add(version); return { version, flavor: 'debian', user: 'www-data', path: `/etc/php/${version}/fpm/pool.d/keel-host.conf`, socket: HOST_POOL_SOCKET(version), others: [...hostPools].filter((v) => v !== version).map((v) => ({ version: v, flavor: 'debian', path: `/etc/php/${v}/fpm/pool.d/keel-host.conf`, socket: HOST_POOL_SOCKET(v) })), bytes: 400, changed, validated: changed ? true : null, reloaded: changed && reload, unit: changed && reload ? `php${version}-fpm` : null }; };
+const HOST_POOL_REMOVE = ({ version }) => { const removed = hostPools.delete(version); return { version, path: `/etc/php/${version}/fpm/pool.d/keel-host.conf`, socket: HOST_POOL_SOCKET(version), removed, reloaded: removed, unit: removed ? `php${version}-fpm` : null }; };
+const HOST_ENSURE = ({ hostname, reload = true, php = true, phpSocket = null }) => ({ hostname, path: '/etc/apache2/sites-available/keel-host.conf', link: '/etc/apache2/sites-enabled/keel-host.conf', docroot: '/var/www/keel-host', docrootCreated: false, indexWritten: false, appsDir: '/etc/apache2/keel-host.d', phpSocket: php ? phpSocket : null, ssl: true, certificate: { fullchain: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem', present: true }, changed: true, validated: true, reloaded: reload, unit: reload ? 'apache2' : null, warnings: [] });
+const HOST_APP_WRITE = ({ name, alias, root, reload = true, php = true, phpSocket = null }) => ({ name, alias: alias.length > 1 ? alias.replace(/\/+$/, '') : alias, root, path: `/etc/apache2/keel-host.d/${name}.conf`, phpSocket: php ? phpSocket : null, vhostPresent: true, changed: true, validated: true, reloaded: reload, unit: reload ? 'apache2' : null, warnings: [] });
 const CERT = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ\n-----END CERTIFICATE-----\n';
 const KEY = '-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49\n-----END PRIVATE KEY-----\n';
 
@@ -79,6 +84,8 @@ beforeAll(async () => {
     'web.service.select': ({ role, server }) => ({ role, server, steps: [{ unit: role === 'ftp' ? 'pure-ftpd' : 'named', action: 'disable --now', ok: true, error: null }, ...(server !== 'disabled' ? [{ unit: server === 'vsftpd' ? 'vsftpd' : server === 'bind' ? 'named' : server, action: 'enable --now', ok: true, error: null }] : [])], candidates: role === 'ftp' ? ftpCandidates(server) : dnsCandidates() }),
     'web.ftp.config.read': ({ server }) => ({ server, path: '/etc/pure-ftpd/conf/', unit: unit('pure-ftpd'), settings: { passivePortMin: 30000, passivePortMax: 35000, tls: 'optional' }, raw: { PassivePortRange: '30000 35000', TLS: '1' } }),
     'web.ftp.config.write': ({ server, settings }) => ({ server, written: server === 'pure-ftpd' ? ['/etc/pure-ftpd/conf/PassivePortRange', '/etc/pure-ftpd/conf/TLS'] : ['/etc/vsftpd.conf'], validated: null, settings, reloaded: true, unit: server, verb: 'restart' }),
+    'web.host.pool.write': HOST_POOL_WRITE,
+    'web.host.pool.remove': HOST_POOL_REMOVE,
     'web.host.ensure': HOST_ENSURE,
     'web.host.status': () => ({ installed: true, flavor: 'debian', path: '/etc/apache2/sites-available/keel-host.conf', link: '/etc/apache2/sites-enabled/keel-host.conf', exists: true, managed: true, enabled: true, hostname: 'panel.example.com', meta: { hostname: 'panel.example.com', ssl: true }, ssl: true, certificate: { fullchain: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem', present: true }, docroot: '/var/www/keel-host', docrootExists: true, phpSocket: '/run/php/php8.5-fpm.sock', appsDir: '/etc/apache2/keel-host.d', apps: [{ name: 'webmail', path: '/etc/apache2/keel-host.d/webmail.conf', managed: true, alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, meta: {}, mtime: '2026-11-05T00:00:00.000Z' }] }),
     'web.host.app.write': HOST_APP_WRITE,
@@ -980,7 +987,7 @@ describe('server hostname site (contract §41)', () => {
 
   it('GET /hostname reports the site, its certificate, the published apps with URLs and the last apply', async () => {
     const res = await get('/api/service-config/hostname').expect(200);
-    expect(res.body.data).toMatchObject({ hostname: 'panel.example.com', fqdn: true, apache: true, url: 'https://panel.example.com/', exists: true, enabled: true, inSync: true, ssl: true, certificate: { present: true }, docroot: '/var/www/keel-host', phpSocket: '/run/php/php8.5-fpm.sock', path: '/etc/apache2/sites-available/keel-host.conf' });
+    expect(res.body.data).toMatchObject({ hostname: 'panel.example.com', fqdn: true, apache: true, url: 'https://panel.example.com/', exists: true, enabled: true, inSync: true, ssl: true, certificate: { present: true }, docroot: '/var/www/keel-host', phpSocket: '/run/php/php8.5-fpm.sock', pools: [], path: '/etc/apache2/sites-available/keel-host.conf' });
     expect(res.body.data.panelUrl).toMatch(/^https:\/\/panel\.example\.com:\d+\/$/);
     expect(res.body.data.apps).toEqual([expect.objectContaining({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, url: 'https://panel.example.com/webmail/' })]);
   });
@@ -990,10 +997,18 @@ describe('server hostname site (contract §41)', () => {
     const res = await post('/api/service-config/hostname/apply', {}).expect(200);
     expect(res.body.data).toMatchObject({ hostname: 'panel.example.com', url: 'https://panel.example.com/', written: true, changed: true, reloaded: true, ssl: true, path: '/etc/apache2/sites-available/keel-host.conf', warnings: [] });
     const call = app.agent.callsTo('web.host.ensure').pop().args;
-    expect(call).toMatchObject({ hostname: 'panel.example.com', port: 80, sslPort: 443, reload: true, ips: ['203.0.113.5'] });
+    // The site's handler is its own keel-host pool in the effective default's tree (8.3: the newest tree while nothing is configured), never the distro www pool.
+    expect(call).toMatchObject({ hostname: 'panel.example.com', port: 80, sslPort: 443, reload: true, ips: ['203.0.113.5'], php: true, phpSocket: '/run/php/php8.3-fpm-keel-host.sock' });
     expect(call.panelPort).toEqual(expect.any(Number));
     expect(call.bind).toBeUndefined();
+    // The first pool write re-renders the drop-ins (they may still name the distro socket); the stock list carries no spec, so nothing is written.
+    expect(app.agent.calls.map((c) => c.name).filter((n) => n.startsWith('web.host'))).toEqual(['web.host.pool.write', 'web.host.ensure', 'web.host.app.list']);
+    expect(app.agent.callsTo('web.host.pool.write')[0].args).toEqual({ version: '8.3' });
+    expect(res.body.data).toMatchObject({ phpVersion: '8.3', phpSocket: '/run/php/php8.3-fpm-keel-host.sock' });
+    expect(app.ctx.web.hostApps.phpVersion()).toEqual({ version: '8.3', socket: '/run/php/php8.3-fpm-keel-host.sock', path: '/etc/php/8.3/fpm/pool.d/keel-host.conf' });
     expect(audits('hostname_vhost.ensure')).toBe(1);
+    expect(audits('hostname_php_pool.write')).toBe(1);
+    expect((await get('/api/service-config/hostname')).body.data).toMatchObject({ phpVersion: '8.3', phpPool: { ok: true, summary: { version: '8.3', socket: '/run/php/php8.3-fpm-keel-host.sock' } } });
     expect((await get('/api/service-config/hostname')).body.data.lastApply).toMatchObject({ ok: true, summary: { hostname: 'panel.example.com', ssl: true } });
     // An unchanged render is not audited again; reload:false is passed through.
     app.agent.set('web.host.ensure', ({ hostname, reload }) => ({ hostname, path: '/etc/apache2/sites-available/keel-host.conf', ssl: true, changed: false, reloaded: false, validated: null, warnings: [{ code: 'php_missing', message: 'no www pool' }] }));
@@ -1068,9 +1083,10 @@ describe('server hostname site (contract §41)', () => {
     const req = { audit: (e) => audited.push(e) };
     const pub = await app.ctx.web.hostApps.publish({ name: 'webmail', alias: '/webmail/', root: '/var/lib/roundcube/public_html', php: true, denyDirs: ['config', 'temp'] }, req);
     expect(pub).toMatchObject({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', url: 'https://panel.example.com/webmail/', path: '/etc/apache2/keel-host.d/webmail.conf', changed: true, reloaded: true, warnings: [] });
-    expect(app.agent.calls.map((c) => c.name).filter((n) => n.startsWith('web.host'))).toEqual(['web.host.ensure', 'web.host.app.write']);
+    expect(app.agent.calls.map((c) => c.name).filter((n) => n.startsWith('web.host'))).toEqual(['web.host.pool.write', 'web.host.ensure', 'web.host.app.write']);
     expect(app.agent.callsTo('web.host.ensure')[0].args.reload).toBe(false);
-    expect(app.agent.callsTo('web.host.app.write')[0].args).toEqual({ name: 'webmail', alias: '/webmail/', root: '/var/lib/roundcube/public_html', php: true, denyDirs: ['config', 'temp'] });
+    // The drop-in gets the site's pool socket, never a distro default.
+    expect(app.agent.callsTo('web.host.app.write')[0].args).toEqual({ name: 'webmail', alias: '/webmail/', root: '/var/lib/roundcube/public_html', php: true, denyDirs: ['config', 'temp'], phpSocket: '/run/php/php8.3-fpm-keel-host.sock' });
     expect(audited.map((e) => e.action)).toEqual(['hostname_vhost.ensure', 'host_app.publish']);
     expect(audited[1]).toMatchObject({ target: 'webmail', args: { alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, changed: true, reloaded: true } });
     // The site changed but the drop-in did not: Apache is still reloaded once so the new vhost is live.
@@ -1088,6 +1104,101 @@ describe('server hostname site (contract §41)', () => {
     expect(gone).toMatchObject({ name: 'webmail', removed: true, reloaded: true, path: '/etc/apache2/keel-host.d/webmail.conf' });
     expect(app.agent.callsTo('web.host.app.remove').pop().args).toEqual({ name: 'webmail' });
     expect(audited.pop()).toMatchObject({ action: 'host_app.unpublish', target: 'webmail', args: { removed: true, reloaded: true } });
+  });
+});
+
+describe('server hostname site: its own PHP-FPM pool (contract §41 amendment)', () => {
+  const audits = (action) => app.ctx.db.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE action = ?').get(action).n;
+  const hostOps = () => app.agent.calls.map((c) => c.name).filter((n) => n.startsWith('web.host') || n === 'web.reload');
+  afterAll(async () => { app.ctx.settings.set('service_config.apache', null); app.ctx.settings.set('php.default_version', null); hostPools.clear(); await post('/api/service-config/hostname/apply', {}).expect(200); });
+
+  it('follows the effective default (Apache pin, then the Software default, then the newest tree), removes the pool left in the previous version and moves the drop-ins with one reload', async () => {
+    hostPools.clear();
+    await post('/api/service-config/hostname/apply', {}).expect(200);
+    expect(app.agent.callsTo('web.host.pool.write').pop().args).toEqual({ version: '8.3' });
+    // The Software category's effective default wins over the newest tree; a version with no tree falls back to the newest.
+    const hadSoftware = app.ctx.software;
+    app.ctx.software = { php: { systemDefault: async () => ({ configured: '8.1', detected: '8.3', effective: '8.1' }) } };
+    const audited = [];
+    const req = { audit: (e) => audited.push(e) };
+    try {
+      app.agent.set('web.host.app.list', () => ({ installed: true, appsDir: '/etc/apache2/keel-host.d', vhostPresent: true, apps: [
+        { name: 'webmail', path: '/etc/apache2/keel-host.d/webmail.conf', managed: true, alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, meta: { name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, phpSocket: '/run/php/php8.3-fpm-keel-host.sock', access: 'all', allowFrom: [], options: ['-Indexes', '+FollowSymLinks'], directoryIndex: null, allowOverride: 'All', denyDirs: ['config', 'temp'] }, mtime: '2026-11-05T00:00:00.000Z' },
+        { name: 'static', path: '/etc/apache2/keel-host.d/static.conf', managed: true, alias: '/static', root: '/usr/share/phpmyadmin', php: false, meta: { name: 'static', alias: '/static', root: '/usr/share/phpmyadmin', php: false, phpSocket: null, access: 'local', allowFrom: [], options: ['None'], directoryIndex: ['index.html'], allowOverride: 'None', denyDirs: [] }, mtime: '2026-11-05T00:00:00.000Z' },
+        { name: 'legacy', path: '/etc/apache2/keel-host.d/legacy.conf', managed: false, alias: null, root: null, php: null, meta: null, mtime: '2026-11-05T00:00:00.000Z' },
+      ] }));
+      app.agent.calls.length = 0;
+      const moved = await app.ctx.web.hostApps.resyncPhpDefault('8.1', req);
+      expect(moved).toMatchObject({ hostname: 'panel.example.com', applied: true, version: '8.1', socket: '/run/php/php8.1-fpm-keel-host.sock', changed: true, reloaded: true, requested: '8.1' });
+      expect(hostOps()).toEqual(['web.host.pool.write', 'web.host.pool.remove', 'web.host.ensure', 'web.host.app.list', 'web.host.app.write', 'web.host.app.write']);
+      expect(app.agent.callsTo('web.host.pool.remove').pop().args).toEqual({ version: '8.3' });
+      expect(app.agent.callsTo('web.host.ensure').pop().args).toMatchObject({ php: true, phpSocket: '/run/php/php8.1-fpm-keel-host.sock', reload: true });
+      const writes = app.agent.callsTo('web.host.app.write').map((c) => c.args);
+      expect(writes[0]).toEqual({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, access: 'all', allowFrom: [], options: ['-Indexes', '+FollowSymLinks'], allowOverride: 'All', denyDirs: ['config', 'temp'], phpSocket: '/run/php/php8.1-fpm-keel-host.sock', reload: false });
+      expect(writes[1]).toEqual({ name: 'static', alias: '/static', root: '/usr/share/phpmyadmin', php: false, access: 'local', allowFrom: [], options: ['None'], directoryIndex: ['index.html'], allowOverride: 'None', denyDirs: [], reload: false });
+      expect(moved.apps).toEqual([{ name: 'webmail', changed: true, phpSocket: '/run/php/php8.1-fpm-keel-host.sock' }, { name: 'static', changed: true, phpSocket: null }]);
+      expect([...hostPools]).toEqual(['8.1']);
+      expect(app.ctx.web.hostApps.phpVersion()).toMatchObject({ version: '8.1', socket: '/run/php/php8.1-fpm-keel-host.sock' });
+      expect(audited.find((e) => e.action === 'hostname_php_pool.write')).toMatchObject({ target: '8.1', args: { socket: '/run/php/php8.1-fpm-keel-host.sock', removed: ['8.3'] } });
+      // Unchanged: no pool rewrite is audited, the drop-ins are left alone, nothing is reloaded.
+      app.agent.calls.length = 0;
+      const same = await app.ctx.web.hostname.ensure(req);
+      expect(same).toMatchObject({ phpVersion: '8.1', phpSocket: '/run/php/php8.1-fpm-keel-host.sock', apps: [] });
+      expect(hostOps()).toEqual(['web.host.pool.write', 'web.host.ensure']);
+      expect(audited.filter((e) => e.action === 'hostname_php_pool.write')).toHaveLength(1);
+      // A default no tree carries (a version the catalog knows but is not installed) falls back to the newest tree.
+      app.ctx.software = { php: { systemDefault: async () => ({ configured: '8.4', detected: '8.4', effective: '8.4' }) } };
+      await post('/api/service-config/hostname/apply', {}).expect(200);
+      expect(app.agent.callsTo('web.host.pool.write').pop().args).toEqual({ version: '8.3' });
+      expect([...hostPools]).toEqual(['8.3']);
+      // Apache Configuration's pinned web default wins over the Software default, like it does for inherited domains.
+      app.ctx.settings.set('service_config.apache', { ...app.ctx.settings.get('service_config.apache', {}), defaultPhpVersion: '8.1' });
+      await post('/api/service-config/hostname/apply', {}).expect(200);
+      expect(app.agent.callsTo('web.host.pool.write').pop().args).toEqual({ version: '8.1' });
+      app.ctx.settings.set('service_config.apache', null);
+      // Without the Software category the stored setting still decides.
+      app.ctx.software = undefined;
+      app.ctx.settings.set('php.default_version', '8.3');
+      await post('/api/service-config/hostname/apply', {}).expect(200);
+      expect(app.agent.callsTo('web.host.pool.write').pop().args).toEqual({ version: '8.3' });
+    } finally { app.ctx.software = hadSoftware; app.agent.reset('web.host.app.list'); app.ctx.settings.set('php.default_version', null); app.ctx.settings.set('service_config.apache', null); }
+  });
+
+  it('a rejected pool is a failed apply (422) that leaves the site untouched; a pool removal failure is only logged', async () => {
+    app.agent.fail('web.host.pool.write', 'config_invalid', 'PHP-FPM rejected the hostname pool');
+    try {
+      app.agent.calls.length = 0;
+      const res = await post('/api/service-config/hostname/apply', {});
+      expect(res.status).toBe(422);
+      expect(res.body.error.code).toBe('config_invalid');
+      expect(app.agent.callsTo('web.host.ensure')).toHaveLength(0);
+      expect((await get('/api/service-config/hostname')).body.data.phpPool).toMatchObject({ ok: false, error: 'PHP-FPM rejected the hostname pool' });
+    } finally { app.agent.set('web.host.pool.write', HOST_POOL_WRITE); }
+    hostPools.add('8.1'); hostPools.add('8.3');
+    app.agent.fail('web.host.pool.remove', 'command_failed', 'systemctl failed');
+    try {
+      const res = await post('/api/service-config/hostname/apply', {}).expect(200);
+      expect(res.body.data).toMatchObject({ written: true, phpVersion: '8.3' });
+    } finally { app.agent.set('web.host.pool.remove', HOST_POOL_REMOVE); hostPools.clear(); }
+  });
+
+  it('with no PHP-FPM installed the site is rendered without a handler and warns php_missing; hostApps.phpVersion() is null before any apply', async () => {
+    app.agent.set('web.detect', () => ({ ...detectWith(true)(), php: { installed: false, versions: [] } }));
+    try {
+      app.ctx.web.detect?.(true);
+      app.agent.calls.length = 0;
+      const res = await post('/api/service-config/hostname/apply', {}).expect(200);
+      expect(res.body.data).toMatchObject({ written: true, phpVersion: null, phpSocket: null, warnings: [{ code: 'php_missing' }] });
+      expect(app.agent.callsTo('web.host.pool.write')).toHaveLength(0);
+      expect(app.agent.callsTo('web.host.ensure').pop().args).toMatchObject({ php: false });
+      expect(app.agent.callsTo('web.host.ensure').pop().args.phpSocket).toBeUndefined();
+      expect(app.ctx.web.hostApps.phpVersion()).toBeNull();
+    } finally { app.agent.set('web.detect', detectWith(true)); app.ctx.web.detect?.(true); }
+  });
+
+  it('resyncPhpDefault reports instead of throwing for a bare hostname', async () => {
+    app.ctx.settings.set('basic.hostname', 'nova');
+    try { expect(await app.ctx.web.hostApps.resyncPhpDefault('8.3', null)).toMatchObject({ hostname: 'nova', applied: false, reason: 'hostname_not_fqdn' }); } finally { app.ctx.settings.set('basic.hostname', 'panel.example.com'); }
   });
 });
 
@@ -1172,9 +1283,9 @@ describe('webmail published under the hostname site (P0-1)', () => {
     app.agent.calls.length = 0;
     const res = await post('/api/service-config/webmail/publish', {}).expect(200);
     expect(res.body.data).toMatchObject({ installed: true, flavor: 'roundcube', root: '/var/lib/roundcube/public_html', alias: '/webmail', url: 'https://panel.example.com/webmail/', path: '/etc/apache2/keel-host.d/webmail.conf', changed: true, reloaded: true, config: { path: '/etc/roundcube/config.inc.php', changed: true, validated: true, values: { imapHost: 'ssl://panel.example.com:993', smtpHost: 'tls://panel.example.com:587', productName: 'Keel' } }, warnings: [] });
-    expect(app.agent.calls.map((c) => c.name).filter((n) => /^web\.(host|webmail)/.test(n))).toEqual(['web.webmail.detect', 'web.host.ensure', 'web.host.app.write', 'web.webmail.config.write', 'web.host.app.probe']);
+    expect(app.agent.calls.map((c) => c.name).filter((n) => /^web\.(host|webmail)/.test(n))).toEqual(['web.webmail.detect', 'web.host.pool.write', 'web.host.ensure', 'web.host.app.write', 'web.webmail.config.write', 'web.host.app.probe']);
     // Debian's own fragment relies on Roundcube's .htaccess (AllowOverride All); the source/schema/vendor trees are denied outright as well.
-    expect(app.agent.callsTo('web.host.app.write').pop().args).toEqual({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, allowOverride: 'All', denyDirs: ['config', 'temp', 'logs', 'bin', 'SQL', 'vendor', 'installer', 'tests'], reload: true });
+    expect(app.agent.callsTo('web.host.app.write').pop().args).toEqual({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, allowOverride: 'All', denyDirs: ['config', 'temp', 'logs', 'bin', 'SQL', 'vendor', 'installer', 'tests'], reload: true, phpSocket: '/run/php/php8.3-fpm-keel-host.sock' });
     expect(app.agent.callsTo('web.webmail.config.write').pop().args).toEqual({ hostname: 'panel.example.com', imapScheme: 'ssl', imapPort: 993, smtpScheme: 'tls', smtpPort: 587, productName: 'Keel', plugins: [] });
     expect(audits('webmail.publish')).toBe(1);
     expect(audits('host_app.publish')).toBeGreaterThanOrEqual(1);

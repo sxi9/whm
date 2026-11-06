@@ -10,6 +10,7 @@ import {
   mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, DOVECOT_INCLUDES, EXIM_VMAIL, FTP_VIRTUAL, dovecotLayout,
   pureFtpdAuthLink, createPureFtpdAuthLink, PURE_FTPD_AUTH_LINK,
   renderHostVhost, renderHostApp, renderHostIndex, parseHostMeta, wwwPoolSocket, hostCertPaths, HOST_VHOST,
+  hostPools, hostPoolSocket, hostPoolPath, renderHostPool, HOST_POOL,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -23,6 +24,9 @@ vi.mock('../src/exec.js', async (importOriginal) => {
 });
 
 const ctx = createContext();
+// The renderers consult phpLayout(); keep them independent of Keel builds that exist on the host running the suite.
+process.env.WHM_KEEL_PHP_DIR = process.env.WHM_KEEL_PHP_DIR || fs.mkdtempSync(path.join(os.tmpdir(), 'keel-web-empty-'));
+
 const VHOST = { domain: 'example.com', aliases: ['parked.net'], docroot: '/home/alice/public_html', user: 'alice', ip: '203.0.113.5', redirects: [], customDirectives: '', meta: {}, port: 80, sslPort: 443 };
 
 async function opError(promise) {
@@ -734,6 +738,86 @@ describe('server hostname site', () => {
     expect(wwwPoolSocket({ versions: [{ version: '8.3', flavor: 'rhel', socketDir: '/run/php-fpm' }] }, io(['/run/php-fpm/www.sock']))).toBe('/run/php-fpm/www.sock');
     expect(wwwPoolSocket({ versions: [] }, io([]))).toBeNull();
     expect(HOST_VHOST).toMatchObject({ name: 'keel-host', docroot: '/var/www/keel-host', certDir: '/etc/ssl/whm/service/apache' });
+  });
+
+  it('renders the handler from the socket it is given: a Keel build socket under /run/keel-php or the keel-host pool, never a fixed distro path', () => {
+    const keel = renderHostVhost({ ...HOST, phpSocket: '/run/keel-php/php8.4-fpm-keel-host.sock' });
+    expect(keel.match(/SetHandler "proxy:unix:\/run\/keel-php\/php8\.4-fpm-keel-host\.sock\|fcgi:\/\/localhost"/g)).toHaveLength(2);
+    expect(keel).not.toContain('/run/php/php8.5-fpm.sock');
+    expect(parseHostMeta(keel).phpSocket).toBe('/run/keel-php/php8.4-fpm-keel-host.sock');
+    const app = renderHostApp({ ...APP, phpSocket: '/run/php/php8.3-fpm-keel-host.sock', access: 'all', allowFrom: [], options: ['None'], allowOverride: 'None', denyDirs: [] });
+    expect(app).toContain('SetHandler "proxy:unix:/run/php/php8.3-fpm-keel-host.sock|fcgi://localhost"');
+    expect(parseHostMeta(app, '# keel-host-app ').phpSocket).toBe('/run/php/php8.3-fpm-keel-host.sock');
+  });
+});
+
+describe('server hostname site: its own PHP-FPM pool (keel-host)', () => {
+  const debian = { version: '8.3', flavor: 'debian', poolDir: '/etc/php/8.3/fpm/pool.d', bin: 'php-fpm8.3', units: ['php8.3-fpm'], socketDir: '/run/php', listenOwner: 'www-data' };
+  const keel = { version: '8.4', flavor: 'keel', poolDir: '/opt/keel/php/8.4/etc/php-fpm.d', bin: '/opt/keel/php/8.4/sbin/php-fpm', fpmConfig: '/opt/keel/php/8.4/etc/php-fpm.conf', units: ['keel-php8.4-fpm'], socketDir: '/run/keel-php', listenOwner: 'www-data' };
+  const rhel = { version: '8.2', flavor: 'rhel', poolDir: '/etc/php-fpm.d', bin: 'php-fpm', units: ['php-fpm'], socketDir: '/run/php-fpm', listenOwner: 'apache' };
+
+  it("lives in the pool directory of the version it is written for, with a socket beside that version's tenant sockets", () => {
+    expect(HOST_POOL).toEqual({ name: 'keel-host', stateDir: '/var/lib/whm/keel-host' });
+    expect(hostPoolPath(debian)).toBe('/etc/php/8.3/fpm/pool.d/keel-host.conf');
+    expect(hostPoolPath(keel)).toBe('/opt/keel/php/8.4/etc/php-fpm.d/keel-host.conf');
+    expect(hostPoolSocket(debian)).toBe('/run/php/php8.3-fpm-keel-host.sock');
+    expect(hostPoolSocket(keel)).toBe('/run/keel-php/php8.4-fpm-keel-host.sock');
+    expect(hostPoolSocket({ ...rhel, version: 'system' })).toBe('/run/php-fpm/php-fpm-keel-host.sock');
+    // Never a tenant file: those are whm-<user>.conf.
+    expect(hostPoolPath(debian)).not.toMatch(/whm-/);
+  });
+
+  it('renders as the web server user with pm ondemand, the state directory for uploads/sessions and no open_basedir; byte-identical for the same tree', () => {
+    const text = renderHostPool(debian);
+    expect(text.startsWith('; Managed by Keel (PHP-FPM pool for the server hostname site, runs as www-data, PHP 8.3)')).toBe(true);
+    expect(text).toContain('[keel-host]\nuser = www-data\ngroup = www-data\nlisten = /run/php/php8.3-fpm-keel-host.sock\nlisten.owner = www-data\nlisten.group = www-data\nlisten.mode = 0660\npm = ondemand\npm.max_children = 10\npm.process_idle_timeout = 10s\n');
+    expect(text).toContain('php_admin_value[upload_tmp_dir] = /var/lib/whm/keel-host/tmp');
+    expect(text).toContain('php_admin_value[session.save_path] = /var/lib/whm/keel-host/tmp');
+    expect(text).toContain('php_admin_value[error_log] = /var/lib/whm/keel-host/php-error.log');
+    expect(text).toContain('security.limit_extensions = .php .phar .phtml');
+    expect(text).not.toContain('open_basedir');
+    expect(text).not.toContain('[www-data]');
+    expect(renderHostPool(debian)).toBe(text);
+    expect(renderHostPool(rhel)).toContain('user = apache\ngroup = apache\nlisten = /run/php-fpm/php8.2-fpm-keel-host.sock\nlisten.owner = apache');
+    expect(renderHostPool(keel)).toContain('listen = /run/keel-php/php8.4-fpm-keel-host.sock');
+    // The tenant renderer is unchanged by the name/group options it grew.
+    const tenant = renderPhpPool({ user: 'alice', version: '8.3', pm: 'ondemand', maxChildren: 5, processIdleTimeout: 10, maxRequests: 500, memoryLimit: '256M', uploadMaxFilesize: '64M', postMaxSize: '64M', maxExecutionTime: 120 }, { socket: '/run/php/php8.3-fpm-alice.sock', homeDir: '/home/alice' });
+    expect(tenant).toContain('(PHP-FPM pool for alice, PHP 8.3)');
+    expect(tenant).toContain('[alice]\nuser = alice\ngroup = alice\n');
+  });
+
+  it('lists the trees that carry the pool, newest first, from the layout alone', () => {
+    const layout = { versions: [rhel, debian, keel] };
+    const io = (present) => ({ exists: (p) => present.includes(p) });
+    expect(hostPools(layout, io(['/etc/php/8.3/fpm/pool.d/keel-host.conf', '/opt/keel/php/8.4/etc/php-fpm.d/keel-host.conf']))).toEqual([
+      { version: '8.4', flavor: 'keel', path: '/opt/keel/php/8.4/etc/php-fpm.d/keel-host.conf', socket: '/run/keel-php/php8.4-fpm-keel-host.sock', units: ['keel-php8.4-fpm'] },
+      { version: '8.3', flavor: 'debian', path: '/etc/php/8.3/fpm/pool.d/keel-host.conf', socket: '/run/php/php8.3-fpm-keel-host.sock', units: ['php8.3-fpm'] },
+    ]);
+    expect(hostPools(layout, io(['/etc/php/8.3/fpm/pool.d/whm-alice.conf']))).toEqual([]);
+  });
+
+  it('web.host.pool.write / remove validate the version before anything runs; a version with no tree is capability_missing, never a write', async () => {
+    for (const args of [{}, { version: '8.3; rm -rf /' }, { version: '../8.3' }, { version: 'php83' }, { version: '8.3', user: 'alice' }, { version: '8.3', reload: 'yes' }]) {
+      expect((await opError(runOp('web.host.pool.write', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+      expect((await opError(runOp('web.host.pool.remove', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    }
+    if (!phpLayout().versions.some((v) => v.version === '7.0')) {
+      expect((await opError(runOp('web.host.pool.write', { version: '7.0' }, ctx))).code).toBe('capability_missing');
+      expect(await runOp('web.host.pool.remove', { version: '7.0' }, ctx)).toEqual({ version: '7.0', path: null, removed: false, reloaded: false, unit: null });
+    }
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('web.host.ensure and web.host.app.write take the handler socket as a parameter, pinned to a socket path under /run', async () => {
+    const APP = { name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html' };
+    for (const phpSocket of ['/etc/passwd', '/run/php/x.sock; id', 'relative.sock', '/run/php/../../etc/x.sock', '/tmp/x.sock', '/run/php/php8.3-fpm-keel-host']) {
+      expect((await opError(runOp('web.host.ensure', { hostname: 'nova.example.com', phpSocket }, ctx))).code, phpSocket).toBe('invalid_args');
+      expect((await opError(runOp('web.host.app.write', { ...APP, phpSocket }, ctx))).code, phpSocket).toBe('invalid_args');
+    }
+    const narrow = createContext({ allowedRoots: ['/home'] });
+    expect((await opError(runOp('web.host.ensure', { hostname: 'nova.example.com', phpSocket: '/run/keel-php/php8.4-fpm-keel-host.sock' }, narrow))).code).toBe('path_not_allowed');
+    expect((await opError(runOp('web.host.app.write', { ...APP, phpSocket: '/run/php/php8.3-fpm-keel-host.sock' }, narrow))).code).toBe('path_not_allowed');
+    expect(exec).not.toHaveBeenCalled();
   });
 });
 

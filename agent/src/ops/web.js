@@ -590,8 +590,8 @@ export function renderGlobalInclude(d) {
   return `${lines.join('\n')}\n`;
 }
 
-export function renderPhpPool(p, { listenOwner = 'www-data', socket, homeDir }) {
-  const lines = [`; ${MANAGED.slice(2)} (PHP-FPM pool for ${p.user}, PHP ${p.version}). Edit through the panel; manual changes are overwritten.`, `[${p.user}]`, `user = ${p.user}`, `group = ${p.user}`, `listen = ${socket}`, `listen.owner = ${listenOwner}`, `listen.group = ${listenOwner}`, 'listen.mode = 0660', `pm = ${p.pm}`, `pm.max_children = ${p.maxChildren}`];
+export function renderPhpPool(p, { listenOwner = 'www-data', socket, homeDir, name = p.user, group = p.user, label = `PHP-FPM pool for ${p.user}` }) {
+  const lines = [`; ${MANAGED.slice(2)} (${label}, PHP ${p.version}). Edit through the panel; manual changes are overwritten.`, `[${name}]`, `user = ${p.user}`, `group = ${group}`, `listen = ${socket}`, `listen.owner = ${listenOwner}`, `listen.group = ${listenOwner}`, 'listen.mode = 0660', `pm = ${p.pm}`, `pm.max_children = ${p.maxChildren}`];
   if (p.pm === 'dynamic') {
     const start = p.startServers ?? Math.max(1, Math.min(p.maxChildren, 2));
     lines.push(`pm.start_servers = ${start}`, `pm.min_spare_servers = ${p.minSpareServers ?? Math.max(1, Math.min(start, p.maxChildren))}`, `pm.max_spare_servers = ${p.maxSpareServers ?? Math.max(start, Math.min(p.maxChildren, start * 2))}`);
@@ -966,6 +966,34 @@ export function wwwPoolSocket(layout = phpLayout(), io = { exists }) {
   return candidates.find((s) => io.exists(s)) || null;
 }
 
+// The hostname site's own PHP-FPM pool: one "keel-host" pool in the pool
+// directory of the effective default version (distro pool.d or a Keel build's
+// etc/php-fpm.d), running as the web server user, so removing the distro PHP
+// or defaulting to a source build never leaves the site pointing at a socket
+// that no longer exists. Named keel-host.conf: tenant pools are whm-<user>.conf.
+export const HOST_POOL = { name: 'keel-host', stateDir: '/var/lib/whm/keel-host' };
+export function hostPoolSocket(tree) {
+  return `${tree.socketDir}/php${tree.version === 'system' ? '' : tree.version}-fpm-${HOST_POOL.name}.sock`;
+}
+export function hostPoolPath(tree) {
+  return path.join(tree.poolDir, `${HOST_POOL.name}.conf`);
+}
+// Every tree that carries the host pool, newest PHP first.
+export function hostPools(layout = phpLayout(), io = { exists }) {
+  return [...layout.versions].reverse().filter((v) => io.exists(hostPoolPath(v))).map((v) => ({ version: v.version, flavor: v.flavor, path: hostPoolPath(v), socket: hostPoolSocket(v), units: v.units }));
+}
+export function renderHostPool(tree) {
+  const owner = tree.listenOwner || 'www-data';
+  const p = { user: owner, version: tree.version, pm: 'ondemand', maxChildren: 10, processIdleTimeout: 10, maxRequests: 500, memoryLimit: '256M', uploadMaxFilesize: '64M', postMaxSize: '64M', maxExecutionTime: 120, tmpDir: `${HOST_POOL.stateDir}/tmp`, errorLog: `${HOST_POOL.stateDir}/php-error.log` };
+  return renderPhpPool(p, { listenOwner: owner, socket: hostPoolSocket(tree), homeDir: HOST_POOL.stateDir, name: HOST_POOL.name, group: owner, label: `PHP-FPM pool for the server hostname site, runs as ${owner}` });
+}
+// The handler socket the hostname site should use when the caller passes none:
+// the host pool of the newest tree that has one, else the distro www pool.
+function hostPhpSocketFallback() {
+  return hostPools()[0]?.socket || wwwPoolSocket();
+}
+
+const socketPath = confPath.regex(/^\/(?:run|var\/run|var\/opt)\/[A-Za-z0-9._\/-]+\.sock$/, 'PHP-FPM socket path under /run');
 const hostAppName = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/, 'lowercase name such as webmail');
 const hostAppAlias = z.string().max(128).regex(/^\/(?!(?:.*\/)?\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*\/?$/, 'URL path such as /webmail');
 const hostAppOption = z.enum(['+Indexes', '-Indexes', '+FollowSymLinks', '-FollowSymLinks', '+SymLinksIfOwnerMatch', '-SymLinksIfOwnerMatch', '+MultiViews', '-MultiViews', 'None']);
@@ -978,12 +1006,13 @@ const hostAppSchema = z.object({
   directoryIndex: z.array(z.string().regex(/^[A-Za-z0-9._-]{1,64}$/)).max(10).optional(),
   allowOverride: z.enum(['None', 'All', 'AuthConfig', 'FileInfo', 'Indexes', 'Limit', 'Options']).default('None'),
   denyDirs: z.array(dirName).max(20).default([]),
+  phpSocket: socketPath.optional(),
   reload: z.boolean().default(true),
 }).strict().refine((a) => a.access !== 'list' || a.allowFrom.length > 0, { message: 'allowFrom is required when access is "list"', path: ['allowFrom'] });
 
 const hostVhostSchema = z.object({
   hostname: arg.domain, docroot: confPath.default(HOST_VHOST.docroot), port: z.number().int().min(1).max(65535).default(80), sslPort: z.number().int().min(1).max(65535).nullable().default(443),
-  bind: arg.ip.nullable().optional(), ips: z.array(arg.ip).max(64).default([]), php: z.boolean().default(true), panelPort: z.number().int().min(1).max(65535).default(2087), serverAdmin: emailAddress.optional(), reload: z.boolean().default(true),
+  bind: arg.ip.nullable().optional(), ips: z.array(arg.ip).max(64).default([]), php: z.boolean().default(true), phpSocket: socketPath.optional(), panelPort: z.number().int().min(1).max(65535).default(2087), serverAdmin: emailAddress.optional(), reload: z.boolean().default(true),
 }).strict();
 
 const hostPhpLines = (socket, indent = '  ') => [`${indent}<IfModule proxy_fcgi_module>`, `${indent}  SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1`, `${indent}  <FilesMatch "\\.ph(ar|p|tml)$">`, `${indent}    SetHandler "proxy:unix:${socket}|fcgi://localhost"`, `${indent}  </FilesMatch>`, `${indent}</IfModule>`];
@@ -1083,7 +1112,7 @@ function hostVhostPresent(layout) {
 }
 
 defineOp('web.host.ensure', {
-  description: 'Render and install the server-hostname site (keel-host.conf: :80 with ACME passthrough + redirect, :443 with the Apache service certificate, PHP via the www pool, IncludeOptional keel-host.d/*.conf; bound to every held account IP in ips plus the wildcard), validate with configtest (rolled back on error) and reload; idempotent',
+  description: 'Render and install the server-hostname site (keel-host.conf: :80 with ACME passthrough + redirect, :443 with the Apache service certificate, PHP via phpSocket (the keel-host pool from web.host.pool.write; without it the newest host pool, else the distro www pool), IncludeOptional keel-host.d/*.conf; bound to every held account IP in ips plus the wildcard), validate with configtest (rolled back on error) and reload; idempotent',
   schema: hostVhostSchema,
   run: async (h, ctx) => {
     const docroot = ctx.assertAllowedPath(h.docroot, 'write');
@@ -1104,8 +1133,8 @@ defineOp('web.host.ensure', {
     const certPresent = exists(cert.fullchain) && exists(cert.key);
     const ssl = h.sslPort && certPresent ? cert : null;
     if (h.sslPort && !certPresent) warnings.push({ code: 'certificate_missing', message: `No Apache service certificate under ${HOST_VHOST.certDir}; https://${h.hostname}/ is served once one is installed (Manage Service SSL Certificates or AutoSSL for the hostname).` });
-    const phpSocket = h.php ? wwwPoolSocket() : null;
-    if (h.php && !phpSocket) warnings.push({ code: 'php_missing', message: 'No PHP-FPM www pool socket was found; PHP applications under the hostname site are not executed.' });
+    const phpSocket = h.php ? h.phpSocket || hostPhpSocketFallback() : null;
+    if (h.php && !phpSocket) warnings.push({ code: 'php_missing', message: 'No PHP-FPM pool socket was found for the hostname site (web.host.pool.write first); PHP applications under it are not executed.' });
     const content = renderHostVhost({ ...h, docroot, appsDir, logDir: layout.logDir, acmeRoot: HOST_VHOST.acmeRoot, phpSocket, ssl, ownAddress: hostHasAddress });
     const base = { hostname: h.hostname, path: file, link: layout.link, docroot, docrootCreated: docrootState.created, indexWritten: docrootState.indexWritten, appsDir, phpSocket, ssl: Boolean(ssl), certificate: { ...cert, present: certPresent }, bytes: Buffer.byteLength(content), warnings };
     if (existing === content && (!layout.link || exists(layout.link))) return { ...base, changed: false, validated: null, reloaded: false, unit: null };
@@ -1116,13 +1145,14 @@ defineOp('web.host.ensure', {
 });
 
 defineOp('web.host.status', {
-  description: 'The server-hostname site: file, enabled state, metadata, service certificate presence, www pool socket and the published applications',
+  description: 'The server-hostname site: file, enabled state, metadata, service certificate presence, the PHP handler socket, the keel-host pools present per PHP version and the published applications',
   run: async (_args, ctx) => {
     const cert = hostCertPaths();
     ctx.assertAllowedPath(HOST_VHOST.docroot, 'read');
     const certificate = { ...cert, present: exists(cert.fullchain) && exists(cert.key) };
     const apache = apacheLayout();
-    if (!apache) return { installed: false, exists: false, enabled: false, managed: false, hostname: null, meta: null, ssl: false, certificate, docroot: HOST_VHOST.docroot, docrootExists: isDirectory(HOST_VHOST.docroot), phpSocket: wwwPoolSocket(), appsDir: null, apps: [] };
+    const pools = hostPools();
+    if (!apache) return { installed: false, exists: false, enabled: false, managed: false, hostname: null, meta: null, ssl: false, certificate, docroot: HOST_VHOST.docroot, docrootExists: isDirectory(HOST_VHOST.docroot), phpSocket: pools[0]?.socket || wwwPoolSocket(), pools, appsDir: null, apps: [] };
     const layout = hostLayout(apache);
     const file = ctx.assertAllowedPath(layout.file, 'read');
     const appsDir = ctx.assertAllowedPath(layout.appsDir, 'read');
@@ -1130,7 +1160,7 @@ defineOp('web.host.status', {
     const meta = parseHostMeta(text);
     return {
       installed: Boolean(apache.bin), flavor: apache.flavor, path: file, link: layout.link, exists: text != null, managed: text != null && text.includes(HOST_MARK), enabled: layout.link ? exists(layout.link) : text != null,
-      hostname: meta?.hostname ?? null, meta, ssl: Boolean(meta?.ssl), certificate, docroot: meta?.docroot ?? HOST_VHOST.docroot, docrootExists: isDirectory(meta?.docroot ?? HOST_VHOST.docroot), phpSocket: wwwPoolSocket(), appsDir, apps: listHostApps(appsDir),
+      hostname: meta?.hostname ?? null, meta, ssl: Boolean(meta?.ssl), certificate, docroot: meta?.docroot ?? HOST_VHOST.docroot, docrootExists: isDirectory(meta?.docroot ?? HOST_VHOST.docroot), phpSocket: meta?.phpSocket ?? pools[0]?.socket ?? wwwPoolSocket(), pools, appsDir, apps: listHostApps(appsDir),
     };
   },
 });
@@ -1154,6 +1184,67 @@ defineOp('web.host.remove', {
   },
 });
 
+// The pool's state directory (uploads, sessions, PHP error log) belongs to the
+// pool user; a symlink or a foreign owner there is refused rather than chowned.
+function ensureHostPoolState(owner) {
+  const dir = HOST_POOL.stateDir;
+  for (const [d, mode] of [[dir, 0o750], [path.join(dir, 'tmp'), 0o700]]) {
+    let st = null;
+    try { st = fs.lstatSync(d); } catch { st = null; }
+    if (st && (st.isSymbolicLink() || !st.isDirectory())) throw new OpError('refused', `${d} exists and is not a directory`);
+    if (st && st.uid !== 0 && st.uid !== owner.uid) throw new OpError('refused', `${d} is owned by uid ${st.uid}, not root or ${owner.name}`);
+    if (!st) fs.mkdirSync(d, { recursive: true, mode });
+    fs.chownSync(d, owner.uid, owner.gid);
+    fs.chmodSync(d, mode);
+  }
+}
+
+defineOp('web.host.pool.write', {
+  description: 'Write the hostname site\'s own PHP-FPM pool (keel-host.conf: user www-data/apache, pm ondemand, listen <socketDir>/php<version>-fpm-keel-host.sock) into the pool directory of the given PHP version (distro pool.d or a Keel build\'s etc/php-fpm.d), test with php-fpm -t (rolled back on error) and reload that version\'s unit; lists the same pool left in other versions as others',
+  schema: z.object({ version: phpVersion, reload: z.boolean().default(true) }).strict(),
+  run: async ({ version, reload }, ctx) => {
+    const layout = phpLayout();
+    const tree = layout.versions.find((v) => v.version === version);
+    if (!tree) throw new OpError('capability_missing', `PHP-FPM ${version} is not installed on this server (available: ${layout.versions.map((v) => v.version).join(', ') || 'none'})`);
+    const file = ctx.assertAllowedPath(hostPoolPath(tree), 'write');
+    ctx.assertAllowedPath(HOST_POOL.stateDir, 'write');
+    const owner = passwdEntry(tree.listenOwner || 'www-data');
+    if (!owner) throw new OpError('not_found', `Web server user "${tree.listenOwner}" does not exist`);
+    ensureHostPoolState(owner);
+    const socket = hostPoolSocket(tree);
+    const content = renderHostPool(tree);
+    const previous = readText(file);
+    const others = hostPools(layout).filter((p) => p.version !== version).map(({ version: v, flavor, path: p, socket: s }) => ({ version: v, flavor, path: p, socket: s }));
+    const base = { version, flavor: tree.flavor, user: owner.name, path: file, socket, others, bytes: Buffer.byteLength(content) };
+    if (previous === content) return { ...base, changed: false, validated: null, reloaded: false, unit: null };
+    writeAtomic(file, content);
+    let validated = null;
+    if (tree.bin) {
+      const testArgv = tree.flavor === 'keel' ? ['-t', '--fpm-config', tree.fpmConfig] : ['-t'];
+      const { code, stdout, stderr } = await exec(tree.bin, testArgv, { allowFailure: true, timeoutMs: 60_000 });
+      validated = code === 0;
+      if (!validated) { restore(file, previous); throw new OpError('config_invalid', `PHP-FPM rejected the hostname pool; the previous file was restored: ${lastLine(stderr || stdout)}`, { output: `${stdout}${stderr}`.trim() }); }
+    }
+    const result = reload ? await reloadUnit(tree.units) : { reloaded: false, unit: null };
+    return { ...base, changed: true, validated, ...result };
+  },
+});
+
+defineOp('web.host.pool.remove', {
+  description: 'Remove the hostname site\'s PHP-FPM pool from one PHP version\'s pool directory and reload that unit',
+  destructive: true,
+  schema: z.object({ version: phpVersion, reload: z.boolean().default(true) }).strict(),
+  run: async ({ version, reload }, ctx) => {
+    const tree = phpLayout().versions.find((v) => v.version === version);
+    if (!tree) return { version, path: null, removed: false, reloaded: false, unit: null };
+    const file = ctx.assertAllowedPath(hostPoolPath(tree), 'write');
+    const existed = exists(file);
+    if (existed) fs.unlinkSync(file);
+    dropLegacyBackup(file);
+    return { version, path: file, socket: hostPoolSocket(tree), removed: existed, ...(existed && reload ? await reloadUnit(tree.units) : { reloaded: false, unit: null }) };
+  },
+});
+
 defineOp('web.host.app.write', {
   description: 'Publish a web application under the server-hostname site from a structured spec (Alias + Directory rendered by the agent) as keel-host.d/<name>.conf, validate with configtest (rolled back on error) and reload',
   schema: hostAppSchema,
@@ -1167,8 +1258,8 @@ defineOp('web.host.app.write', {
     const previous = readText(file);
     if (previous != null && !previous.includes(HOST_APP_MARK)) throw new OpError('refused', `${file} was not written by the panel; refusing to overwrite it`);
     const warnings = [];
-    const phpSocket = a.php ? wwwPoolSocket() : null;
-    if (a.php && !phpSocket) warnings.push({ code: 'php_missing', message: 'No PHP-FPM www pool socket was found; the application is published without a PHP handler.' });
+    const phpSocket = a.php ? a.phpSocket || hostPhpSocketFallback() : null;
+    if (a.php && !phpSocket) warnings.push({ code: 'php_missing', message: 'No PHP-FPM pool socket was found for the hostname site; the application is published without a PHP handler.' });
     const vhostPresent = hostVhostPresent(layout);
     if (!vhostPresent) warnings.push({ code: 'hostname_vhost_missing', message: `${layout.file} is absent or disabled, so ${appsDir}/${a.name}.conf is not loaded until the hostname site exists.` });
     fs.mkdirSync(appsDir, { recursive: true, mode: 0o755 });

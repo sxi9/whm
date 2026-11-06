@@ -604,6 +604,21 @@ export function parseDnfRemoveSimulation(stdout) {
   return out;
 }
 
+// The package manager's own dry run over installed package names (apt-get -s
+// remove / dnf remove --assumeno): every package the transaction would take
+// out, reverse dependencies included. Changes nothing.
+async function simulateRemoval(pm, present, purge) {
+  if (pm.family === 'debian') {
+    const r = await exec('apt-get', ['-s', '-q', '-o', 'Debug::NoLocking=true', purge ? 'purge' : 'remove', '--', ...present], { env: APT_ENV, allowFailure: true, timeoutMs: 5 * 60_000, maxBuffer: BIG });
+    if (r.code !== 0) throw new OpError('command_failed', `apt-get could not simulate the removal: ${r.stderr.trim().split('\n').pop() || 'unknown error'}`, { output: tail(`${r.stdout}\n${r.stderr}`, 50) });
+    return { removed: parseAptRemoveSimulation(r.stdout), output: tail(r.stdout, 200) };
+  }
+  const r = await exec(pm.binary, ['-q', 'remove', '--assumeno', '--', ...present], { allowFailure: true, timeoutMs: 5 * 60_000, maxBuffer: BIG });
+  const removed = parseDnfRemoveSimulation(`${r.stdout}\n${r.stderr}`);
+  if (!removed.length && r.code !== 0 && !/Operation aborted|Nothing to do/i.test(`${r.stdout}\n${r.stderr}`)) throw new OpError('command_failed', `${pm.binary} could not simulate the removal: ${r.stderr.trim().split('\n').pop() || 'unknown error'}`, { output: tail(`${r.stdout}\n${r.stderr}`, 50) });
+  return { removed, output: tail(`${r.stdout}\n${r.stderr}`, 200) };
+}
+
 defineOp('pkg.remove_simulate', {
   description: 'Which packages a removal would take out, reverse dependencies included (apt-get -s remove / dnf remove --assumeno); changes nothing',
   timeoutMs: 5 * 60_000,
@@ -613,19 +628,7 @@ defineOp('pkg.remove_simulate', {
     const installed = new Set((await installedPackages()).packages.map((p) => p.name));
     const present = packages.filter((p) => installed.has(p));
     if (!present.length) return { manager: pm.manager, requested: packages, present, remove: [], collateral: [], output: [] };
-    let removed;
-    let output;
-    if (pm.family === 'debian') {
-      const r = await exec('apt-get', ['-s', '-q', '-o', 'Debug::NoLocking=true', purge ? 'purge' : 'remove', '--', ...present], { env: APT_ENV, allowFailure: true, timeoutMs: 5 * 60_000, maxBuffer: BIG });
-      if (r.code !== 0) throw new OpError('command_failed', `apt-get could not simulate the removal: ${r.stderr.trim().split('\n').pop() || 'unknown error'}`, { output: tail(`${r.stdout}\n${r.stderr}`, 50) });
-      removed = parseAptRemoveSimulation(r.stdout);
-      output = tail(r.stdout, 200);
-    } else {
-      const r = await exec(pm.binary, ['-q', 'remove', '--assumeno', '--', ...present], { allowFailure: true, timeoutMs: 5 * 60_000, maxBuffer: BIG });
-      removed = parseDnfRemoveSimulation(`${r.stdout}\n${r.stderr}`);
-      if (!removed.length && r.code !== 0 && !/Operation aborted|Nothing to do/i.test(`${r.stdout}\n${r.stderr}`)) throw new OpError('command_failed', `${pm.binary} could not simulate the removal: ${r.stderr.trim().split('\n').pop() || 'unknown error'}`, { output: tail(`${r.stdout}\n${r.stderr}`, 50) });
-      output = tail(`${r.stdout}\n${r.stderr}`, 200);
-    }
+    const { removed, output } = await simulateRemoval(pm, present, purge);
     const requested = new Set(present);
     return { manager: pm.manager, requested: packages, present, remove: removed.map((p) => p.name), collateral: removed.filter((p) => !requested.has(p.name)), output };
   },
@@ -952,17 +955,20 @@ async function removeKeelPhp(minor, ctx) {
 }
 
 defineOp('pkg.php.remove', {
-  description: 'Remove every package of one installed PHP version (or the prefix, unit and link of a Keel source build); refuses the CLI default and the last remaining version, keeps /etc/php/<ver> unless purge',
+  description: 'Remove every package of one installed PHP version (or the prefix, unit and link of a Keel source build); refuses the CLI default, the last remaining version and a removal that would take other packages with it (unless force), keeps /etc/php/<ver> unless purge; dry only simulates',
   destructive: true,
   timeoutMs: LONG,
-  schema: z.object({ version: phpVersionId, purge: z.boolean().default(false), wait }).strict(),
-  run: async ({ version, purge, wait: waitFor }, ctx) => {
+  schema: z.object({ version: phpVersionId, purge: z.boolean().default(false), force: z.boolean().default(false), dry: z.boolean().default(false), wait }).strict(),
+  run: async ({ version, purge, force, dry, wait: waitFor }, ctx) => {
     const { versions, defaultId } = phpDiscovery.discover();
     const v = versions.find((x) => x.id === version);
     if (!v) throw new OpError('not_found', `PHP version "${version}" is not installed on this server`);
     if (v.id === defaultId) throw new OpError('refused', `PHP ${version} is the CLI default (/usr/bin/php); make another version the default first`);
     if (versions.length < 2) throw new OpError('refused', `PHP ${version} is the only installed version; install another one before removing it`);
-    if (v.layout === 'keel') return removeKeelPhp(v.id, ctx);
+    if (v.layout === 'keel') {
+      if (dry) return { version, layout: 'keel', manager: null, packages: [], purge, dry: true, remove: [], extra: [], output: [] };
+      return removeKeelPhp(v.id, ctx);
+    }
     const glob = phpPackageGlob(v);
     if (!glob) throw new OpError('unsupported', `PHP ${version} (${v.binary}) is not a packaged build this panel can remove`);
     const pm = requireManager();
@@ -979,8 +985,18 @@ defineOp('pkg.php.remove', {
     }
     packages = [...new Set(packages)].filter((p) => pkgName.safeParse(p).success);
     if (!packages.length) throw new OpError('not_found', `No ${glob} packages are installed; PHP ${version} was not installed from packages`);
+    // apt removes the reverse dependencies of the version packages with them
+    // (roundcube-core and phpmyadmin went with php8.5-* on a live host): the
+    // transaction is simulated first and anything outside the version's own
+    // prefix refuses the removal unless the caller forces it.
+    const requested = new Set(packages);
+    const sim = await simulateRemoval(pm, packages, purge);
+    const remove = sim.removed.map((p) => p.name);
+    const extra = remove.filter((p) => !requested.has(p) && !p.startsWith(prefix));
+    if (dry) return { version, layout: v.layout, manager: pm.manager, packages, purge, dry: true, remove, extra, output: sim.output };
+    if (extra.length && !force) throw new OpError('refused', `Removing PHP ${version} would also remove ${extra.join(', ')}; move what depends on it to another version first, or force the removal`, { version, packages, extra });
     const argv = pm.family === 'debian' ? [purge ? 'purge' : 'remove', '-y', '-q', ...APT_DPKG_OPTS, '--', ...packages] : ['-y', '-q', 'remove', '--', ...packages];
-    return { version, manager: pm.manager, packages, purge, ...finished(await runLong({ kind: 'remove', bin: pm.binary, argv, env: APT_ENV, wait: waitFor }, ctx)) };
+    return { version, manager: pm.manager, packages, purge, forced: Boolean(force && extra.length), extra, ...finished(await runLong({ kind: 'remove', bin: pm.binary, argv, env: APT_ENV, wait: waitFor }, ctx)) };
   },
 });
 

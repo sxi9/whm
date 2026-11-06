@@ -88,6 +88,9 @@ export const EA4_CATALOG = {
   },
 };
 const EA4_PREFIXES = { debian: ['apache2', 'libapache2-', 'php', 'modsecurity'], rhel: ['httpd', 'mod_', 'php'] };
+// The hostname site's applications (contract §41): their drop-in names and the distro packages that pull in PHP.
+const HOST_APP_LABELS = { webmail: 'webmail', phpmyadmin: 'phpMyAdmin' };
+const HOST_APP_PACKAGES = [[/^roundcube/, 'webmail'], [/^phpmyadmin/i, 'phpMyAdmin']];
 
 export function compareVersions(a, b) {
   const pa = String(a ?? '').replace(/^v/, '').split(/[.-]/).map((x) => (/^\d+$/.test(x) ? Number(x) : x));
@@ -328,15 +331,20 @@ export function createSoftwareService(ctx) {
       const fam = capabilities.has('pkg') ? await family().catch(() => null) : null;
       const entry = runtime ? RUNTIMES[runtime] : null;
       if (method && !entry?.source) throw unprocessable('Only PHP versions have an install method; everything else installs from packages', { method: ['Leave it out'] });
+      let installed = null;
       if (entry?.source && fam) {
-        // Catalog check first (422 on a bad version), then the repo decides the default method.
+        // Catalog check first (422 on a bad version), then what is already on
+        // the host (a distro tree is never replaced by a source build, a Keel
+        // build is never built twice), then the repo decides the default method.
         resolveInstall({ runtime, version }, fam);
+        try { installed = detectedVersion(runtime, version, await op('pkg.runtime.detect')); } catch (err) { logger.warn({ err }, 'runtime detection failed'); }
+        resolveInstall({ runtime, version }, fam, { installed });
         const rs = (await probeRepos([entry.repo]))[entry.repo];
         const packagesAvailable = Boolean(rs?.present || rs?.supported === true);
-        if (!method) method = packagesAvailable ? 'package' : 'source';
-        else if (method === 'package' && rs?.supported === false) throw unprocessable(`${entry.label} ${version} packages are not available on this OS: ${rs.detail || 'the repository has no series for it'}${PHP_SOURCE_MINORS.includes(version) ? '; install it as a source build instead' : ''}`, { method: PHP_SOURCE_MINORS.includes(version) ? ['source'] : ['No install method is available for this version on this OS'] });
+        if (!method) method = packagesAvailable || installed?.installed ? 'package' : 'source';
+        else if (method === 'package' && rs?.supported === false && !installed?.installed) throw unprocessable(`${entry.label} ${version} packages are not available on this OS: ${rs.detail || 'the repository has no series for it'}${PHP_SOURCE_MINORS.includes(version) ? '; install it as a source build instead' : ''}`, { method: PHP_SOURCE_MINORS.includes(version) ? ['source'] : ['No install method is available for this version on this OS'] });
       }
-      const plan = resolveInstall({ runtime, version, tool }, fam, { method });
+      const plan = resolveInstall({ runtime, version, tool }, fam, { method, installed });
       const job = enqueue('software.runtime.install', { kind: plan.kind, key: plan.key, version: plan.version, family: fam, ...(plan.installer === 'php-source' ? { method: 'source' } : {}) }, user);
       const target = plan.version ? `${plan.key}:${plan.version}` : plan.key;
       req?.audit?.({ action: 'software.runtime.install', target, args: { kind: plan.kind, key: plan.key, version: plan.version, method: plan.installer === 'php-source' ? 'source' : plan.installer === 'node' ? 'node' : 'package', packages: plan.packages, jobId: job.id } });
@@ -1108,28 +1116,73 @@ export function createSoftwareService(ctx) {
       if (webDefault) return [`PHP ${version} is the web default pinned in Apache Configuration; clear or change it there first`, 'Change the Apache web default first'];
       if (plans > 0) return [`PHP ${version} is the default of ${plans} package(s); change those packages first`, `${plans} package(s) use this version`];
       if (vhosts > 0) return [`PHP ${version} serves ${vhosts} web vhost(s); move them to another version first`, `${vhosts} vhost(s) use this version`];
+      const apps = await php.hostAppsOn(version, versions, defaultId);
+      if (apps.length) return [`PHP ${version} runs the hostname site's ${apps.join(' and ')} (webmail and phpMyAdmin are served on the PHP-FPM socket of the version the hostname site renders); publish them on another version first`, `${apps.join(' and ')} run on this version`];
       return null;
     },
-    async remove(version, user, req) {
+    // The PHP version the hostname site's applications run on: the
+    // service-configuration helper when it has one, else the version whose
+    // PHP-FPM socket the site renders, else the distribution default.
+    async hostAppsPhpVersion(versions, defaultId) {
+      if (typeof ctx.web?.hostApps?.phpVersion === 'function') {
+        try { const v = await ctx.web.hostApps.phpVersion(); if (v) return v; } catch (err) { logger.warn({ err }, 'host apps PHP version lookup failed'); }
+      }
+      let socket = null;
+      if (typeof ctx.web?.hostname?.status === 'function') {
+        try { socket = (await ctx.web.hostname.status())?.phpSocket ?? null; } catch (err) { logger.warn({ err }, 'hostname site status failed'); }
+      }
+      if (socket) {
+        const debian = /\/php(\d+\.\d+)-fpm\.sock$/.exec(socket)?.[1];
+        const hit = versions.find((v) => v.id === debian) ?? versions.find((v) => v.id && socket.includes(`/${v.id}/`));
+        if (hit) return hit.id;
+      }
+      return defaultId ?? null;
+    },
+    // Labels of the hostname-site applications (contract §41) that would lose
+    // their PHP handler with this version; [] without a hostname site.
+    async hostAppsOn(version, versions, defaultId) {
+      if (typeof ctx.web?.hostApps?.list !== 'function') return [];
+      let apps;
+      try { apps = (await ctx.web.hostApps.list()).apps || []; } catch (err) { logger.warn({ err }, 'host app listing failed'); return []; }
+      const phpApps = apps.filter((a) => a.php !== false && a.managed !== false);
+      if (!phpApps.length) return [];
+      if ((await php.hostAppsPhpVersion(versions, defaultId)) !== version) return [];
+      return phpApps.map((a) => HOST_APP_LABELS[a.name] ?? a.name);
+    },
+    // The 422 for a removal the package manager would widen beyond php<ver>-*.
+    collateralMessage(version, extra) {
+      const appOf = (p) => HOST_APP_PACKAGES.find(([re]) => re.test(p))?.[1] ?? null;
+      const apps = [...new Set(extra.map(appOf).filter(Boolean))];
+      if (extra.some((p) => !appOf(p))) apps.push(apps.length ? 'whatever else depends on it' : 'what depends on it');
+      return `Removing PHP ${version} would also remove ${extra.join(', ')} — move ${apps.join(' and ')} to another version first, or force the removal`;
+    },
+    async remove(version, user, req, { force = false } = {}) {
       requirePhp();
       const blocker = await php.removeBlocker(version);
       if (blocker) throw unprocessable(blocker[0], { version: [blocker[1]] });
-      const job = enqueue('software.php.remove', { version }, user);
-      req?.audit?.({ action: 'software.php.remove', target: version, args: { jobId: job.id } });
-      return { job, version };
+      // The package manager's dry run first: apt removes reverse dependencies
+      // (roundcube-core, phpmyadmin) with the version packages.
+      const sim = await op('pkg.php.remove', { version, dry: true }, req);
+      const extra = Array.isArray(sim?.extra) ? sim.extra : [];
+      if (extra.length && !force) throw unprocessable(php.collateralMessage(version, extra), { version: [`Removing it also removes ${extra.join(', ')}`], extra });
+      const forced = Boolean(force && extra.length);
+      const job = enqueue('software.php.remove', { version, ...(force ? { force: true } : {}) }, user);
+      req?.audit?.({ action: 'software.php.remove', target: version, args: { jobId: job.id, force: Boolean(force), forced, extra } });
+      return { job, version, extra, forced };
     },
     async removeJob(job) {
-      const { version } = job.params;
+      const { version, force = false } = job.params;
       const blocker = await php.removeBlocker(version);
       if (blocker) throw new Error(`Removal of PHP ${version} refused: ${blocker[0]}`);
+      if (force) job.log(`forced: packages outside PHP ${version}'s own prefix that depend on it are removed as well`, 'warn');
       job.progress(5, `removing PHP ${version}`);
-      const result = await runLongOp(job, 'pkg.php.remove', { version }, `PHP ${version} removal`);
+      const result = await runLongOp(job, 'pkg.php.remove', { version, ...(force ? { force: true } : {}) }, `PHP ${version} removal`);
       job.progress(90, 're-detecting capabilities');
       await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after PHP removal failed'); job.log(`capability re-detection failed: ${err.message}`, 'warn'); });
       const offered = php.offeredVersions();
       if (offered?.includes(version)) settings.set('php.offered_versions', offered.filter((id) => id !== version));
       job.progress(100, 'done');
-      return { version, packages: result.packages ?? [], removed: true, ...(result.layout ? { layout: result.layout } : {}), ...(result.prefix ? { prefix: result.prefix } : {}) };
+      return { version, packages: result.packages ?? [], removed: true, ...(result.layout ? { layout: result.layout } : {}), ...(result.prefix ? { prefix: result.prefix } : {}), ...(Array.isArray(result.extra) && result.extra.length ? { extra: result.extra, forced: true } : {}) };
     },
     // Direct update of an installed version (contract §63): the pending
     // packages of its prefix, or a fresh php.net build over a Keel prefix.

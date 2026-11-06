@@ -125,7 +125,8 @@ export async function register(ctx) {
   r.get('/php/catalog', requireRoot, wrap(() => s.php.catalog()));
   r.get('/php/usage', requireRoot, wrap(() => s.php.usage()));
   r.put('/php/offered', requireRoot, validate({ body: z.object({ versions: z.array(phpVersionId).max(50).nullable() }).strict() }), wrap((req) => s.php.setOffered(req.body.versions, req.user, req)));
-  r.post('/php/remove', requireRoot, validate({ body: z.object({ version: phpVersionId }).strict() }), accepted((req) => s.php.remove(req.body.version, req.user, req)));
+  // force (root only, audited): remove even when the package manager would take other packages (roundcube-core, phpmyadmin) with the version.
+  r.post('/php/remove', requireRoot, validate({ body: z.object({ version: phpVersionId, force: z.boolean().default(false) }).strict() }), accepted((req) => s.php.remove(req.body.version, req.user, req, { force: req.body.force })));
   r.post('/php/update', requireRoot, validate({ body: z.object({ version: phpVersionId }).strict() }), accepted((req) => s.php.update(req.body.version, req.user, req)));
   r.get('/php/versions', requireReseller, validate({ query: z.object({ modules: z.enum(['true', 'false']).default('false') }) }), wrap((req) => s.php.versions({ modules: req.query.modules === 'true', user: req.user })));
   r.put('/php/default', requireRoot, validate({ body: z.object({ version: phpVersionId }).strict() }), maybeAccepted((req) => s.php.setSystemDefault(req.body.version, req.user, req)));

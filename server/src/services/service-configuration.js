@@ -34,6 +34,8 @@ import { ssoEndpoint } from '../lib/sso-endpoint.js';
 //   web.hostname.ensure(req, { reload, strict })    -> server-hostname site (contract §41): keel-host.conf with the Apache service certificate; idempotent
 //   web.hostname.status()                           -> { hostname, fqdn, exists, enabled, inSync, ssl, certificate, apps, lastApply }
 //   web.hostApps.publish({ name, alias, root, php, … }, req) / unpublish(name, req) / list()   -> keel-host.d/<name>.conf under that site only
+//   web.hostApps.phpVersion()                       -> { version, socket } of the hostname site's own keel-host PHP-FPM pool (PHP Version Manager removal guard), null before the first apply
+//   web.hostApps.resyncPhpDefault(version, req)     -> move the keel-host pool, the site and every drop-in to the new effective default (the PUT /api/software/php/default seam)
 //   web.webmail.status() / publish(req, { reload }) / unpublish(req)   -> Roundcube as /webmail under that site + the Keel block in /etc/roundcube/config.inc.php (contract §41 addendum)
 // The ones that change a live vhost/daemon persist the change first and then throw
 // CapabilityError('apache' | 'ftp') when the daemon is missing; consumers map that
@@ -1706,6 +1708,67 @@ export function createServiceConfigService(ctx) {
   };
   const shapeHostApp = (host) => (a) => ({ name: a.name, alias: a.alias ?? null, root: a.root ?? null, php: a.php ?? null, managed: a.managed ?? true, path: a.path, url: host && a.alias ? `https://${host}${a.alias}/` : null, updatedAt: a.mtime ?? null });
 
+  // The hostname site's PHP handler is its own keel-host pool in the effective
+  // default version's tree (Apache Configuration's pinned web default, else the
+  // Software default, else the newest tree), never the distro www pool: that
+  // pool goes away with the distro PHP and a Keel build has none.
+  async function hostPhpVersion() {
+    let trees = await phpTrees();
+    // A cached detection from before PHP was installed must not strip the site of its handler.
+    if (!trees.length) { invalidate(); trees = await phpTrees(); }
+    if (!trees.length) return null;
+    let wanted = phpVersionId(getConf('apache').defaultPhpVersion);
+    if (!wanted) {
+      try { wanted = phpVersionId((await ctx.software?.php?.systemDefault?.())?.effective); } catch (err) { logger.warn({ err }, 'web: php system default lookup failed'); wanted = null; }
+    }
+    if (!wanted) wanted = phpVersionId(settings.get('php.default_version'));
+    if (wanted && trees.some((t) => t.version === wanted)) return wanted;
+    return trees[trees.length - 1].version;
+  }
+  const hostPoolApply = () => { const a = lastApply('hostname_php_pool'); return a?.ok && a.summary?.version ? { version: a.summary.version, socket: a.summary.socket ?? null, path: a.summary.path ?? null } : null; };
+  // Writes the pool for the effective default and drops the ones left in other
+  // versions; { socket: null } with a php_missing warning when no PHP-FPM is installed.
+  async function ensureHostPool(req) {
+    const version = await hostPhpVersion();
+    if (!version) {
+      recordApply('hostname_php_pool', false, { version: null }, 'no PHP-FPM is installed');
+      return { version: null, socket: null, changed: false, removed: [], warnings: [{ code: 'php_missing', message: 'No PHP-FPM version is installed; PHP applications under the hostname site are not executed until one is (Software › PHP Version Manager).' }] };
+    }
+    try {
+      const r = await op('web.host.pool.write', { version }, req);
+      const removed = [];
+      for (const other of r.others || []) {
+        try { removed.push({ version: other.version, ...(await op('web.host.pool.remove', { version: other.version }, req)) }); } catch (err) { logger.warn({ err, version: other.version }, 'web: stale hostname pool removal failed'); }
+      }
+      recordApply('hostname_php_pool', true, { version, socket: r.socket, path: r.path, flavor: r.flavor ?? null, user: r.user ?? null });
+      if (r.changed || removed.length) audit(req, { action: 'hostname_php_pool.write', target: version, args: { path: r.path, socket: r.socket, user: r.user ?? null, reloaded: Boolean(r.reloaded), removed: removed.map((x) => x.version) } });
+      return { version, socket: r.socket, path: r.path, changed: Boolean(r.changed), removed, warnings: [] };
+    } catch (err) {
+      recordApply('hostname_php_pool', false, { version }, err.message);
+      throw err;
+    }
+  }
+  const hostAppSpecFromMeta = (m) => {
+    const spec = { name: m.name, alias: m.alias, root: m.root, php: m.php !== false };
+    for (const k of ['access', 'allowFrom', 'options', 'directoryIndex', 'allowOverride', 'denyDirs']) if (m[k] != null) spec[k] = m[k];
+    return spec;
+  };
+  // Re-renders every panel-managed drop-in with the current handler socket (reload left to the caller).
+  async function rerenderHostApps(socket, req) {
+    const list = await op('web.host.app.list');
+    const out = [];
+    for (const a of list.apps || []) {
+      if (!a.managed || !a.meta?.name || !a.meta.alias || !a.meta.root) continue;
+      const spec = { ...hostAppSpecFromMeta(a.meta), reload: false };
+      if (spec.php && socket) spec.phpSocket = socket;
+      try {
+        const r = await op('web.host.app.write', spec, req);
+        out.push({ name: a.name, changed: Boolean(r.changed), phpSocket: r.phpSocket ?? null });
+      } catch (err) { logger.warn({ err, name: a.name }, 'web: hostname app re-render failed'); out.push({ name: a.name, changed: false, error: err.message }); }
+    }
+    return out;
+  }
+
   const hostnameSite = {
     hostname: serverHostname,
     // Called from the hooks (Basic Setup save, Apache service-cert install) with
@@ -1722,14 +1785,21 @@ export function createServiceConfigService(ctx) {
         return { hostname: host, written: false, changed: false, reloaded: false, reason: 'capability_missing', warnings: [{ code: 'capability_missing', message: 'Apache is not installed on this server.' }] };
       }
       const ports = listenPorts();
-      const args = { hostname: host, port: ports.http, sslPort: ports.https, panelPort: panelPort(), ips: hostnameSiteIps(), reload };
+      const previousSocket = hostPoolApply()?.socket ?? null;
+      const pool = await ensureHostPool(req);
+      const args = { hostname: host, port: ports.http, sslPort: ports.https, panelPort: panelPort(), ips: hostnameSiteIps(), php: Boolean(pool.socket), reload };
+      if (pool.socket) args.phpSocket = pool.socket;
       if (ports.bind) args.bind = ports.bind;
       try {
         const r = await op('web.host.ensure', args, req);
-        const warnings = r.warnings || [];
-        recordApply('hostname_vhost', true, { hostname: host, path: r.path, ssl: r.ssl, changed: r.changed, warnings: warnings.map((w) => w.code) });
-        if (r.changed) audit(req, { action: 'hostname_vhost.ensure', target: host, args: { path: r.path, ssl: r.ssl, phpSocket: r.phpSocket, reloaded: Boolean(r.reloaded), warnings: warnings.map((w) => w.code) } });
-        return { hostname: host, url: `https://${host}/`, written: true, changed: Boolean(r.changed), reloaded: Boolean(r.reloaded), validated: r.validated ?? null, ssl: Boolean(r.ssl), path: r.path, docroot: r.docroot, phpSocket: r.phpSocket ?? null, warnings };
+        const warnings = [...pool.warnings, ...(r.warnings || [])];
+        // A pool that moved to another version leaves the drop-ins on the old socket.
+        const apps = pool.socket && previousSocket !== pool.socket ? await rerenderHostApps(pool.socket, req) : [];
+        let reloaded = Boolean(r.reloaded);
+        if (reload && !reloaded && apps.some((a) => a.changed)) reloaded = Boolean((await reloadAfter(true, req)).reloaded);
+        recordApply('hostname_vhost', true, { hostname: host, path: r.path, ssl: r.ssl, changed: r.changed, phpVersion: pool.version, phpSocket: r.phpSocket ?? null, warnings: warnings.map((w) => w.code) });
+        if (r.changed) audit(req, { action: 'hostname_vhost.ensure', target: host, args: { path: r.path, ssl: r.ssl, phpVersion: pool.version, phpSocket: r.phpSocket, reloaded, warnings: warnings.map((w) => w.code) } });
+        return { hostname: host, url: `https://${host}/`, written: true, changed: Boolean(r.changed) || apps.some((a) => a.changed), reloaded, validated: r.validated ?? null, ssl: Boolean(r.ssl), path: r.path, docroot: r.docroot, phpVersion: pool.version, phpSocket: r.phpSocket ?? null, apps, warnings };
       } catch (err) {
         recordApply('hostname_vhost', false, { hostname: host }, err.message);
         throw err;
@@ -1743,8 +1813,8 @@ export function createServiceConfigService(ctx) {
       return {
         hostname: rawHostname() || null, fqdn: Boolean(host), apache, url: host ? `https://${host}/` : null, panelUrl: host ? `https://${host}:${panelPort()}/` : null,
         exists: Boolean(st.exists), enabled: Boolean(st.enabled), managed: st.managed ?? null, current: st.hostname ?? null, inSync: Boolean(st.exists && host && st.hostname === host), ssl: Boolean(st.ssl),
-        certificate: st.certificate ?? null, docroot: st.docroot ?? null, phpSocket: st.phpSocket ?? null, path: st.path ?? null, appsDir: st.appsDir ?? null, apps: (st.apps || []).map(shapeHostApp(host)),
-        lastApply: lastApply('hostname_vhost'), error: st.error ?? null,
+        certificate: st.certificate ?? null, docroot: st.docroot ?? null, phpSocket: st.phpSocket ?? null, phpVersion: hostPoolApply()?.version ?? null, pools: st.pools ?? [], path: st.path ?? null, appsDir: st.appsDir ?? null, apps: (st.apps || []).map(shapeHostApp(host)),
+        lastApply: lastApply('hostname_vhost'), phpPool: lastApply('hostname_php_pool'), error: st.error ?? null,
       };
     },
   };
@@ -1753,7 +1823,7 @@ export function createServiceConfigService(ctx) {
     async publish(spec, req) {
       requireApache();
       const site = await hostnameSite.ensure(req, { reload: false, strict: true });
-      const r = await op('web.host.app.write', spec, req);
+      const r = await op('web.host.app.write', spec.php === false || !site.phpSocket ? spec : { ...spec, phpSocket: site.phpSocket }, req);
       const reloaded = Boolean(r.reloaded) || (site.changed ? Boolean((await reloadAfter(true, req)).reloaded) : false);
       audit(req, { action: 'host_app.publish', target: spec.name, args: { alias: r.alias, root: r.root, php: spec.php ?? true, changed: Boolean(r.changed), reloaded } });
       return { name: spec.name, alias: r.alias, root: r.root, url: `https://${site.hostname}${r.alias}/`, path: r.path, changed: Boolean(r.changed), reloaded, validated: r.validated ?? null, warnings: [...site.warnings, ...(r.warnings || [])] };
@@ -1770,6 +1840,17 @@ export function createServiceConfigService(ctx) {
       if (!capabilities.has('apache')) return { installed: false, hostname: host, appsDir: null, vhostPresent: false, apps: [] };
       const r = await op('web.host.app.list');
       return { installed: true, hostname: host, appsDir: r.appsDir ?? null, vhostPresent: Boolean(r.vhostPresent), apps: (r.apps || []).map(shapeHostApp(host)) };
+    },
+    // The PHP version the hostname site runs on (its keel-host pool), from the
+    // last successful pool apply; null before the site was ever applied. The
+    // PHP Version Manager refuses to remove that version while this names it.
+    phpVersion() { return hostPoolApply(); },
+    // The seam for PUT /api/software/php/default: once the default is stored,
+    // the pool, the site and every drop-in follow it in one pass (one Apache reload).
+    async resyncPhpDefault(version, req) {
+      if (!serverHostname() || !capabilities.has('apache')) return { hostname: rawHostname() || null, applied: false, version: null, socket: null, reason: !serverHostname() ? 'hostname_not_fqdn' : 'capability_missing' };
+      const site = await hostnameSite.ensure(req, { reload: true, strict: false });
+      return { hostname: site.hostname, applied: site.written, version: site.phpVersion ?? null, socket: site.phpSocket ?? null, changed: site.changed, reloaded: site.reloaded, apps: site.apps || [], warnings: site.warnings, requested: version ?? null };
     },
     // What the published alias really answers over loopback with the site's
     // name (contract §41.1): a drop-in Apache accepted can still be a 500.

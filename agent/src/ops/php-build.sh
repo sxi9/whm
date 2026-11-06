@@ -76,7 +76,14 @@ echo "== configuration under $KEEL_PHP_PREFIX"
 # the operator own them afterwards, so a rebuild must not reset them.
 mkdir -p "$KEEL_PHP_PREFIX/lib/conf.d" "$KEEL_PHP_PREFIX/etc/php-fpm.d" "$KEEL_PHP_PREFIX/var/log" "$KEEL_PHP_PREFIX/var/run"
 [ -e "$KEEL_PHP_PREFIX/lib/php.ini" ] || install -m 0644 php.ini-production "$KEEL_PHP_PREFIX/lib/php.ini"
-[ -e "$KEEL_PHP_PREFIX/lib/conf.d/10-opcache.ini" ] || printf 'zend_extension=opcache\n' > "$KEEL_PHP_PREFIX/lib/conf.d/10-opcache.ini"
+# The opcache snippet only when the build produced the extension: php-fpm logs
+# "Failed loading Zend extension 'opcache'" on every start otherwise.
+extdir="$("$KEEL_PHP_PREFIX/bin/php-config" --extension-dir 2>/dev/null || true)"
+if [ -n "$extdir" ] && [ -e "$extdir/opcache.so" ]; then
+  [ -e "$KEEL_PHP_PREFIX/lib/conf.d/10-opcache.ini" ] || printf 'zend_extension=opcache\n' > "$KEEL_PHP_PREFIX/lib/conf.d/10-opcache.ini"
+else
+  echo "== opcache.so not found under ${extdir:-the extension dir}; no 10-opcache.ini written"
+fi
 
 # php-fpm refuses to start without a pool; the idle pool keeps the unit up
 # until the panel writes the first whm-<user>.conf. Pools are per account, so
