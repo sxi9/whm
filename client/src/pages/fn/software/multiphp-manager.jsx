@@ -310,7 +310,7 @@ export default function MultiPhpManager({ fn }) {
         <Card title="PHP versions" subtitle={`Every version of the catalog for ${catalog.data.os?.id || catalog.data.family || 'this host'}${catalog.data.os?.versionId ? ` ${catalog.data.os.versionId}` : ''}: install, remove, pick the system default and choose what accounts may select.`} actions={<Button onClick={refetchAll}>Re-detect</Button>} padded={false}>
           <div className="table-wrap">
             <table>
-              <thead><tr><th style={{ minWidth: 220 }}>Version</th><th>State</th><th>PHP-FPM</th><th>Updates</th><th>Default</th><th>Domains</th><th>Offered to accounts</th><th /></tr></thead>
+              <thead><tr><th style={{ minWidth: 220 }}>Version</th><th>State</th><th>PHP-FPM</th><th style={{ minWidth: 200 }}>Updates</th><th>Default</th><th>Domains</th><th>Offered to accounts</th><th /></tr></thead>
               <tbody>
                 {matrix.length === 0 && <tr><td colSpan={8} className="table-state">The catalog is empty for this OS. Add a version with <Link to="/software/easyapache-4">EasyApache 4</Link> or install packages by hand.</td></tr>}
                 {matrix.some((v) => !v.installed && v.method === 'source') && <tr><td colSpan={8} className="muted small" style={{ padding: '8px 16px' }}>Versions marked <em>Source build</em> have no packages for this OS yet; Install compiles them from the official php.net source into {PHP_SOURCE_PREFIX}/&lt;version&gt; with their own PHP-FPM service (about 15 minutes, the build log streams below).</td></tr>}
@@ -327,7 +327,7 @@ export default function MultiPhpManager({ fn }) {
                       </td>
                       <td><PhpStatePill state={v.state} /></td>
                       <td>{v.installed ? (v.fpmInstalled ? <StatusPill status={v.fpmActive ? 'active' : v.fpmActive === false ? 'inactive' : 'unknown'}>{v.fpmUnit || 'FPM'}{v.fpmActive === false ? ' · stopped' : ''}</StatusPill> : <StatusPill status="not-installed">no FPM</StatusPill>) : <span className="muted">—</span>}</td>
-                      <td><PhpUpdateCell row={v} stamp={catalog.data.updates} checking={checking} busy={runner.busy} onUpdate={update} /></td>
+                      <td style={{ minWidth: 200 }}><PhpUpdateCell row={v} stamp={catalog.data.updates} checking={checking} busy={runner.busy} onUpdate={update} /></td>
                       <td>{v.isSystemDefault && <StatusPill status="ok">system default</StatusPill>}{v.isDefault && !v.isSystemDefault && <StatusPill status="info">CLI</StatusPill>}</td>
                       <td>{v.installed ? v.domains ?? 0 : <span className="muted">—</span>}</td>
                       <td style={{ whiteSpace: 'nowrap' }}><Toggle checked={Boolean(v.offered)} disabled={!v.installed || busy} onChange={(on) => setOffered(v, on)} label={v.installed ? (v.offered ? 'Offered' : 'Hidden') : 'Install first'} /></td>

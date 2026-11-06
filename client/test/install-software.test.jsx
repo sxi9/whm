@@ -381,7 +381,7 @@ describe('pages that used to link to the package search', () => {
     expect(html).toContain('>Set as default</button>');
     // Updates column (contract §63): the row's `update` decides the button; null candidate = nothing to update to yet;
     // no `update` at all = up to date as of the catalog's check times. Check for updates is the header's primary action.
-    expect(html).toContain('<th>Updates</th>');
+    expect(html).toContain('>Updates</th>');
     expect(html).toContain('>Check for updates</button>');
     expect(html).toContain('>Security update<');
     expect(html).toContain('8.3.36-1');
