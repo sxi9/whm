@@ -1889,3 +1889,173 @@ No new table or setting; the existing `db_access_hosts` rows (raw host as typed)
   entry keeps `mysql`, as the whole Databases group does). No migration.
 - Tests: `agent/test/db-pg-hba.test.js`, `server/test/database-services.test.js` (PostgreSQL suite),
   `server/test/panel-databases.test.js`, `client/test/panel-databases.test.jsx`.
+
+## 68. Customer panel: Terminal (`ctx.panelTerminal`, agent `term.*`, `term-bridge.py`, WebSocket `/api/panel/terminal/ws`) (P4-1)
+A login shell **of the account** in the browser, only when the plan grants shell (`plan.has_shell`; otherwise `501
+shell_disabled`, the `PLAN_SETTING_CODES` wording of §59). Feature `terminal` (seeded on). No migration. Dependencies:
+`ws` (server), `@xterm/xterm` + `@xterm/addon-fit` (client).
+- **Agent (`agent/src/ops/term.js`):** `term.open { username, cols 20–500, rows 5–200 }` runs the shipped static bridge
+  `agent/src/ops/term-bridge.py` (python3; parameters by argv and environment only: socket path, cols, rows, idle
+  seconds, max seconds, `SHELL/HOME/USER/LOGNAME/TERM/LANG/PATH`) **as the account** through `asUserArgv` (setpriv
+  `--no-new-privs`, no supplementary groups) with only three pipes inherited (control stdin, `ready`/`exit` stdout,
+  stderr). The shell is the account's `/etc/passwd` entry: it must be absolute, executable and not `nologin`/`false`
+  (`shell_disabled`), and the bridge execs it as a login shell (`-bash`) on a pty from the home. Socket layout:
+  `/run/whm/term` is `root:whmpanel 0711` (allowed root `TERM_RUN_DIR` in `managed-paths.js`, `/run/whm` itself stays
+  closed), the agent creates `/run/whm/term/<id>/` as `account:whmpanel 0710`, the bridge binds `pty.sock` there
+  (umask `0117` → `0660`) and the agent, after `ready`, checks it without following links (a socket owned by the
+  account's uid), hands it to group `whmpanel` and gives the directory back to `root:whmpanel 0710` (while the account owns it, a shell could swap the socket for a link to another one — the agent's own — before the panel connects; the bridge's own unlink then fails and is ignored). The bridge serves the **first client only** (the listener closes and
+  the path is unlinked on accept), bridges pty ↔ socket, exits on hangup (shell exit, client gone, agent pipe gone,
+  SIGHUP/SIGTERM), after **15 min idle** and after **4 h** at most, then SIGHUPs the shell (SIGKILL after 2 s). The panel relay enforces the same two caps itself (`CAPS.idleMs` / `CAPS.maxMs` from the agent's `startedAt`; close reasons `idle` / `max`, `term.close` issued), since the bridge runs as the account and can be stopped by it, and it checks with `lstat` that the path is a unix socket right before connecting. `accounts.cleanupAccount` calls `panelTerminal.endAccountSessions(username)` first of all its steps (close reason `account_removed`, `cleanup.terminal = { ended }`). Wire
+  format client → bridge: `[type u8][length u16 BE][payload ≤ 8192]`, type 0 keyboard bytes, type 1 resize (`cols u16,
+  rows u16`); bridge → client: raw pty bytes. Control from the agent on stdin: `resize <cols> <rows>\n`. Returns
+  `{ id (32 hex), username, socket, pid, startedAt, cols, rows }`. `term.resize { id, cols, rows }` (control line),
+  `term.close { id }` (SIGHUP then SIGKILL, the session directory is removed when the bridge exits), `term.list
+  { username }` (live sessions of that account). Limits: 32 per host, 4 per account; `capability_missing` without
+  python3. Nothing the user types ever passes through the agent.
+- **Service (`ctx.panelTerminal`, `services/panel-terminal.js`):** `open(scope, { cols?, rows? }, req)` gates scope
+  shape, feature, `plan.has_shell` (501 `shell_disabled`, also when the agent answers `shell_disabled` because passwd
+  is behind the plan) and the home, calls `term.open`, keeps `{ id, accountId, username, userId, socket, … }` in memory,
+  mints a **single-use `wsToken`** (32 random bytes base64url, stored as its sha256, 30 s, bound to the session's user
+  id) and audits `panel.terminal.open { id, cols, rows }`; `list(scope)` reconciles with `term.list` and reports
+  `{ id, startedAt, cols, rows, connected, pid }`; `close(scope, id)` → `term.close`, audit `panel.terminal.close
+  { id, reason: 'closed' }`. Every end of a terminal (browser gone, shell exit, logout, account removal) writes one
+  `panel.terminal.close` row with its `reason`; the content is never audited or logged.
+  **Upgrade** (`attachUpgrade(server)`, called by `index.js` on all four listeners — admin and panel, TLS and plain —
+  so a "log in as" session on 2087 works too): path must be exactly `/api/panel/terminal/ws` and pass
+  `panelApiAllowed` (`/api/panel/terminal` is listed on its own in `PANEL_API_ALLOW`), the `Origin` host must equal the
+  `Host` header, the `whm.sid` cookie is unsigned with the session secret and looked up in `ctx.sessionStore`
+  (user not suspended), `ctx.panel.scope()` runs on the session (acting-as included) and must name the terminal's
+  account, the token is consumed on first presentation (a token presented with another user's cookie is burnt too),
+  and a terminal that already has a socket answers `409`. Relay: binary frames or `{ type: 'input', data }` →
+  type-0 frames (split at 8 KiB), `{ type: 'resize', cols, rows }` → a type-1 frame (clamped), unix bytes → binary
+  messages, `{ type: 'ready' }` once the socket connected. Every 15 s the relay re-reads the session store and closes
+  the terminal (`4440`, `reason: 'logged_out'`) when the session is gone or belongs to someone else; close codes
+  `4401/4403/4404/4409/4410/4440`.
+- **Routes (`routes/panel/terminal.js`, all session-only, feature `terminal`):** `GET /api/panel/terminal/sessions`,
+  `POST /api/panel/terminal/sessions { cols?, rows? }` → `201 { id, wsToken, expiresInSeconds: 30, cols, rows,
+  startedAt }`, `DELETE /api/panel/terminal/sessions/:id` → `{ id, closed: true }` (404 for another account's id).
+- **Client:** `pages/panel/advanced/terminal.jsx` (nav `advanced/terminal`, feature `terminal`, phase 4): xterm.js
+  loaded on demand with the fit addon, opens one shell on mount, **Reconnect** (a new shell: the bridge takes one
+  client) and **Disconnect** actions, status pill, copy/paste hint with a *Copy selection* button, the idle/cap note,
+  and the "not included in your plan" state straight from `me.account.plan.has_shell === false` (no request made).
+  Keys `panel.terminal.*`.
+- Tests: `agent/test/term.test.js` (schemas, the shell gate, control/close bookkeeping, the allowed root),
+  `server/test/panel-terminal.test.js` (a local socket server speaking the bridge framing behind a real listener and
+  `ws` client: 501/403/422, relay, resize, one socket per session, origin/cookie/token refusals, token expiry,
+  logout closes, audits), `client/test/panel-terminal.test.jsx`. Host acceptance: grant shell to the account, open a
+  terminal, `id` → the account's uid, `pwd` → its home; revoke → 501.
+
+## 69. Customer panel: User Manager — sub-users as a composition of the account's mailbox and FTP services (`ctx.panelUsers`, `panel_subusers`) (P4-2)
+A sub-user (cPanel User Manager) is **never a Linux user**: it is a name on one of the account's domains whose enabled
+services are objects the account already owns, created and removed through the panel services that own them. Nothing
+here talks to the agent directly, so every rule of Email accounts (feature `emailaccts`, `max_email`, Dovecot capability,
+remote routing 409, maildir as the account) and FTP accounts (feature `ftpaccts`, `max_ftp`, PureDB/AuthUserFile, home
+pinned under the account home by `resolveUnderHome`) applies unchanged.
+- **Migration `034g_panel-subusers.sql`:** `panel_subusers (id, account_id → accounts ON DELETE CASCADE, username, domain,
+  full_name, contact_email, services_json, created_at, updated_at, UNIQUE (username, domain))`. `username` matches
+  `SUBUSER_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/` (the intersection of a mailbox local part and an FTP name). `services_json`
+  is `{ email: { enabled, quotaMb, mailboxId }, ftp: { enabled, homeDir, accountId }, dav: { enabled } }`
+  (`normalizeServices()` fills the defaults; `DEFAULT_SERVICES` carries `dav: { enabled: false }` for P4-3). The ids
+  point at `mail_accounts.id` / `ftp_accounts.id`; the password is **never stored** here (each service keeps its own
+  hash), so switching a service on later needs the password again (`422 password_required`).
+- **Service `ctx.panelUsers`** (`services/panel-users.js`, every method takes the pinned scope and asserts feature
+  `usermanager`; plan key `max_subusers`, `null` = unlimited): `list(scope)` → `{ data: [user], meta: { total, max,
+  domains, features: { email, ftp }, defaults } }`; `get`; `create(scope, { username, domain, password, fullName,
+  contactEmail, services })` — domain must be one of the account's (`404` otherwise), order **mailbox → FTP → row**: the
+  mailbox through `ctx.panelEmail.accounts.create` (local part = username, the sub-user's domain, the given quota or the
+  default), the FTP login through `ctx.panelFtp.create` (name = username, so the daemon login is `<username>@<main
+  domain>` on pure-ftpd, `dir` = `homeDir` under the home); an FTP failure removes the mailbox just created, a row failure
+  removes both; `update(scope, id, { fullName?, contactEmail?, services?, password? })` — a service switched off is
+  removed (mailbox **with its mail**), switched on is created (password required), a mailbox quota change goes through
+  `accounts.setQuota`, an FTP home change is remove + recreate (password required), `dav.enabled` switched off calls
+  `panelDav.forgetLogin(scope, login, req, 'dav_off')` (htpasswd line + `panel_dav_logins` row), and a password sent with any
+  edit is applied to every service that stays on (one password for all services; a service created or recreated in the same
+  edit already carries it), `changed` then lists `password`; `setPassword(scope, id, password)` →
+  `{ id, login, changed, applied: ['email'|'ftp'] }` through `accounts.setPassword` / `panelFtp.setPassword`;
+  `remove(scope, id)` → `{ id, login, removed, services: [...] }` removes the mailbox (with mail), the FTP login and, with
+  `dav` on, the DAV login through `panelDav.forgetLogin(..., 'subuser_removed')` (`services` lists `dav` when a line was removed); a
+  service row already deleted elsewhere (404 from the owner) is tolerated. The shape reports `services.email.present` /
+  `services.ftp.present` (`false` when the owning row vanished, `null` when the service is off) and `services.dav.login`.
+  Password strength: `ctx.security.passwordStrength(pw, 'account')` here, then each owner's own context check. Audit
+  `panel.users.create` (`{ login, services }`), `panel.users.update` (`{ login, changed: ['ftp:off', 'email:quota', …] }`),
+  `panel.users.password` (`{ login, applied }`), `panel.users.delete` (`{ login, removed }`) — never the password — on top
+  of the owners' own `panel.email.account.*` / `panel.ftp.*` rows.
+- **Read seam for P4-3:** `ctx.panelUsers.davLogins(accountId)` → `[{ id, login: '<username>@<domain>' }]` for every
+  sub-user with `dav.enabled`.
+- **Routes `routes/panel/users.js`** (`panelRouter(ctx, 'users')`: no `panel:users` token scope exists, so the group is
+  **session-only**; `requireFeature('usermanager')` on the router): `GET /api/panel/users`, `POST /api/panel/users
+  { username, domain, password, fullName?, contactEmail?, services?: { email?: { enabled, quotaMb? }, ftp?: { enabled,
+  homeDir? }, dav?: { enabled } } }` → `201 { data, meta: { warnings } }` (the mailbox's routing warnings), `GET /api/panel/users/:id`,
+  `PUT /api/panel/users/:id { fullName?, contactEmail?, services?, password? }` → `{ data, meta: { warnings, changed } }`,
+  `PUT /api/panel/users/:id/password { password }`, `DELETE /api/panel/users/:id`. Bodies are `.strict()`; `homeDir`
+  follows `REL_PATH` of panel-ftp (no `..`, no leading `-`).
+- **Client:** group **Preferences** (`['Preferences', 'Settings', …]` in `client/src/panel/nav.js`, icon `Settings` and
+  tile colour `preferences` in `panel/icons.js`) with the function `users` (feature `usermanager`, seeded `true` in
+  `DEFAULT_FEATURES`); page `pages/panel/preferences/users.jsx` (list with service badges, add/edit sheet with the
+  service switches, password reset; the *Calendars and contacts* switch shows only with plan feature `caldav`). Keys
+  `panel-category.preferences`, `panel.preferences/users.*`, `panel.users.*`.
+- **Side effect noted for other units:** `panel-ftp.js` `resolveUnderHome` and the create audit now use `path.posix`
+  (account homes are Linux paths), so `server/test/panel-ftp.test.js` also passes on a Windows checkout.
+- Tests: `server/test/panel-users.test.js` (14), `client/test/panel-users.test.jsx` (7).
+
+## 70. Customer panel: Calendars and Contacts — Radicale CalDAV/CardDAV (`ctx.dav`, `ctx.panelDav`, agent `dav.*`, host app `proxy`) (P4-3)
+One Radicale per server, from the distribution, never reachable but through the hostname site's reverse proxy; one htpasswd
+file the panel owns; one collection tree per DAV login; the panel hashes every password itself.
+- **Agent ops (`agent/src/ops/dav.js`; constants `RADICALE`/`RADICALE_ROOTS` in `managed-paths.js`, roots `/etc/radicale` and
+  `/var/lib/radicale` added to `lib.js`):** `dav.status {}` → `{ installed, version, bcrypt, listen: { host: '127.0.0.1', port: 5232 },
+  packages, config: { path, exists, managed, inSync, meta }, users: { path, exists, count }, storage: { path, exists }, unit: { name,
+  present, active, enabled, pid } }`; `dav.install { restart? }` (packages are **not** its job — the server installs `radicale` and
+  `python3-bcrypt` through `pkg.install` first) renders `/etc/radicale/config` from `renderRadicaleConfig()` (constants only:
+  `hosts = 127.0.0.1:5232`, `[auth] type = htpasswd`, `htpasswd_filename = /etc/whm/radicale/users`, `htpasswd_encryption = bcrypt`,
+  `[rights] type = owner_only`, `[storage] filesystem_folder = /var/lib/radicale/collections`, `[web] type = internal`; marker line
+  `# keel-radicale {json}`; the distro file is copied once to `config.keel-orig`), creates `/etc/whm/radicale` 0750 and the users file
+  0640 root:radicale (atomic temp + rename, symlinks refused), chowns the store to `radicale`, `systemctl enable --now` and restarts
+  on change, `command_failed` with the journal tail when the unit is not active afterwards; `capability_missing` without the
+  `radicale` binary or group. `dav.user.set { login, hash }` — `login` matches `DAV_LOGIN_RE` (`local@domain`, lowercase, no `:`),
+  `hash` matches `BCRYPT_RE` (`$2a|b|y$NN$` + 53 chars) — upserts the line (foreign/comment lines kept verbatim) and answers
+  `{ login, path, created, replaced }`; `dav.user.remove { login }` (destructive) → `{ login, path, removed }`, the collections stay;
+  `dav.collections { login }` (read-only) lists `collection-root/<login>/*/` with `.Radicale.props` → `{ login, path, exists,
+  collections: [{ name, kind: calendar|addressbook|other, tag, displayName, description, color, items, updatedAt }] }`.
+- **Host app proxy (`web.host.app.write`, §41 extension):** the spec takes `proxy: { port (≥ 1024), scriptName? }` **instead of**
+  `root` (exactly one; `php` is forced false). `renderHostProxyApp` writes `RedirectMatch 301 "^/dav$" "/dav/"`,
+  `ProxyPass "/dav/" "http://127.0.0.1:<port>/" retry=0` + `ProxyPassReverse` inside `<IfModule proxy_http_module>`, and a
+  `<Location "/dav/">` with the access rule and `RequestHeader set X-Script-Name "/dav"` / `X-Forwarded-Proto https` inside
+  `<IfModule headers_module>`; the meta line carries `proxy: { port, scriptName, target }`, `root: null`. Missing `proxy`,
+  `proxy_http` or `headers` is a `proxy_modules_missing` warning on the write; `web.modules.status/enable` now accept `headers`
+  (`HOST_PROXY_MODULES`), the Application Manager's `PROXY_MODULES` default is unchanged.
+- **Admin service `ctx.dav` (`server/src/services/dav.js`, attached by `routes/categories/service-configuration.js`, capability
+  `radicale`):** `status()` → the op's fields plus `pkgAvailable, hostname, fqdn, apache, site, published: { alias, file, managed,
+  proxy, url } | null, url, serverUrl, modules: { missing, loaded } | null, http, warning, lastApply (component `dav` in
+  `service_config_applies`), recentJobs`; `install(user, req)` → `202 { job, packages, pending: true }` running job `dav.install`:
+  `pkg.install { packages: ['radicale','python3-bcrypt'], noRecommends: true }` (synchronous through the agent, 45 min call timeout)
+  when `dav.status.installed` is false → `capabilities.refresh()` → agent `dav.install` → `publish()` when Apache and an FQDN
+  hostname exist (a publish failure is a warning, the job still succeeds); `publish(req, { reload })` → `web.modules.status` +
+  `web.modules.enable` for the missing ones (`reload: false`), `hostApps.publish({ name: 'dav', alias: '/dav', php: false,
+  proxy: { port: 5232, scriptName: '/dav' }, options: ['None'], reload })`, probe, `recordApply('dav')`, audit `dav.publish`;
+  `unpublish(req)` (audit `dav.unpublish`); for the panel: `available()`, `serverUrl()`, `setUser(login, hash, req)` (refuses a
+  non-bcrypt value with 500 before the agent sees it), `removeUser`, `collections` (never throws). Routes: `GET /api/service-config/dav`,
+  `POST …/dav/install`, `POST …/dav/publish { reload? }`, `DELETE …/dav` (root). Card: *Service Configuration › Panel Web Services
+  Configuration › Calendars (Radicale)* (`client/src/pages/service-config/DavCard.jsx`, `davState()` for the status line).
+- **Panel service `ctx.panelDav` (`services/panel-dav.js`, routes `routes/panel/dav.js` at `/api/panel/email/calendars`, scope
+  `panel:email`, feature `caldav`):** the DAV logins of an account are its own `<username>@<main domain>` (`kind: 'account'`) plus every
+  P4-2 sub-user with `services.dav.enabled` (`ctx.panelUsers.davLogins(accountId)` when loaded, else a tolerant read of
+  `panel_subusers`; absence = none). Logins are addresses on domains the account owns, so they cannot collide across accounts; a
+  `panel_dav_logins` row (migration `034h`: `account_id, login UNIQUE, subuser_id, created_at, updated_at`) records that a password
+  exists and a row owned by another account answers `409 login_taken`. `GET /` → `{ available, serverUrl, hostname, logins:
+  [{ login, kind, subuserId, hasPassword, passwordSetAt, urls: { principal, caldav, carddav, discovery } }], passwordMinLength: 8 }`;
+  `PUT /:login/password { password ≥ 8 }` (session only, 403 `session_required` for tokens) → `ctx.crypto.hashPassword` (bcrypt 12)
+  → `ctx.dav.setUser` → row upsert, audit `panel.dav.password.set { login, kind, created }`; `DELETE /:login/password` → `removeUser`
+  (a missing htpasswd file is not an error) → row delete, audit `panel.dav.password.remove`; `GET /:login/collections`. Two
+  hooks bypass the listing: `forgetLogin(scope, login, req, reason)` (P4-2, a row of another account is never touched; audit
+  `panel.dav.password.remove { login, kind: 'subuser', removed, reason }`) and `removeAccountLogins(accountId, req)`, which
+  `accounts.cleanupAccount` runs before the `panel_dav_logins` rows cascade (`cleanup.dav = { logins: [{ login, removed }] }`). A login
+  outside the account's list is `404`; Radicale absent is `501 radicale`. The User Manager's password does **not** propagate to DAV.
+- **Client:** `pages/panel/email/calendars.jsx` (nav `Email › Calendars and contacts`, slug `calendars`, feature `caldav`; keys
+  `panel.email.calendars.*`, `panel.email/calendars.label/description`): status card with *Open web page*, *Set a DAV password*
+  form (`PasswordInput`), logins table with *Collections* and *Remove*, `CollectionsCard`, `ClientSetup` (Thunderbird, iOS, Android
+  DAVx⁵, macOS). Feature flag `caldav: true` seeded in `DEFAULT_FEATURES`.
+- **Host steps:** none beyond what the Install button does (`apt-get install radicale python3-bcrypt`, `a2enmod proxy proxy_http
+  headers`); the operator may run them by hand on a host without the Software category.
+- Tests: `agent/test/dav.test.js`, `server/test/dav.test.js`, `client/test/panel-calendars.test.jsx`. Host acceptance: Install from
+  the card, `https://<hostname>/dav/` answers Radicale's page, set a DAV password for the account, `curl -u <login>:<pw> -X PROPFIND
+  https://<hostname>/dav/<login>/` → 207, remove the password → 401.

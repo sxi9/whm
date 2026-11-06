@@ -873,6 +873,25 @@ IPv6 listen, expose version). **Server:** settings only. **Gotchas:** **not wire
 panel** — the listeners are configured by `/etc/whm/panel.env` and the session policy lives in
 *Security Center › Configure Security Policies*; this page records intent.
 
+The **Calendars (Radicale)** card on the same page is the CalDAV/CardDAV server every account's
+*Email › Calendars and contacts* page uses. **Install** runs the job `dav.install`: the
+`radicale` and `python3-bcrypt` packages through the agent's package installer, then the agent
+writes `/etc/radicale/config` (managed; the distribution file is kept once as
+`config.keel-orig`) pinned to `127.0.0.1:5232`, `htpasswd` authentication with bcrypt on
+`/etc/whm/radicale/users` (0640 root:radicale), `rights = owner_only` and the store
+`/var/lib/radicale/collections`, enables and restarts the unit, and — when Apache and a fully
+qualified hostname exist — publishes it. **Publish** (also *Publish again*) enables `proxy`,
+`proxy_http` and `headers` with `a2enmod` when they are missing, writes
+`keel-host.d/dav.conf` (`ProxyPass /dav/ → http://127.0.0.1:5232/`, `X-Script-Name /dav`), reloads
+Apache and probes `https://<hostname>/dav/` over loopback; the card shows the HTTP answer.
+**Unpublish** removes the drop-in only. **Reconfigure** rewrites the configuration without
+touching packages. **Server:** `GET /api/service-config/dav`, `POST …/dav/install` (202 job),
+`POST …/dav/publish { reload? }`, `DELETE …/dav`. **Needs:** a Debian-family host for the
+package names; Apache for the publication. **Gotchas:** port 5232 is never exposed — the
+proxy is the only public path; DAV passwords are hashed by the panel (bcrypt) and only the
+hash reaches the agent, so a sub-user's User Manager password is *not* its DAV password; the
+`radicale` unit must be able to read `/etc/whm/radicale` (the group is set at install).
+
 #### 7.5 Exim Configuration Manager
 
 Server-wide mail-server policy. **Who:** root.
@@ -1371,6 +1390,13 @@ Choose the shell to apply — *Disabled* (`/usr/sbin/nologin`), *Jailed shell*
 (`/bin/sh`) — then apply to a row or to the selection; the table shows the current shell and
 whether the Linux user exists. **Server:** `PUT /api/account-functions/shell/:username` →
 `usermod -s` through the agent. **Gotchas:** FTP and the panel keep working with no shell.
+The account panel's **Advanced › Terminal** (feature `terminal`, on by default) opens that shell
+in the customer's browser as the account's own uid whenever the plan has *shell access*
+(`has_shell`); the bridge runs with no new privileges from `/run/whm/term/<id>/` (`root:whmpanel
+0711`), needs `python3` on the host, serves one browser tab per shell, closes after 15 minutes
+idle or 4 hours, and writes `panel.terminal.open` / `panel.terminal.close` audit rows without
+any content. Revoking shell access (or the feature) stops new terminals at once; a shell that is
+already open ends when the customer disconnects, signs out, or the caps hit.
 
 #### 14.9 Modify an Account
 

@@ -839,7 +839,10 @@ defineOp('web.vhost.write', {
 // Apache modules the Application Manager needs (contract §65). Only the three
 // proxy modules and mod_rewrite (the WebSocket upgrade rule) can be enabled;
 // `status` is read-only and lists what is loaded.
-const modulesArg = z.array(z.enum(PROXY_MODULES)).min(1).max(PROXY_MODULES.length);
+// A reverse-proxied hostname-site application (web.host.app.write with `proxy`) also needs mod_headers.
+export const HOST_PROXY_MODULES = ['proxy', 'proxy_http', 'headers'];
+const ENABLEABLE_MODULES = [...new Set([...PROXY_MODULES, ...HOST_PROXY_MODULES])];
+const modulesArg = z.array(z.enum(ENABLEABLE_MODULES)).min(1).max(ENABLEABLE_MODULES.length);
 async function loadedModules(apache) {
   const info = await apacheInfo(apache);
   return new Set(info.modules.map((m) => m.name));
@@ -971,15 +974,19 @@ const hostAppAlias = z.string().max(128).regex(/^\/(?!(?:.*\/)?\.{1,2}(?:\/|$))[
 const hostAppOption = z.enum(['+Indexes', '-Indexes', '+FollowSymLinks', '-FollowSymLinks', '+SymLinksIfOwnerMatch', '-SymLinksIfOwnerMatch', '+MultiViews', '-MultiViews', 'None']);
 const dirName = z.string().regex(/^(?!\.{1,2}$)[A-Za-z0-9._-]{1,64}$/, 'directory name');
 const ipOrCidr = z.string().max(64).refine((v) => { const [ip, bits, ...rest] = v.split('/'); return !rest.length && arg.ip.safeParse(ip).success && (bits === undefined || (/^\d{1,3}$/.test(bits) && Number(bits) <= (ip.includes(':') ? 128 : 32))); }, 'IP address or CIDR');
+// A reverse-proxied application (Radicale and the like): the alias is handed to a
+// loopback port instead of a directory, with the prefix announced as X-Script-Name.
+const hostAppProxy = z.object({ port: z.number().int().min(PROXY_PORT_MIN).max(65535), scriptName: hostAppAlias.optional() }).strict();
 const hostAppSchema = z.object({
-  name: hostAppName, alias: hostAppAlias, root: confPath, php: z.boolean().default(true),
+  name: hostAppName, alias: hostAppAlias, root: confPath.optional(), proxy: hostAppProxy.optional(), php: z.boolean().default(true),
   access: z.enum(['all', 'local', 'list']).default('all'), allowFrom: z.array(ipOrCidr).max(50).default([]),
   options: z.array(hostAppOption).min(1).max(6).default(['-Indexes', '+FollowSymLinks']),
   directoryIndex: z.array(z.string().regex(/^[A-Za-z0-9._-]{1,64}$/)).max(10).optional(),
   allowOverride: z.enum(['None', 'All', 'AuthConfig', 'FileInfo', 'Indexes', 'Limit', 'Options']).default('None'),
   denyDirs: z.array(dirName).max(20).default([]),
   reload: z.boolean().default(true),
-}).strict().refine((a) => a.access !== 'list' || a.allowFrom.length > 0, { message: 'allowFrom is required when access is "list"', path: ['allowFrom'] });
+}).strict().refine((a) => a.access !== 'list' || a.allowFrom.length > 0, { message: 'allowFrom is required when access is "list"', path: ['allowFrom'] })
+  .refine((a) => Boolean(a.root) !== Boolean(a.proxy), { message: 'exactly one of root or proxy', path: ['root'] });
 
 const hostVhostSchema = z.object({
   hostname: arg.domain, docroot: confPath.default(HOST_VHOST.docroot), port: z.number().int().min(1).max(65535).default(80), sslPort: z.number().int().min(1).max(65535).nullable().default(443),
@@ -1027,16 +1034,32 @@ export function renderHostIndex(hostname, panelPort = 2087) {
     '</head>', '<body>', '<main>', `<h1>${hostname}</h1>`, '<p>This server is managed by Keel.</p>', `<a href="${panel}/panel">Account panel</a>`, `<a class="alt" href="${panel}/">Administration</a>`, '</main>', '</body>', '</html>', ''].join('\n');
 }
 
+const hostAppRequire = (a, indent = '  ') => (a.access === 'local' ? [`${indent}Require local`] : a.access === 'list' ? [`${indent}Require ip ${a.allowFrom.join(' ')}`] : [`${indent}Require all granted`]);
+
+// The proxied form: no directory, the prefix stripped on the way to the loopback
+// port and announced as X-Script-Name (what Radicale reads to build its links).
+// `retry=0` keeps the first request after a daemon restart from waiting out
+// mod_proxy's 60 s failure cache.
+export function renderHostProxyApp(a, alias, meta) {
+  const scriptName = a.proxy.scriptName ? (a.proxy.scriptName.length > 1 ? a.proxy.scriptName.replace(/\/+$/, '') : a.proxy.scriptName) : alias;
+  const target = `http://127.0.0.1:${a.proxy.port}/`;
+  const base = alias === '/' ? '/' : `${alias}/`;
+  const lines = [`${MANAGED} (server hostname site: application "${a.name}", reverse proxy). Rendered from a structured spec; manual changes are overwritten.`, `${HOST_APP_MARK}${JSON.stringify({ ...meta, proxy: { port: a.proxy.port, scriptName, target } })}`, ''];
+  if (alias !== '/') lines.push(`RedirectMatch 301 "^${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$" ${q(base)}`);
+  lines.push('<IfModule proxy_http_module>', '  ProxyRequests Off', `  ProxyPass ${q(base)} ${q(target)} retry=0`, `  ProxyPassReverse ${q(base)} ${q(target)}`);
+  lines.push(`  <Location ${q(base)}>`, ...hostAppRequire(a, '    '), '    <IfModule headers_module>', `      RequestHeader set X-Script-Name ${q(scriptName)}`, '      RequestHeader set X-Forwarded-Proto "https" env=HTTPS', '    </IfModule>', '  </Location>', '</IfModule>');
+  return `${lines.join('\n')}\n`;
+}
+
 export function renderHostApp(a) {
   const alias = a.alias.length > 1 ? a.alias.replace(/\/+$/, '') : a.alias;
-  const meta = { name: a.name, alias, root: a.root, php: a.php, phpSocket: a.php ? a.phpSocket || null : null, access: a.access, allowFrom: a.allowFrom, options: a.options, directoryIndex: a.directoryIndex ?? null, allowOverride: a.allowOverride, denyDirs: a.denyDirs };
+  const meta = { name: a.name, alias, root: a.root ?? null, php: a.proxy ? false : a.php, phpSocket: a.php && !a.proxy ? a.phpSocket || null : null, access: a.access, allowFrom: a.allowFrom, options: a.options, directoryIndex: a.directoryIndex ?? null, allowOverride: a.allowOverride, denyDirs: a.denyDirs };
+  if (a.proxy) return renderHostProxyApp(a, alias, meta);
   const lines = [`${MANAGED} (server hostname site: application "${a.name}"). Rendered from a structured spec; manual changes are overwritten.`, `${HOST_APP_MARK}${JSON.stringify(meta)}`, ''];
   lines.push(`Alias ${q(alias)} ${q(a.root)}`);
   lines.push(`<Directory ${q(a.root)}>`, `  Options ${a.options.join(' ')}`, `  AllowOverride ${a.allowOverride}`);
   if (a.directoryIndex?.length) lines.push(`  DirectoryIndex ${a.directoryIndex.join(' ')}`);
-  if (a.access === 'local') lines.push('  Require local');
-  else if (a.access === 'list') lines.push(`  Require ip ${a.allowFrom.join(' ')}`);
-  else lines.push('  Require all granted');
+  lines.push(...hostAppRequire(a));
   if (a.php && a.phpSocket) lines.push(...hostPhpLines(a.phpSocket));
   else if (!a.php) lines.push('  <FilesMatch "\\.ph(ar|p|tml)$">', '    Require all denied', '  </FilesMatch>');
   lines.push('</Directory>');
@@ -1158,17 +1181,22 @@ defineOp('web.host.app.write', {
   description: 'Publish a web application under the server-hostname site from a structured spec (Alias + Directory rendered by the agent) as keel-host.d/<name>.conf, validate with configtest (rolled back on error) and reload',
   schema: hostAppSchema,
   run: async (a, ctx) => {
-    const root = ctx.assertAllowedPath(a.root, 'read');
+    const root = a.proxy ? null : ctx.assertAllowedPath(a.root, 'read');
     const apache = requireApache();
     const layout = hostLayout(apache);
     const appsDir = ctx.assertAllowedPath(layout.appsDir, 'write');
     const file = ctx.assertAllowedPath(path.join(appsDir, `${a.name}.conf`), 'write');
-    if (!isDirectory(root)) throw new OpError('not_found', `${root} does not exist or is not a directory`);
+    if (root && !isDirectory(root)) throw new OpError('not_found', `${root} does not exist or is not a directory`);
     const previous = readText(file);
     if (previous != null && !previous.includes(HOST_APP_MARK)) throw new OpError('refused', `${file} was not written by the panel; refusing to overwrite it`);
     const warnings = [];
-    const phpSocket = a.php ? wwwPoolSocket() : null;
-    if (a.php && !phpSocket) warnings.push({ code: 'php_missing', message: 'No PHP-FPM www pool socket was found; the application is published without a PHP handler.' });
+    const phpSocket = a.php && !a.proxy ? wwwPoolSocket() : null;
+    if (a.proxy) {
+      const loaded = await loadedModules(apache).catch(() => new Set());
+      const missing = HOST_PROXY_MODULES.filter((m) => !loaded.has(m));
+      if (missing.length) warnings.push({ code: 'proxy_modules_missing', message: `Apache modules ${missing.join(', ')} are not loaded; the application is published but not served until they are enabled.` });
+    }
+    if (a.php && !a.proxy && !phpSocket) warnings.push({ code: 'php_missing', message: 'No PHP-FPM www pool socket was found; the application is published without a PHP handler.' });
     const vhostPresent = hostVhostPresent(layout);
     if (!vhostPresent) warnings.push({ code: 'hostname_vhost_missing', message: `${layout.file} is absent or disabled, so ${appsDir}/${a.name}.conf is not loaded until the hostname site exists.` });
     fs.mkdirSync(appsDir, { recursive: true, mode: 0o755 });

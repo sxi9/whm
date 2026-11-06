@@ -9,3 +9,9 @@ export const PHP_UNIT_PATHS = PHP_MINORS.map((m) => `/etc/systemd/system/keel-ph
 export const PHP_LINK_PATHS = PHP_MINORS.map((m) => `/usr/local/bin/php${m}`);
 // Where a local PostgreSQL keeps pg_hba.conf (Debian clusters, RHEL data directories); db.pg.hba.write edits it in place.
 export const PG_HBA_ROOTS = ['/etc/postgresql', '/var/lib/pgsql'];
+// Where the account panel's terminal bridges (term.*) keep their unix sockets: one directory per session below it.
+export const TERM_RUN_DIR = '/run/whm/term';
+// Radicale (CalDAV/CardDAV, dav.*): the distro config file, the panel's htpasswd directory under /etc/whm and the
+// collections store; lib.js adds the two roots outside /etc/whm to the allowed list.
+export const RADICALE = Object.freeze({ configDir: '/etc/radicale', config: '/etc/radicale/config', usersDir: '/etc/whm/radicale', users: '/etc/whm/radicale/users', storage: '/var/lib/radicale/collections', unit: 'radicale', user: 'radicale', group: 'radicale', host: '127.0.0.1', port: 5232, packages: ['radicale', 'python3-bcrypt'] });
+export const RADICALE_ROOTS = ['/etc/radicale', '/var/lib/radicale'];

@@ -2,6 +2,7 @@ import { Info } from 'lucide-react';
 import { PageHeader, Card, Loading, formatDate } from '../../../components/Common.jsx';
 import { Field, NumberInput, Toggle } from '../../../components/Form.jsx';
 import { useSettingsForm, SaveBar, RequestError, ListEditor } from '../../service-config/Shared.jsx';
+import { DavCard } from '../../service-config/DavCard.jsx';
 
 export default function WebServicesConfiguration({ fn }) {
   const form = useSettingsForm('/service-config/webservices');
@@ -33,6 +34,7 @@ export default function WebServicesConfiguration({ fn }) {
           <SaveBar form={form} label="Save settings" />
         </>
       )}
+      <DavCard />
     </>
   );
 }

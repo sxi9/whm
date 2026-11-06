@@ -87,6 +87,7 @@ export const PANEL_CATEGORY_DEFS = [
     ['Email routing', 'Deliver mail for a domain here or at another mail server.', 1, { slug: 'routing' }],
     ['Webmail', 'Read your mail in the browser.', 1],
     ['Mail usage', 'Messages sent and delivered recently.', 1, { slug: 'usage' }],
+    ['Calendars and contacts', 'Sync calendars and address books with your phone and mail app over CalDAV and CardDAV.', 3, { slug: 'calendars', feature: 'caldav' }],
   ]],
   ['Databases', 'Database', [
     ['Databases', 'Databases on this account.', 1, { feature: 'mysql' }],
@@ -131,11 +132,15 @@ export const PANEL_CATEGORY_DEFS = [
     ['Error pages', 'Your own pages for 404 and the other error responses.', 1, { feature: 'errpgs' }],
     ['Optimize website', 'Compress pages, styles and scripts before they are sent to visitors.', 1, { feature: 'optimizews' }],
     ['Hotlink protection', 'Stop other sites from embedding your images and files.', 1, { feature: 'hotlink' }],
+    ['Terminal', 'A command line on your account, in the browser.', 4, { feature: 'terminal' }],
   ]],
   ['Software', 'Package', [
     ['WordPress', 'Install, update and remove WordPress on your domains.', 1, { feature: 'wordpress' }],
     ['Plugins', 'Extra tools your hosting provider installed for your account.', 1, { feature: 'plugins' }],
     ['Application manager', 'Run Node.js and Python applications as services and publish them on your domains.', 3, { slug: 'apps', feature: 'applicationmanager' }],
+  ]],
+  ['Preferences', 'Settings', [
+    ['User manager', 'People who use this account\'s services with their own login: a mailbox, an FTP folder, calendars.', 3, { slug: 'users', feature: 'usermanager' }],
   ]],
 ];
 

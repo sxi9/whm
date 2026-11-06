@@ -134,6 +134,10 @@ export function createAccountsService(ctx) {
     const { username, domain, id } = account;
     const cleanup = {};
     const attempt = async (name, fn) => { try { const r = await fn(); if (r) cleanup[name] = r; } catch (err) { logger.warn({ err, username, step: name }, 'termination cleanup step failed'); cleanup[name] = { error: err.message }; } };
+    // Open terminals first: the login shell runs as the uid that is about to go.
+    await attempt('terminal', async () => (ctx.panelTerminal?.endAccountSessions ? ctx.panelTerminal.endAccountSessions(username) : null));
+    // DAV htpasswd lines before their panel_dav_logins rows cascade with the account.
+    await attempt('dav', async () => (ctx.panelDav?.removeAccountLogins ? ctx.panelDav.removeAccountLogins(id, req) : null));
     await attempt('ssl', async () => (ctx.ssl?.removeAccountCerts ? ctx.ssl.removeAccountCerts(id, req) : null));
     // The application units (root-level systemd services linked from
     // /etc/whm/apps) go before the vhosts that proxy to them.

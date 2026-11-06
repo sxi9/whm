@@ -227,7 +227,7 @@ describe('listener configuration', () => {
   });
 
   it('allow-list: exactly what the account-panel SPA calls', () => {
-    expect(PANEL_API_ALLOW).toEqual(['/api/health', '/api/auth', '/api/branding', '/api/panel', '/api/locales/active', '/api/themes/active']);
+    expect(PANEL_API_ALLOW).toEqual(['/api/health', '/api/auth', '/api/branding', '/api/panel', '/api/panel/terminal', '/api/locales/active', '/api/themes/active']);
     expect(PANEL_API_DENY).toEqual(['/api/panel/admin']);
     for (const ok of ['/api/health', '/api/auth/login', '/api/auth/me', '/api/auth/reset/request', '/api/auth/external/x/callback', '/api/branding', '/api/branding/logo', '/api/panel/me', '/api/panel/sso/webmail', '/api/panel/files/jobs/1/stream', '/api/locales/active', '/api/themes/active', '/api/panel/administration']) expect(panelApiAllowed(ok), ok).toBe(true);
     for (const no of ['/api/accounts', '/api/system/jobs/1/stream', '/api/plugins/ui', '/api/panelx', '/api/healthz', '/api/authx', '/api', '/api/cpanel/branding', '/api/locales', '/api/themes', '/api/themes/preference', '/api/panel/admin', '/api/panel/admin/login-as/alice', '/api/panel/admin/settings']) expect(panelApiAllowed(no), no).toBe(false);

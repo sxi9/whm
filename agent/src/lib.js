@@ -10,7 +10,7 @@ const deployDirOf = (app) => path.resolve(path.dirname(fileURLToPath(import.meta
 // of these; anything else is refused even for root. Operators can extend the list
 // in the agent config, never the API.
 export { NODE_LINK_MAJORS, NODE_LINK_PATHS, PHP_MINORS, PHP_UNIT_PATHS, PHP_LINK_PATHS } from './managed-paths.js';
-import { NODE_LINK_PATHS, PHP_UNIT_PATHS, PHP_LINK_PATHS, PG_HBA_ROOTS } from './managed-paths.js';
+import { NODE_LINK_PATHS, PHP_UNIT_PATHS, PHP_LINK_PATHS, PG_HBA_ROOTS, TERM_RUN_DIR, RADICALE_ROOTS } from './managed-paths.js';
 
 export const DEFAULT_ALLOWED_ROOTS = [
   '/home', '/var/lib/whm', '/etc/whm', '/var/log/whm',
@@ -20,6 +20,8 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/mysql', '/etc/my.cnf', '/etc/my.cnf.d', '/var/lib/mysql-files',
   // pg_hba.conf of a local PostgreSQL (db.pg.hba.write).
   ...PG_HBA_ROOTS,
+  // Radicale's config file and collections store (dav.*); its htpasswd lives under /etc/whm.
+  ...RADICALE_ROOTS,
   '/etc/pure-ftpd', '/etc/proftpd', '/etc/vsftpd.conf',
   '/etc/ssl/whm', '/etc/letsencrypt', '/etc/pki/tls/whm', '/etc/ssl/private/pure-ftpd.pem',
   '/etc/php', '/etc/opt/remi', '/etc/php-fpm.d',
@@ -36,6 +38,8 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/opt/cpanel', '/etc/php.ini', '/etc/php.d', '/etc/opt/rh', '/var/run/reboot-required', '/var/run/reboot-required.pkgs',
   // Account application units (apps.unit.*): the files `systemctl link` points at; /etc/systemd/system itself stays closed.
   '/etc/whm/apps',
+  // Account terminal bridges (term.*): the per-session socket directories; /run/whm itself stays closed.
+  TERM_RUN_DIR,
   '/etc/vsftpd',
   '/usr/local/whm/hooks',
   '/etc/default/locale', '/etc/locale.conf',
