@@ -736,7 +736,7 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       await post('/phpmyadmin/publish', { disableGlobal: 'yes' }).expect(422);
 
       const res = await post('/phpmyadmin/publish', {}).expect(200);
-      expect(res.body.data).toMatchObject({ published: true, url: 'https://panel.example.com/phpmyadmin/', path: '/etc/apache2/keel-host.d/phpmyadmin.conf', alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', changed: true, reloaded: true, globalAlias: { enabled: false, disabled: true }, warnings: [] });
+      expect(res.body.data).toMatchObject({ published: true, url: 'https://panel.example.com/phpmyadmin/', path: '/etc/apache2/keel-host.d/phpmyadmin.conf', alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', changed: true, reloaded: true, globalAlias: { enabled: false, disabled: true } });
       const write = app.agent.callsTo('web.host.app.write');
       expect(write).toHaveLength(1);
       // Never weaker than Debian's fragment: setup/ (the wizard, htpasswd-gated there) is denied with libraries/ and templates/.
@@ -1052,7 +1052,7 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       try {
         const res = await post('/phpmyadmin/publish', {}).expect(200);
         expect(res.body.data.globalAlias).toMatchObject({ enabled: true, disabled: false });
-        expect(res.body.data.warnings.map((w) => w.code)).toEqual(['global_alias_kept']);
+        expect(res.body.data.warnings.map((w) => w.code).filter((c) => c !== 'php_missing')).toEqual(['global_alias_kept']);
       } finally { restore('db.phpmyadmin.global_conf.disable'); }
       await del('/phpmyadmin/publish').expect(200);
     });

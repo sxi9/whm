@@ -129,6 +129,10 @@ export async function start() {
   httpServer.listen(config.port, config.host, () => logger.info({ port: config.port, mode: config.mode, env: config.env, dataDir: config.dataDir, httpRedirect: config.tls && config.httpRedirect }, 'WHM panel listening (http)'));
   servers.push(httpServer);
   if (config.panelHttpPort) listenOptional(http.createServer(app), config.panelHttpPort, 'account panel', 'http');
+  // The account terminal's WebSocket (/api/panel/terminal/ws) is an upgrade on
+  // every listener, TLS and plain, admin and panel: the handler checks the
+  // session cookie, the scope and the single-use token itself.
+  for (const server of servers) ctx.panelTerminal?.attachUpgrade(server);
 
   // Plugins load once the panel listens, so a slow activation never keeps the
   // operator from reaching Manage Plugins; the job workers start after that so

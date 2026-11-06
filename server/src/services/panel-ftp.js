@@ -24,10 +24,11 @@ export function loginFor(daemon, name, account) {
   return daemon === 'pure-ftpd' ? `${name}@${account.domain}` : `${name}${PROFTPD_SEPARATOR}${account.username}`;
 }
 
-// A path relative to the home (or absolute inside it) resolved and pinned under it.
+// A path relative to the home (or absolute inside it) resolved and pinned under
+// it; homes are Linux paths whatever host runs the tests.
 export function resolveUnderHome(home, rel) {
-  const base = path.resolve(home);
-  const target = path.resolve(base, rel.replace(/^\/+/, ''));
+  const base = path.posix.resolve(home);
+  const target = path.posix.resolve(base, rel.replace(/^\/+/, ''));
   if (target !== base && !target.startsWith(`${base}/`)) throw new HttpError(422, 'validation_failed', 'The directory must be inside the account home', { dir: ['Outside the home directory'] });
   return target;
 }
@@ -176,7 +177,7 @@ export function createPanelFtpService(ctx) {
     }
     let sync = null;
     try { sync = await op('ftp.sync', { daemon: info.daemon }, req); } catch (err) { sync = { synced: false, error: err.message }; }
-    audit(req, scope, { action: 'panel.ftp.create', args: { login, dir: path.relative(home, dir) || '.', quotaMb } });
+    audit(req, scope, { action: 'panel.ftp.create', args: { login, dir: path.posix.relative(home, dir) || '.', quotaMb } });
     return { ...shape(stmts.byId.get(id, scope.accountId)), sync, ...connection(scope, info) };
   }
 

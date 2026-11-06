@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot } from '../../middleware/rbac.js';
 import { createServiceConfigService, FTP_SERVERS, DNS_SERVERS, SSL_SERVICES, TLS_VERSIONS } from '../../services/service-configuration.js';
+import { createDavService } from '../../services/dav.js';
 
 // OpenSSL cipher-list / TLS 1.3 suite syntax: no whitespace or shell/config metacharacters.
 const cipherList = z.string().max(2048).regex(/^[A-Za-z0-9:+!@_=-]*$/, 'OpenSSL cipher list such as ECDHE-RSA-AES256-GCM-SHA384:!aNULL');
@@ -83,6 +84,9 @@ export async function register(ctx) {
   ctx.capabilities.register('logrotate', { binaries: ['logrotate'], required: ['logrotate'] });
   ctx.capabilities.register('powerdns', { binaries: ['pdns_server', 'pdns_control', 'pdnsutil'], required: ['pdns_server'] });
   ctx.jobs.register('web.vhosts.sync', (job) => ctx.web.syncAllJob(job));
+  ctx.dav = createDavService(ctx);
+  ctx.capabilities.register('radicale', { binaries: ['radicale'], required: ['radicale'] });
+  ctx.jobs.register('dav.install', (job) => ctx.dav.installJob(job));
 
   const w = () => ctx.web;
   const r = Router();
@@ -133,6 +137,12 @@ export async function register(ctx) {
   r.get('/webmail', requireRoot, wrap(() => w().webmail.status()));
   r.post('/webmail/publish', requireRoot, validate({ body: z.object({ reload: z.boolean().default(true) }).strict() }), wrap((req) => w().webmail.publish(req, { reload: req.body.reload })));
   r.delete('/webmail', requireRoot, wrap((req) => w().webmail.unpublish(req)));
+
+  // Calendars and Contacts (Phase 8 P4-3, contract §70): Radicale from the distribution, published as /dav under the hostname site
+  r.get('/dav', requireRoot, wrap(() => ctx.dav.status()));
+  r.post('/dav/install', requireRoot, accepted((req) => ctx.dav.install(req.user, req)));
+  r.post('/dav/publish', requireRoot, validate({ body: z.object({ reload: z.boolean().default(true) }).strict() }), wrap((req) => ctx.dav.publish(req, { reload: req.body.reload })));
+  r.delete('/dav', requireRoot, wrap((req) => ctx.dav.unpublish(req)));
 
   // FTP Server Selection (+ daemon settings)
   r.get('/ftp', requireRoot, wrap(() => w().ftp.get()));

@@ -36,6 +36,28 @@ not for the commit log.
   accounts they own; `409` naming the `panel.phpmyadmin.sso` switch while single sign-on is off or phpMyAdmin is not
   published) → `{ url, user, account, expiresAt, grantOption }`; audit `db.phpmyadmin.signon.admin` /
   `db.phpmyadmin.signon.as` with the actor; agent op `db.grant.global`. Manual §20.9, contract §44.
+- **Calendars and Contacts (CalDAV/CardDAV) for every account.** Radicale from the distribution runs on loopback
+  with bcrypt htpasswd logins the panel manages (`/etc/whm/radicale/users`, one collection tree per login) and is published
+  as `/dav/` under the server hostname site; the admin installs and publishes it from *Service Configuration › Panel Web
+  Services Configuration › Calendars (Radicale)* (`GET|POST|DELETE /api/service-config/dav[/install|/publish]`, job
+  `dav.install`), the account panel's *Email › Calendars and contacts* page shows the server address, the account's DAV
+  login (`<username>@<main domain>`, plus User Manager sub-users with the service on), sets or removes the DAV password
+  (hashed by the panel; `PUT|DELETE /api/panel/email/calendars/:login/password`), lists the login's collections and
+  carries Thunderbird / iOS / Android setup steps. Feature `caldav`, contract §70, migration `034h_panel-dav.sql`.
+- **Account panel › Preferences › User manager.** Sub-users of a hosting account (cPanel's User Manager): a name on one
+  of the account's domains with one password for every service — a mailbox (created through Email accounts, with its
+  quota) and an FTP login limited to a folder of the account (created through FTP accounts), plus a *Calendars and
+  contacts* flag for the CalDAV/CardDAV login. Switching a service on or off creates or removes it, the password reset
+  reaches every enabled service, deleting the user removes its mailbox (with the mail) and its FTP login; never a Linux
+  user. `GET|POST /api/panel/users`, `GET|PUT|DELETE /api/panel/users/:id`, `PUT /api/panel/users/:id/password`
+  (session-only); plan feature `usermanager`, plan key `max_subusers`; migration `034g_panel-subusers.sql`. Contract §69,
+  manual C §17.
+- **Account panel › Advanced › Terminal.** A login shell of the account in the browser (xterm.js) when the plan grants
+  shell access: the agent starts the shipped `term-bridge.py` as the account on a pty behind a unix socket under
+  `/run/whm/term/<id>/` (first client only, 15 min idle, 4 h cap), the panel relays it over the WebSocket
+  `/api/panel/terminal/ws` (single-use 30 s token + the session cookie, same-origin, one socket per shell, closed on
+  logout); `POST/GET/DELETE /api/panel/terminal/sessions`, feature `terminal`, audit rows `panel.terminal.open/close`
+  without content; a plan without shell answers 501 `shell_disabled` and the page says so. Requires `python3` on the host.
 - **Direct Update buttons for critical issues (PHP and other software).** The admin Home opens with an *Updates that
   need attention* card whenever something needs one: installed PHP versions hit by an advisory from the Security
   Advisor's list (critical when the advisory is critical/high), pending security or regular package updates of the

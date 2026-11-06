@@ -12,7 +12,9 @@ export const ADMIN_SHELL = 'admin';
 // images), the health probe, and the two exact routes every signed-in role
 // loads on start (interface strings via i18n/useT.js, the active theme via
 // theme/ThemeLoader.jsx). Anything else under /api is administration.
-export const PANEL_API_ALLOW = ['/api/health', '/api/auth', '/api/branding', '/api/panel', '/api/locales/active', '/api/themes/active'];
+// /api/panel/terminal is listed on its own because its WebSocket upgrade never
+// reaches Express: services/panel-terminal.js asks panelApiAllowed() itself.
+export const PANEL_API_ALLOW = ['/api/health', '/api/auth', '/api/branding', '/api/panel', '/api/panel/terminal', '/api/locales/active', '/api/themes/active'];
 // The administration of the account panel (log in as, password and 2FA
 // resets, settings) lives under /api/panel but belongs to the admin shell:
 // a session cookie or token is host-scoped, not port-scoped, so an admin

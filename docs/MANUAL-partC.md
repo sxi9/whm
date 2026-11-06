@@ -1066,6 +1066,34 @@ removed), followed by `update-exim4.conf` and a reload.
   remote domain are not consulted here any more. Backup MX ("relay") routing is an administrator
   setting and is not offered in the account panel.
 
+#### 6.11 Calendars and contacts
+
+- **Purpose:** calendars and address books on the server, synced to every device over CalDAV
+  and CardDAV (Radicale).
+- **Who:** feature `caldav`; also while acting.
+- **Screen:** the **Calendar server** card — status (*Ready*, *Not published*, *Stopped* or *Not
+  available* when the hosting provider has not installed it), the server address
+  `https://<server>/dav/` and **Open web page** (Radicale's own page, where calendars and address
+  books can be created in the browser); **Set a DAV password** — pick a DAV login and a password
+  (at least 8 characters, strength meter; separate from the mailbox and panel passwords; setting
+  it again replaces the old one); **DAV logins** — your account login `<username>@<main domain>`
+  and every sub-user whose *Calendars and contacts* service is on in the User Manager, each with
+  *Password set* / *No password*, **Collections** (the login's calendars and address books with
+  type, item count and last change) and **Remove** (the password only; the data stays and comes
+  back with a new password); **Set up your apps** — the addresses and the steps for Thunderbird,
+  iPhone/iPad, Android (DAVx⁵) and macOS. A client connects to the server address with the DAV
+  login and password; your own tree is `https://<server>/dav/<login>/`, and only that login can
+  read it.
+- **Server:** `GET /email/calendars` → `{ available: { installed, active, published, url },
+  serverUrl, hostname, logins: [{ login, kind: account|subuser, subuserId, hasPassword,
+  passwordSetAt, urls }], passwordMinLength }`; `PUT /email/calendars/:login/password { password }`
+  (browser session only; the panel hashes it with bcrypt and the agent writes the hash to
+  Radicale's htpasswd file, audited `panel.dav.password.set`); `DELETE …/:login/password`
+  (`panel.dav.password.remove`); `GET …/:login/collections` (read-only listing of the store).
+  A login that is not yours answers `404`; one left registered to another account `409 login_taken`.
+- **Needs:** the provider's Radicale install (`501` otherwise) and the `/dav/` publication for
+  the address to exist. Sub-user DAV passwords are set here, not by the User Manager's password.
+
 ## 7. Databases
 
 Routes under `/databases` (`services/panel-databases.js`). The engine is the active profile of
@@ -1576,6 +1604,31 @@ group, so its mutations are session-only.
   is usually the point; the rules live in `public_html/.htaccess` between the panel's markers and
   WordPress or other rewrite rules above them are kept.
 
+#### 15.4 Terminal
+
+- **Purpose:** a command line on your account, in the browser, running as your own Linux user
+  from your home directory.
+- **Who:** feature `terminal` **and** a plan that includes shell access; also while an
+  administrator acts as you. Without shell access the page shows *Not included in your plan*
+  (the API answers `501 shell_disabled`), and the SSH keys page is in the same state.
+- **Screen:** the shell opens as soon as the page loads (`Connecting` → `Connected`). Type as in
+  any terminal; the window follows the browser size. **Reconnect** starts a new shell (the
+  previous one is closed: a shell serves one browser tab), **Disconnect** ends it. Copy with
+  Ctrl+Shift+C (Cmd+C on a Mac) or the *Copy selection* button, paste with Ctrl+Shift+V (Cmd+V)
+  or a right-click.
+- **Limits:** a shell closes after 15 minutes without activity and after 4 hours at most, when
+  you sign out of the panel, and when its browser tab closes. Every open and close is recorded in
+  the audit log (never what you type or see).
+- **Server:** `POST /api/panel/terminal/sessions { cols, rows }` → `{ id, wsToken }` (the token is
+  single-use and valid 30 seconds), WebSocket `/api/panel/terminal/ws?token=…` with the panel
+  session cookie, `GET`/`DELETE /api/panel/terminal/sessions[/:id]`. Browser session only; API
+  tokens cannot open a terminal.
+- **Gotchas:** the shell is the one Manage Shell Access set for the account (`/bin/bash` by
+  default); a shell that is `nologin` on the server while the plan says otherwise answers
+  `501 shell_disabled` until the operator re-applies the shell; `sudo` and set-uid programs do not
+  work in it (the shell runs with *no new privileges*); long-running programs die with the
+  session, use `cron` for those.
+
 ---
 
 ## 16. Software
@@ -1684,6 +1737,55 @@ group, so installs, updates and removals are session-only; the list is readable 
   cannot be set by hand (`422`); when your program exits the service restarts it after 3 s and the
   state shows *failed* — read **Logs**; an app that does not answer gives visitors a `503` from the web
   server; without Apache on the host the page says so and `POST` answers `501`.
+
+---
+
+## 17. Preferences
+
+Routes under `/users` (`services/panel-users.js`). No token scope is granted for this group, so
+it is session-only.
+
+#### 17.1 User manager
+
+- **Purpose:** give a person — a colleague, a designer, a device — their own login to this
+  account's services without sharing your account password: a mailbox and an FTP folder with
+  **one password**, plus a calendars-and-contacts login. These users never sign in to this panel
+  and are never Linux users on the server.
+- **Who:** feature `usermanager`; each service also needs its own feature (`emailaccts`,
+  `ftpaccts`) and counts against its own plan limit (`max_email`, `max_ftp`); the plan key
+  `max_subusers` caps the number of users (empty = unlimited). Also while acting.
+- **Screen:** *Users* lists every user as `name@domain` with its full name, a badge per enabled
+  service (**Email**, **FTP**, **Calendars**; an amber badge means the mailbox or FTP login was
+  deleted from its own page meanwhile), the contact address and the creation date. **Add user**
+  opens the sheet: user name and domain (one of yours), full name, contact email (where the person
+  can be reached — not a mailbox here), then the services: *Email* with the mailbox size (empty =
+  the default size), *FTP* with the folder under your home that the login is limited to (created
+  if missing), *Calendars and contacts* (only when your plan includes calendars; the DAV password
+  is set on *Email › Calendars and contacts*), and the password. Row actions: **Edit** (the same
+  sheet — switching a service on asks for the password again, because the panel never stores it;
+  a password typed on a plain edit is applied to every enabled service), **Change password** (every
+  enabled service at once) and **Delete user** (removes the mailbox *with its messages* and the FTP
+  login).
+- **Server:** `GET /users` → `{ data: [{ id, username, domain, login, fullName, contactEmail,
+  services: { email: { enabled, quotaMb, address, present }, ftp: { enabled, homeDir, present },
+  dav: { enabled, login } }, createdAt, updatedAt }], meta: { total, max, domains, features: { email,
+  ftp }, defaults } }`; `POST /users { username, domain, password, fullName?, contactEmail?,
+  services?: { email?: { enabled, quotaMb? }, ftp?: { enabled, homeDir? }, dav?: { enabled } } }` →
+  `201 { data, meta: { warnings } }` (the mailbox is created exactly as *Email accounts* creates it,
+  then the FTP login exactly as *FTP accounts* does — the FTP login is `<name>@<your main domain>` on
+  pure-ftpd — then the user; a failure on the way removes what was already made); `GET /users/:id`;
+  `PUT /users/:id { fullName?, contactEmail?, services?, password? }` → `{ data, meta: { warnings,
+  changed } }`; `PUT /users/:id/password { password }` → `{ applied: ['email', 'ftp'] }`;
+  `DELETE /users/:id` → `{ removed, services }`. Audit `panel.users.create` / `update` / `password`
+  / `delete` next to the mailbox and FTP entries; the password is never logged.
+- **Gotchas:** the user name must start with a letter or digit and may use `.`, `_` and `-` (max 32
+  characters) — it is both the mailbox local part and the FTP name, so it must be free on both; a
+  mailbox or FTP login you create with the same name on their own pages blocks the user (`409`);
+  enabling a service without the password answers `422 password_required`; a mailbox created here
+  also appears under *Email accounts* and the FTP login under *FTP accounts*, where quota, folder and
+  password can be changed as well; mail for a domain routed to another server cannot get a mailbox
+  (`409 routing_remote`, same as *Email accounts*); without Dovecot or an FTP daemon with virtual
+  users the matching switch answers `501`.
 
 ---
 
