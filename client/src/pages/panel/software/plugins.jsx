@@ -18,11 +18,10 @@ export default function Plugins({ fn }) {
   if (!hasFeature('plugins')) return <PanelPage fn={fn}><FeatureDisabledState fn={fn} /></PanelPage>;
   return (
     <PanelPage fn={fn} actions={<Button size="sm" onClick={reload}><RefreshCw size={14} /> {t('panel.plugins.refresh', 'Refresh')}</Button>}>
-      <p className="muted">{t('panel.plugins.intro', 'Pages added by plugins your hosting provider installed. They open inside the account panel and only see this account.')}</p>
       <ErrorBanner error={error} onRetry={reload} />
       {loading && !plugins.length && <Loading text={t('common.loading', 'Loading…')} />}
       {!loading && !error && plugins.length === 0 && (
-        <Card><EmptyState icon={Puzzle} title={t('panel.plugins.empty_title', 'No plugin pages')}><p>{t('panel.plugins.empty_text', 'Your hosting provider has not installed any plugin with a page for account holders.')}</p></EmptyState></Card>
+        <Card><EmptyState icon={Puzzle} title={t('panel.plugins.empty_title', 'No plugin pages')}><p>{t('panel.plugins.empty_text', 'Your hosting provider has not installed any plugin with a page for account holders.')}</p><p className="muted">{t('panel.plugins.intro', 'Pages added by plugins your hosting provider installed. They open inside the account panel and only see this account.')}</p></EmptyState></Card>
       )}
       {plugins.map((p) => (
         <Card key={p.id} title={p.name} subtitle={fill(t('panel.plugins.by', '{name} {version}'), { name: p.id, version: p.version })}>

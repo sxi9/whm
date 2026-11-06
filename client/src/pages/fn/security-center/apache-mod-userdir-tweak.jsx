@@ -30,6 +30,14 @@ export default function ApacheModUserdirTweak({ fn }) {
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
       {data && !data.installed && <CapabilityNotice error={{ code: 'capability_missing', message: 'Apache is not installed on this server, so mod_userdir cannot be configured.' }} onRetry={refetch} />}
+      {data && !data.installed && (
+        <Card title="Settings" subtitle="Shown for reference; the switch applies once Apache is installed.">
+          <fieldset disabled style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+            <Field inline><Toggle checked={enabled} onChange={setEnabled} label="Enable mod_userdir (~user URLs)" description="Users listed below stay disabled even when the feature is on." disabled /></Field>
+            <FormActions><Button variant="primary" disabled>Save and reload Apache</Button></FormActions>
+          </fieldset>
+        </Card>
+      )}
       {data && data.installed && (
         <>
           <Card title="Status">

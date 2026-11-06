@@ -11,7 +11,8 @@ import { PRIVILEGES, PG_PRIVILEGES, signonUserFor } from './database-services.js
 
 export const DB_NAME = /^[a-z0-9_]{1,54}$/;
 export const DB_USER_NAME = /^[a-z0-9_]{1,22}$/;
-export const ACCESS_HOST = /^[A-Za-z0-9.%:_-]{1,255}$/;
+// The optional CIDR suffix is for PostgreSQL (pg_hba.conf networks, contract §67).
+export const ACCESS_HOST = /^[A-Za-z0-9.%:_-]{1,255}(\/\d{1,3})?$/;
 export const ALL_PRIVILEGES = [...new Set([...PRIVILEGES, ...PG_PRIVILEGES])];
 export const DUMP_STAGING_ROOT = '/var/lib/whm/panel/dumps';
 export const SYSTEM_ROOT = Object.freeze({ id: null, username: 'panel', role: 'root' });
@@ -233,20 +234,22 @@ export function createPanelDatabasesService(ctx) {
     return { name, hosts: r.hosts, grants: r.grants, changes: r.changes };
   }
 
+  // PostgreSQL hosts are pg_hba.conf lines of this server (contract §67): a
+  // remote PostgreSQL profile keeps the unsupported answer.
   function listAccessHosts(scope) {
     requireFeature(scope);
-    if (isPg()) return { data: [], meta: { total: 0, engine: engine(), supported: false } };
     const r = databases().listAccessHosts({ account: scope.username }, scope.ownerPrincipal);
+    if (!r.meta.supported) return { data: [], meta: { total: 0, engine: engine(), supported: false } };
     const data = r.data.filter((h) => h.account_id === scope.accountId || h.account_id == null).map((h) => ({ id: h.id, host: h.host, scope: h.account_id == null ? 'global' : 'account', editable: h.account_id === scope.accountId, created_at: h.created_at }));
     return { data, meta: { total: data.length, engine: engine(), supported: true } };
   }
 
   async function addAccessHost(scope, host, req) {
     requireFeature(scope);
-    if (isPg()) throw new HttpError(422, 'unsupported', 'Remote access hosts are not available for PostgreSQL');
+    if (isPg() && !databases().listAccessHosts({ account: scope.username }, scope.ownerPrincipal).meta.supported) throw new HttpError(422, 'unsupported', 'Remote access hosts need the PostgreSQL server on this host');
     const r = await databases().addAccessHost({ host, account: scope.username }, scope.ownerPrincipal, req);
     audit(req, scope, { action: 'panel.db.access_host.add', args: { host } });
-    return { id: r.id, host: r.host, scope: 'account', editable: true, applied: r.applied, failed: r.failed };
+    return { id: r.id, host: r.host, scope: 'account', editable: true, applied: r.applied, failed: r.failed, ...(r.address ? { address: r.address } : {}) };
   }
 
   async function removeAccessHost(scope, id, req) {

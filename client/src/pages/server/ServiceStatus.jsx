@@ -20,6 +20,8 @@ export function useServiceActions(refetch) {
   };
 }
 
+const dash = <span className="muted">—</span>;
+
 export default function ServiceStatus({ fn }) {
   const { user } = useAuth();
   const { data, loading, error, refetch } = useApi('/system/services', { refreshMs: 15_000 });
@@ -32,12 +34,12 @@ export default function ServiceStatus({ fn }) {
         <DataTable
           columns={[
             { key: 'displayName', label: 'Service' },
-            { key: 'unit', label: 'Unit', render: (s) => (s.unit ? <code>{s.unit}</code> : <span className="muted">not installed</span>) },
+            { key: 'unit', label: 'Unit', render: (s) => (s.unit ? <code>{s.unit}</code> : dash) },
             { key: 'state', label: 'Status', render: (s) => <StatusPill status={s.active ? 'active' : s.installed ? 'down' : 'not-installed'}>{s.active ? 'Up' : s.installed ? 'Down' : 'Not installed'}</StatusPill> },
-            { key: 'pid', label: 'PID' },
-            { key: 'memoryBytes', label: 'Memory', align: 'right', render: (s) => formatBytes(s.memoryBytes) },
-            { key: 'restarts', label: 'Restarts', align: 'right' },
-            { key: 'startedAt', label: 'Started', render: (s) => (s.startedAt ? formatDate(s.startedAt) : '—') },
+            { key: 'pid', label: 'PID', render: (s) => (s.pid ? s.pid : dash) },
+            { key: 'memoryBytes', label: 'Memory', align: 'right', render: (s) => (s.memoryBytes != null ? formatBytes(s.memoryBytes) : dash) },
+            { key: 'restarts', label: 'Restarts', align: 'right', render: (s) => (s.restarts != null ? s.restarts : dash) },
+            { key: 'startedAt', label: 'Started', render: (s) => (s.startedAt ? formatDate(s.startedAt) : dash) },
           ]}
           rows={rows} loading={loading} error={error} rowKey={(s) => s.name}
           rowActions={(s) => (user.role !== 'root' || !s.installed ? [] : [

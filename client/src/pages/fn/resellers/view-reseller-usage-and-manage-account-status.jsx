@@ -52,7 +52,7 @@ export default function ViewResellerUsageAndManageAccountStatus({ fn }) {
           />
         </Card>
       )}
-      {isRoot && <Card title="Reseller"><ResellerPicker value={picked} onChange={setPicked} /></Card>}
+      {isRoot && <Card title="Inspect a reseller"><ResellerPicker value={picked} onChange={setPicked} /></Card>}
       <ErrorBanner error={error} onRetry={refetch} />
       {data && (
         <>

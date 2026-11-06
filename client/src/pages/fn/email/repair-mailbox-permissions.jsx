@@ -31,7 +31,7 @@ export default function RepairMailboxPermissions({ fn }) {
       <PageHeader fn={fn} description="Fixes mailbox trees whose ownership or modes were broken by restores, manual copies or scripts: ~/mail and ~/etc become user:user with 0700 directories and 0600 files, which is what Exim and Dovecot expect." actions={<Button variant="primary" loading={busy} disabled={!data?.length} onClick={() => run({ all: true })}>Repair all accounts</Button>} />
       <RequestError error={error} onRetry={refetch} />
       {job && <Card title="Repair progress"><ProgressLog jobId={job} onFinished={(e) => toast[e.type === 'done' ? 'success' : 'error'](e.type === 'done' ? 'Mailbox permissions repaired' : e.error || 'Repair failed')} /></Card>}
-      <Card padded={false} actions={<Button size="sm" variant="primary" loading={busy} disabled={!selected.length} onClick={() => run({ usernames: selected })}>Repair selected ({selected.length})</Button>}>
+      <Card padded={false} title="Accounts">
         <DataTable
           columns={[
             { key: 'username', label: 'Account', render: (a) => <code>{a.username}</code> },
@@ -42,6 +42,7 @@ export default function RepairMailboxPermissions({ fn }) {
           ]}
           rows={rows} loading={loading} rowKey={(a) => a.username} dense emptyText="No accounts yet. Hosted accounts and their mail trees are listed here."
           searchable q={q} onSearch={setQ} searchPlaceholder="Filter accounts"
+          toolbar={<Button size="sm" loading={busy} disabled={!selected.length} onClick={() => run({ usernames: selected })}>Repair selected ({selected.length})</Button>}
           selectable selected={selected} onSelectedChange={setSelected}
           rowActions={(a) => [{ label: 'Repair', primary: true, onClick: () => run({ usernames: [a.username] }) }]}
         />

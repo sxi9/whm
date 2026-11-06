@@ -33,10 +33,10 @@ export default function UpdateServerSoftware({ fn }) {
       {loading && !data && <Loading />}
       {data && (
         <>
-          <Card title="Panel version" actions={<Button variant="primary" loading={busy === 'check'} disabled={!data.updateUrl} onClick={check}>Check for updates</Button>}>
+          <Card title="Panel version" subtitle={data.updateUrl ? undefined : 'Set an update feed URL under Update settings below to enable checks.'} actions={<Button variant="primary" loading={busy === 'check'} disabled={!data.updateUrl} onClick={check}>Check for updates</Button>}>
             <KeyValue items={[
               ['Installed version', <code key="v">{data.currentVersion}</code>],
-              ['Latest available', data.latest ? <span key="l"><code>{data.latest.version}</code> <StatusPill status={data.updateAvailable ? 'warning' : 'ok'}>{data.updateAvailable ? 'update available' : 'up to date'}</StatusPill></span> : <span className="muted">unknown — run a check</span>],
+              ['Latest available', data.latest ? <span key="l"><code>{data.latest.version}</code> <StatusPill status={data.updateAvailable ? 'warning' : 'ok'}>{data.updateAvailable ? 'update available' : 'up to date'}</StatusPill></span> : <span key="l" className="muted">{data.updateUrl ? 'Unknown; run a check' : 'Set an update feed URL to check'}</span>],
               ['Release tier', data.tier],
               ['Last check', data.lastCheck ? <span key="c">{formatDate(data.lastCheck.at)} · <StatusPill status={data.lastCheck.ok ? 'ok' : 'failed'}>{data.lastCheck.ok ? 'ok' : data.lastCheck.error}</StatusPill></span> : 'never'],
               ['Install method', data.installMethod === 'git' ? `git checkout at ${data.repoRoot}` : data.installMethod],

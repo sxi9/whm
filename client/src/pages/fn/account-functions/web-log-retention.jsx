@@ -34,6 +34,7 @@ export default function WebLogRetention({ fn }) {
   const [job, setJob] = useState(null);
   const [runError, setRunError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const enabledCount = (data?.accounts || []).filter((r) => r.archive_logs).length;
 
   const archiveNow = async (username) => {
     setBusy(true); setRunError(null);
@@ -42,9 +43,9 @@ export default function WebLogRetention({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Per-account policy for the raw Apache logs: whether a monthly archive is kept in the account's ~/logs/archive and for how long. Rotation of the live logs is configured under Service Configuration › Log Rotation Configuration. The archive job runs on the 1st of each month." actions={<Button variant="primary" loading={busy} onClick={() => archiveNow()}>Archive now (all enabled)</Button>} />
+      <PageHeader fn={fn} description="Per-account policy for the raw Apache logs: whether a monthly archive is kept in the account's ~/logs/archive and for how long. Rotation of the live logs is configured under Service Configuration › Log Rotation Configuration. The archive job runs on the 1st of each month." actions={<Button variant="primary" loading={busy} disabled={!enabledCount} onClick={() => archiveNow()}>{enabledCount ? `Archive now (${enabledCount})` : 'Archive enabled accounts now'}</Button>} />
       <CapabilityNotice error={runError} />
-      <Card padded={false}>
+      <Card title="Accounts" subtitle={data ? `${data.accounts.length} accounts · ${enabledCount} archiving monthly` : undefined} padded={false}>
         <ErrorBanner error={error} onRetry={refetch} />
         <DataTable
           columns={[
@@ -56,7 +57,7 @@ export default function WebLogRetention({ fn }) {
             { key: 'last_archived_at', label: 'Last archived', render: (r) => formatDate(r.last_archived_at) },
             { key: 'configured', label: 'Source', render: (r) => <span className="muted">{r.configured ? 'account setting' : 'server default'}</span> },
           ]}
-          rows={data?.accounts || []} loading={loading} rowKey={(r) => r.username} dense
+          rows={data?.accounts || []} loading={loading} rowKey={(r) => r.username} dense emptyText="No accounts yet. Each account appears here with its archive policy."
           rowActions={(r) => [{ label: 'Edit', primary: true, onClick: () => setEditing(r) }, { label: 'Archive now', onClick: () => archiveNow(r.username) }]}
         />
       </Card>

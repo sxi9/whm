@@ -48,6 +48,9 @@ export default function DatabaseUsers({ fn }) {
   const databases = useMemo(() => (dbs.data || []).map((d) => d.name), [dbs.data]);
   const rows = useMemo(() => filterUsers(data || [], q), [data, q]);
   const capability = isCapabilityError(error);
+  // Nothing can be created while the database server is missing: the state is
+  // said once at the top and the form below it is disabled.
+  const blocked = capability || isCapabilityError(dbs.error);
   const weak = () => ({ message: fill(t('panel.databases.password_weak', 'Choose a stronger password (minimum strength {min})'), { min: MIN_STRENGTH }), fields: { password: [t('panel.databases.password_too_weak', 'Too weak')] } });
 
   if (isFeatureDisabled(error)) return <PanelPage fn={fn}><FeatureDisabledState fn={fn} /></PanelPage>;
@@ -82,14 +85,15 @@ export default function DatabaseUsers({ fn }) {
 
   return (
     <PanelPage fn={fn} actions={<Button icon={RefreshCw} onClick={() => { refetch(); dbs.refetch(); }}>{t('common.refresh', 'Refresh')}</Button>}>
+      {blocked && <Card><PanelCapabilityState error={capability ? error : dbs.error} onRetry={() => { refetch(); dbs.refetch(); }} /></Card>}
       <form onSubmit={create}>
         <Card title={t('panel.databases.user_create_title', 'Create a database user')} subtitle={t('panel.databases.user_create_subtitle', 'Sites connect with a user, not with your account password.')}>
           <PanelCapabilityState error={isCapabilityError(formError) ? formError : null} />
           <RequestError error={formError} />
           <div className="form-grid">
-            <NameField id="dbu-name" label={t('panel.databases.user_name', 'User name')} prefix={prefix} value={form.name} onChange={(v) => setForm((f) => ({ ...f, name: v }))} placeholder="app" maxLength={22} error={formError?.fields?.name} />
+            <NameField id="dbu-name" label={t('panel.databases.user_name', 'User name')} prefix={prefix} value={form.name} onChange={(v) => setForm((f) => ({ ...f, name: v }))} placeholder="app" maxLength={22} error={formError?.fields?.name} disabled={blocked} />
             <Field label={t('panel.databases.password', 'Password')} required error={formError?.fields?.password} help={t('panel.databases.password_help', 'Use the generator; the password is shown only now')} htmlFor="dbu-password">
-              <PasswordInput id="dbu-password" value={form.password} onChange={(v) => setForm((f) => ({ ...f, password: v }))} minStrength={MIN_STRENGTH} />
+              <PasswordInput id="dbu-password" value={form.password} onChange={(v) => setForm((f) => ({ ...f, password: v }))} minStrength={MIN_STRENGTH} disabled={blocked} />
             </Field>
           </div>
           <Field label={t('panel.databases.give_access', 'Give access to')} help={databases.length ? t('panel.databases.give_access_help', 'All privileges on the ticked databases; fine-tune them afterwards with "Privileges"') : isCapabilityError(dbs.error) ? t('panel.databases.give_access_unavailable', 'The list of databases is unavailable while the database server is missing') : t('panel.databases.give_access_later', 'No databases yet; the user can be given access later')} error={formError?.fields?.databases}>
@@ -99,12 +103,11 @@ export default function DatabaseUsers({ fn }) {
               </div>
             ) : <Link to="/panel/databases/databases">{t('panel.databases.create_title', 'Create a database')}</Link>}
           </Field>
-          <FormActions><Button type="submit" variant="primary" icon={Plus} loading={busy} disabled={!form.name || !form.password}>{t('panel.databases.user_create_button', 'Create user')}</Button></FormActions>
+          <FormActions><Button type="submit" variant="primary" icon={Plus} loading={busy} disabled={blocked || !form.name || !form.password}>{t('panel.databases.user_create_button', 'Create user')}</Button></FormActions>
         </Card>
       </form>
 
-      <Card title={t('panel.databases.users_title', 'Database users')} subtitle={data?.length ? fill(t('panel.databases.count_on_account', '{count} on this account'), { count: data.length }) : undefined} padded={false}>
-        {capability && <div className="card-body"><PanelCapabilityState error={error} onRetry={refetch} /></div>}
+      {!capability && <Card title={t('panel.databases.users_title', 'Database users')} subtitle={data?.length ? fill(t('panel.databases.count_on_account', '{count} on this account'), { count: data.length }) : undefined} padded={false}>
         <DataTable
           columns={[
             { key: 'name', label: t('panel.databases.col_user', 'User'), render: (r) => <code>{r.name}</code> },
@@ -114,16 +117,16 @@ export default function DatabaseUsers({ fn }) {
               return s ? s.map((g) => <div key={g.database}><code>{g.database}</code> <span className="muted">{g.text}</span></div>) : <StatusPill status="warning">{t('panel.databases.no_database_yet', 'no database yet')}</StatusPill>;
             } },
           ].filter(Boolean)}
-          rows={rows} loading={loading} error={capability ? null : error} rowKey={(r) => r.name}
+          rows={rows} loading={loading} error={error} rowKey={(r) => r.name}
           searchable={Boolean(data?.length)} q={q} onSearch={setQ} searchPlaceholder={t('panel.databases.users_search', 'Search users or databases')}
           rowActions={(r) => [
             { label: t('panel.databases.privileges', 'Privileges'), primary: true, onClick: () => setGrantsFor(r) },
             { label: t('panel.databases.change_password', 'Change password'), onClick: () => { setPwFor(r); setPw(''); setPwError(null); } },
             { label: t('common.delete', 'Delete'), danger: true, onClick: () => drop(r) },
           ]}
-          emptyText={capability ? t('panel.databases.users_empty_capability', 'Your database users appear here once the database server is available.') : q ? t('panel.databases.users_empty_search', 'No user matches the search.') : t('panel.databases.users_empty', 'No database users yet. Create one above and give it access to a database; it appears here with its privileges.')}
+          emptyText={q ? t('panel.databases.users_empty_search', 'No user matches the search.') : t('panel.databases.users_empty', 'No database users yet. Create one above and give it access to a database; it appears here with its privileges.')}
         />
-      </Card>
+      </Card>}
 
       {!capability && !isPg && <InfoNote>{t('panel.databases.users_localhost_before', 'Users connect from this server')} (<code>localhost</code>). {t('panel.databases.users_localhost_after', 'To connect from another computer, allow its address under')} <Link to="/panel/databases/remote-hosts">{t('panel.databases/remote-hosts.label', 'Remote hosts')}</Link>.</InfoNote>}
 

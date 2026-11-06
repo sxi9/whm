@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { ExternalLink, Download, BookOpen, Save, LifeBuoy, KeyRound } from 'lucide-react';
+import { ExternalLink, Download, BookOpen, LifeBuoy, KeyRound } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi, useMutation } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
@@ -17,7 +17,7 @@ function LinkGrid({ links, external = false }) {
       {links.map((l) => (
         <div key={l.key} className="tool-card">
           {external
-            ? <a className="tool-link" href={l.url} target="_blank" rel="noreferrer noopener"><strong>{l.label} <ExternalLink size={13} /></strong><small>{l.description}</small></a>
+            ? <a className="tool-link" href={l.url} target="_blank" rel="noreferrer noopener"><strong>{l.label.split(' ').slice(0, -1).join(' ')}{l.label.includes(' ') ? ' ' : ''}<span style={{ whiteSpace: 'nowrap' }}>{l.label.split(' ').slice(-1)[0]} <ExternalLink size={13} /></span></strong><small>{l.description}</small></a>
             : <Link className="tool-link" to={l.path}><strong>{l.label}</strong><small>{l.description}</small></Link>}
         </div>
       ))}
@@ -51,7 +51,7 @@ export function SupportSettings({ settings, onSaved }) {
           <Field label="Default grant length (hours)" error={fieldErrors?.['access.defaultHours']}><NumberInput value={form.defaultHours} onChange={set('defaultHours')} min={1} max={8760} nullable={false} /></Field>
           <Field label="Maximum grant length (hours)" error={fieldErrors?.['access.maxHours']}><NumberInput value={form.maxHours} onChange={set('maxHours')} min={1} max={8760} nullable={false} /></Field>
         </div>
-        <FormActions><Button type="submit" variant="primary" icon={Save} loading={loading}>Save</Button></FormActions>
+        <FormActions><Button type="submit" variant="primary" loading={loading}>Save</Button></FormActions>
       </form>
     </Card>
   );

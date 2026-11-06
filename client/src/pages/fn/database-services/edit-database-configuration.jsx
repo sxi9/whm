@@ -46,7 +46,7 @@ export default function EditDatabaseConfiguration({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Tune the local MySQL/MariaDB server through a panel-managed include file that overrides the distribution defaults. Changes are validated with the server binary and rolled back if rejected; a restart applies them." actions={<><Button onClick={() => refetch()}>Refresh</Button><Button variant="danger" onClick={restartNow} loading={busy}>Restart server</Button></>} />
+      <PageHeader fn={fn} description="Tune the local MySQL/MariaDB server through a panel-managed include file that overrides the distribution defaults. Changes are validated with the server binary and rolled back if rejected; a restart applies them." actions={<><Button onClick={() => refetch()}>Refresh</Button><Button variant="danger" onClick={restartNow} loading={busy} disabled={!data}>Restart server</Button></>} />
       {error?.code === 'unsupported_engine'
         ? <div className="banner banner-info"><Info size={18} /><div><strong>Not available for the active profile</strong><p>{error.message} <Link to="/database-services/manage-database-profiles">Manage Database Profiles</Link></p></div></div>
         : <RequestError error={error} onRetry={refetch} />}

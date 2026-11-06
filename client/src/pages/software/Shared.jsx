@@ -45,18 +45,23 @@ const RUNTIME_SUBTITLES = {
 // The catalog's row label already carries the runtime name ('PHP 8.4'); only fall back to composing one.
 const rowLabel = (runtime, row) => row.label || `${runtime.label} ${row.id}`;
 
-function RuntimeRow({ runtime, row, busy, onInstall, onRemove }) {
+// With no package manager every PHP row carries the same sentence; the page header
+// already says so, so the rows keep a short note and the full text in the tooltip.
+const NO_MANAGER_NOTE = /package manager/i;
+
+function RuntimeRow({ runtime, row, busy, onInstall, onRemove, noManager }) {
   const isNode = runtime.key === 'nodejs';
   const isSource = runtime.key === 'php' && (row.source || row.method === 'source');
   const unsupported = row.state === 'unsupported';
+  const shortNote = noManager && unsupported && NO_MANAGER_NOTE.test(row.note || '');
   return (
     <tr>
-      <td><strong>{runtime.single ? runtime.label : rowLabel(runtime, row)}</strong> <SourceBuildPill row={row} />
-        {isNode && <><br /><code className="small">/usr/local/bin/node{row.id}</code></>}
-        {isSource && <><br /><code className="small">{PHP_SOURCE_PREFIX}/{row.id}</code></>}
+      <td className="nowrap"><strong>{runtime.single ? runtime.label : rowLabel(runtime, row)}</strong> <SourceBuildPill row={row} />
+        {isNode && <><br /><code className="small nowrap">/usr/local/bin/node{row.id}</code></>}
+        {isSource && <><br /><code className="small nowrap">{PHP_SOURCE_PREFIX}/{row.id}</code></>}
       </td>
       <td>{row.installed ? <StatusPill status="installed">{row.version ? `installed · ${row.version}` : 'installed'}</StatusPill> : <StatusPill status="not-installed">not installed</StatusPill>}</td>
-      <td className="muted small">{row.note || (row.packages?.length ? <CodeList names={row.packages.slice(0, 4).concat(row.packages.length > 4 ? [`+${row.packages.length - 4} more`] : [])} /> : '—')}</td>
+      <td className="muted small">{shortNote ? <span title={row.note}>Needs a package manager</span> : row.note || (row.packages?.length ? <CodeList names={row.packages.slice(0, 4).concat(row.packages.length > 4 ? [`+${row.packages.length - 4} more`] : [])} /> : '—')}</td>
       <td className="actions-col">
         {!row.installed && <Button size="sm" variant="primary" loading={busy} disabled={unsupported} title={unsupported ? row.note || 'Not available for this OS' : undefined} onClick={() => onInstall(runtime, row)}>Install</Button>}
         {row.installed && !isNode && <StatusPill status="installed">Installed</StatusPill>}
@@ -96,9 +101,9 @@ export function RuntimeInstaller({ only, title, subtitle, onFinished, tools }) {
         <Card key={runtime.key} title={cardTitle(runtime)} subtitle={subtitle || RUNTIME_SUBTITLES[runtime.key]} padded={false}>
           <div className="table-wrap">
             <table>
-              <thead><tr><th>Version</th><th>State</th><th>Packages / note</th><th /></tr></thead>
+              <thead><tr><th className="shrink-col">Version</th><th className="shrink-col">State</th><th>Packages / note</th><th /></tr></thead>
               <tbody>
-                {runtime.versions.map((row) => <RuntimeRow key={row.id} runtime={runtime} row={row} busy={runner.busy} onInstall={install} onRemove={remove} />)}
+                {runtime.versions.map((row) => <RuntimeRow key={row.id} runtime={runtime} row={row} busy={runner.busy} onInstall={install} onRemove={remove} noManager={!data.manager} />)}
               </tbody>
             </table>
           </div>

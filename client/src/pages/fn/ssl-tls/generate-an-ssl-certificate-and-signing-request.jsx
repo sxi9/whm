@@ -36,7 +36,7 @@ export default function GenerateCsr({ fn }) {
   return (
     <>
       <PageHeader fn={fn} />
-      <div className="form-grid">
+      <div className="form-grid" style={{ alignItems: 'start' }}>
         <Card title="Certificate details" subtitle="The key and CSR are stored encrypted in the SSL Storage Manager under the account that owns the domain.">
           <Field label="What to generate">
             <RadioGroup name="mode" value={mode} onChange={setMode} options={[
@@ -54,12 +54,14 @@ export default function GenerateCsr({ fn }) {
         </Card>
         <Card title="Subject" subtitle="Organization details embedded in the request. CAs issuing DV certificates ignore everything except the domain.">
           <SubjectFields value={form.subject} onChange={(subject) => setForm({ ...form, subject })} />
-          <FormActions>
-            <Button variant="primary" loading={busy} disabled={!form.domain.trim()} onClick={generate}>{mode === 'csr' ? 'Generate key + CSR' : 'Generate certificate'}</Button>
-          </FormActions>
-          {error && error.status !== 422 && <RequestError error={error} />}
-          {error?.status === 422 && !error.fields?.domain && !error.fields?.sans && <ErrorBanner error={error} />}
         </Card>
+      </div>
+      {error && error.status !== 422 && <RequestError error={error} />}
+      {error?.status === 422 && !error.fields?.domain && !error.fields?.sans && <ErrorBanner error={error} />}
+      <div className="sticky-actions">
+        <FormActions>
+          <Button variant="primary" loading={busy} disabled={!form.domain.trim()} onClick={generate}>{mode === 'csr' ? 'Generate key + CSR' : 'Generate certificate'}</Button>
+        </FormActions>
       </div>
       {result && (
         <Card title={`Generated for ${result.cert.domain}`} subtitle="Copy or download now: the private key is shown once here and otherwise only retrievable from the SSL Storage Manager (audited).">

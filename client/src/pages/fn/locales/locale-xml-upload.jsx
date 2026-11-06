@@ -61,7 +61,7 @@ export default function LocaleXmlUpload({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} />
+      <PageHeader fn={fn} actions={<Link className="btn btn-ghost" to="/locales/locale-xml-download">Download an existing locale</Link>} />
       <RequestError error={error} onRetry={refetch} />
       <Card title="Import a locale from XML" subtitle="Accepts the format produced by Locale XML Download. The file is validated before anything is written; the built-in English locale cannot be overwritten.">
         <div className="form-grid">
@@ -99,7 +99,6 @@ export default function LocaleXmlUpload({ fn }) {
         <FormActions>
           <Button loading={busy} disabled={!xml.trim()} onClick={validate}>Validate</Button>
           <Button variant="primary" loading={busy} disabled={!xml.trim() || !preview} onClick={upload}>Import</Button>
-          <Link className="btn" to="/locales/locale-xml-download">Download an existing locale</Link>
         </FormActions>
         {!preview && xml.trim() && <p className="muted small">Validate first to see what the import would change.</p>}
       </Card>

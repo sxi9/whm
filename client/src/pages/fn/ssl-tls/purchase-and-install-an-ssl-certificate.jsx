@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { Info } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, StatusPill, KeyValue, formatDate } from '../../../components/Common.jsx';
@@ -69,8 +70,10 @@ export default function PurchaseAndInstall({ fn }) {
               { key: 'url', label: 'Site', render: (p) => (p.url ? <a href={p.url} target="_blank" rel="noreferrer">{p.url}</a> : '—') },
             ]} rows={providers.data} rowKey={(p) => p.name} emptyText="Providers added in Market Provider Manager appear here." />
           </Card>
-          <div className="form-grid">
-            <Card title="Order a certificate" subtitle={enabled.length ? 'A key and CSR are generated and stored for the domain; the CSR is what you submit to the provider.' : 'Enable a provider first.'}>
+          {!enabled.length && <div className="banner banner-info"><Info size={18} /><div><strong>No provider is enabled</strong><p>Enable a certificate vendor under <Link to="/market/market-provider-manager">Market Provider Manager</Link> to order through this page.</p></div></div>}
+          <fieldset disabled={!enabled.length} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+          <div className="form-grid" style={{ alignItems: 'start' }}>
+            <Card title="Order a certificate" subtitle="A key and CSR are generated and stored for the domain; the CSR is what you submit to the provider.">
               <Field label="Provider"><Select value={form.provider} onChange={(v) => setForm({ ...form, provider: v, product: '' })} placeholder="Select a provider" options={(providers.data || []).map((p) => ({ value: p.name, label: `${p.displayName}${p.enabled ? '' : ' (disabled)'}`, disabled: !p.enabled }))} /></Field>
               <Field label="Product"><Select value={form.product} onChange={(v) => setForm({ ...form, product: v })} placeholder="Select a product" options={(provider?.products || []).map((x) => ({ value: x.id, label: `${x.name} — ${money(x.price, x.currency)} / ${x.termMonths} months` }))} /></Field>
               <Field label="Domain" required><DomainSelect value={form.domain} onChange={(v) => setForm({ ...form, domain: v })} /></Field>
@@ -81,6 +84,7 @@ export default function PurchaseAndInstall({ fn }) {
               <FormActions><Button variant="primary" loading={busy} disabled={!form.provider || !form.product || !form.domain} onClick={order}>Record order and generate CSR</Button></FormActions>
             </Card>
           </div>
+          </fieldset>
         </>
       )}
       {placed && (

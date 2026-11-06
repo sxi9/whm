@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Plus, Trash2 } from 'lucide-react';
+import { Plus, Trash2, AlertTriangle } from 'lucide-react';
 import { Card, StatusPill, EmptyState } from '../../../../components/Common.jsx';
 import { DataTable } from '../../../../components/DataTable.jsx';
 import { Field, TextInput, Select, Toggle, Button, FormActions, Textarea } from '../../../../components/Form.jsx';
@@ -7,7 +7,7 @@ import { Modal, useConfirm } from '../../../../components/Modal.jsx';
 import { useToast } from '../../../../components/Toast.jsx';
 import { PanelPage } from '../../../../panel/PanelPage.jsx';
 import { usePanelApi, panelApi } from '../../../../panel/hooks/usePanel.js';
-import { PanelRequestError, MutationError, InfoNote, fieldError, isFeatureDisabled, useEmailT, tr } from './Shared.jsx';
+import { PanelRequestError, MutationError, fieldError, isFeatureDisabled, useEmailT, tr } from './Shared.jsx';
 
 // Mail filters, shared by the per-mailbox and the account-wide page: the list
 // of a scope with its order, the rule builder and the "Test" compile. The API
@@ -181,14 +181,18 @@ export function FiltersPanel({ fn, base, qs = '', intro = null, children }) {
 
   const featureOff = isFeatureDisabled(error);
   const atMax = meta?.max != null && rows.length >= meta.max;
+  // The account scope with nothing in it is one empty state (its title is the
+  // intro), not an intro note plus an empty table plus a second empty state.
+  const accountEmpty = !error && !loading && rows.length === 0 && meta?.scope === 'account';
+  const openCreate = () => { setMutationError(null); setTestResult(null); setDialog({ row: null }); };
   return (
-    <PanelPage fn={fn} actions={!featureOff && !error && <Button variant="primary" icon={Plus} onClick={() => { setMutationError(null); setTestResult(null); setDialog({ row: null }); }} disabled={atMax || loading}>{t('panel.email.filters.create', 'Create filter')}</Button>}>
+    <PanelPage fn={fn} actions={!featureOff && !error && <Button variant="primary" icon={Plus} onClick={openCreate} disabled={atMax || loading}>{t('panel.email.filters.create', 'Create filter')}</Button>}>
       {children}
       {featureOff ? <PanelRequestError error={error} fn={fn} /> : (
         <>
-          {intro}
-          {meta?.sieve && meta.sieve.available === false && <InfoNote>{t('panel.email.filters.no_sieve_1', 'Filters are saved but cannot be applied on this server yet: the mail server lacks Sieve support')} (<code>dovecot-sieve</code>). {t('panel.email.common.ask_your_hosting_provider', 'Ask your hosting provider.')}</InfoNote>}
-          <Card padded={false}>
+          {!accountEmpty && intro}
+          {meta?.sieve && meta.sieve.available === false && <div className="banner banner-warning" role="status"><AlertTriangle size={18} /><div>{t('panel.email.filters.no_sieve_1', 'Filters are saved but cannot be applied on this server yet: the mail server lacks Sieve support')} (<code>dovecot-sieve</code>). {t('panel.email.common.ask_your_hosting_provider', 'Ask your hosting provider.')}</div></div>}
+          {!accountEmpty && <Card padded={false}>
             <PanelRequestError error={error} fn={fn} onRetry={refetch} />
             {!error && (
               <DataTable
@@ -208,14 +212,19 @@ export function FiltersPanel({ fn, base, qs = '', intro = null, children }) {
                 ]}
               />
             )}
-          </Card>
+          </Card>}
           {!error && rows.length > 0 && (
             <Card title={t('panel.email.filters.script_title', 'Generated script')} subtitle={t('panel.email.filters.script_subtitle', 'The Sieve script the mail server runs for this scope.')} actions={<Button size="sm" onClick={() => setShowScript((v) => !v)}>{showScript ? t('panel.email.common.hide', 'Hide') : t('panel.email.common.show', 'Show')}</Button>}>
               {showScript ? <Textarea value={meta?.script || ''} onChange={() => {}} readOnly rows={10} mono aria-label={t('panel.email.filters.sieve_script', 'Sieve script')} /> : <p className="muted">{t('panel.email.filters.enabled_count', '{enabled} of {total} filters enabled', { enabled: rows.filter((r) => r.enabled).length, total: rows.length })}{meta?.max != null ? `, ${t('panel.email.filters.allowed_count', '{max} allowed', { max: meta.max })}` : ''}.</p>}
             </Card>
           )}
-          {!error && !loading && rows.length === 0 && meta?.scope === 'account' && (
-            <EmptyState title={t('panel.email.global_filters.empty_title', "Account-wide filters run before each mailbox's own filters")}>{t('panel.email.global_filters.empty_text', "Use them for rules every address on this account shares, such as discarding mail from a sender or filing a project's messages.")}</EmptyState>
+          {accountEmpty && (
+            <Card>
+              <EmptyState title={t('panel.email.global_filters.empty_title', "Account-wide filters run before each mailbox's own filters")}>
+                <p>{t('panel.email.global_filters.empty_text', "Use them for rules every address on this account shares, such as discarding mail from a sender or filing a project's messages.")}</p>
+                <p><Button variant="primary" icon={Plus} onClick={openCreate} disabled={atMax}>{t('panel.email.filters.create', 'Create filter')}</Button></p>
+              </EmptyState>
+            </Card>
           )}
         </>
       )}

@@ -155,7 +155,7 @@ function AssignCard({ enhancements, refreshKey }) {
   };
 
   return (
-    <Card title="Assign to an account" subtitle="Pick an account, tick the enhancements it is entitled to and save. Deep-link with ?username=.">
+    <Card title="Assign to an account" subtitle="Pick an account, tick the enhancements it is entitled to and save.">
       <AccountPicker value={username} onChange={setUsername} />
       {username && (
         <>

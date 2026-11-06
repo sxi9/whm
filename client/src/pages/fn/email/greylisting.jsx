@@ -80,9 +80,10 @@ export default function Greylisting({ fn }) {
           <Card title="Status">
             <KeyValue items={[
               ['Greylisting', <StatusPill key="s" status={data.settings.enabled ? 'enabled' : 'disabled'} />],
-              ['Backend', be?.backend ? <span key="b"><StatusPill status="ok">{be.backend}</StatusPill> {be.dbFile && <code>{be.dbFile}</code>}{be.socket && <code>{be.socket}</code>}</span> : <span key="n"><StatusPill status="not-installed">none</StatusPill> <span className="muted">{be?.reason}</span></span>],
+              ['Backend', be?.backend ? <span key="b"><StatusPill status="ok">{be.backend}</StatusPill> {be.dbFile && <code>{be.dbFile}</code>}{be.socket && <code>{be.socket}</code>}</span> : <StatusPill key="n" status="not-installed">None</StatusPill>],
               ['Exim', (lastApply || data.lastApply) ? <ApplyBadge key="a" apply={lastApply || data.lastApply} /> : <span key="n" className="muted">Not applied yet</span>],
             ]} />
+            {!be?.backend && be?.reason && <p className="muted small" style={{ marginTop: 10 }}>{be.reason}</p>}
             <IncludeHint apply={lastApply || data.lastApply} />
           </Card>
           <Tabs value={tab} onChange={setTab} tabs={[{ value: 'settings', label: 'Settings' }, { value: 'trusted', label: 'Trusted (exempt)', count: data.trusted.length }, { value: 'records', label: 'Records' }]} />

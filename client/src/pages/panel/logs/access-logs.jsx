@@ -72,9 +72,10 @@ export default function AccessLogs({ fn }) {
       {data?.warnings?.length > 0 && (
         <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>{t('panel.logs.skipped_title', 'Some log locations were skipped')}</strong><ul>{data.warnings.map((w) => <li key={w}>{w}</li>)}</ul></div></div>
       )}
+      {/* The missing web server is said once, above the grid; the pickers stay so another server can be chosen. */}
+      {missing && <Card><PanelCapabilityState error={missing} onRetry={refetch} /></Card>}
       <div className="grid-2">
-        <Card title={t('panel.logs.choose_title', 'Choose a log')} subtitle={t('panel.logs.choose_subtitle', 'Raw web server logs for the domains on this account.')}>
-          <PanelCapabilityState error={missing} onRetry={refetch} />
+        <Card title={t('panel.logs.choose_title', 'Choose a log')} subtitle={missing ? fill(t('panel.logs.files_empty_capability', 'Log files appear here once {kind} is available on this server.'), { kind: kindLabel }) : t('panel.logs.choose_subtitle', 'Raw web server logs for the domains on this account.')}>
           <RequestError error={error} onRetry={refetch} />
           <div className="form-grid">
             <Field label={t('panel.logs.web_server', 'Web server')} htmlFor="logs-kind"><Select id="logs-kind" value={kind} onChange={(v) => { setKind(v); setFile(''); }} options={kindOptions} /></Field>
@@ -95,19 +96,19 @@ export default function AccessLogs({ fn }) {
         <RetentionCard disabled={Boolean(me?.actingAs)} />
       </div>
 
-      <Card title={file ? fill(t('panel.logs.tail_of', 'Tail of {file}'), { file }) : t('panel.logs.log_view', 'Log view')} subtitle={tail.data ? `${tail.data.truncated ? t('panel.logs.last', 'Last') : t('panel.logs.all', 'All')} ${fill(t('panel.logs.bytes_of', '{shown} of {total}'), { shown: formatBytes(tail.data.length), total: formatBytes(tail.data.size) })}${tail.data.mtime ? ` · ${updated(tail.data.mtime)}` : ''}` : undefined}
+      {!missing && <Card title={file ? fill(t('panel.logs.tail_of', 'Tail of {file}'), { file }) : t('panel.logs.log_view', 'Log view')} subtitle={tail.data ? `${tail.data.truncated ? t('panel.logs.last', 'Last') : t('panel.logs.all', 'All')} ${fill(t('panel.logs.bytes_of', '{shown} of {total}'), { shown: formatBytes(tail.data.length), total: formatBytes(tail.data.size) })}${tail.data.mtime ? ` · ${updated(tail.data.mtime)}` : ''}` : undefined}
         actions={tail.data && <span className="muted small">{plural(t, 'panel.logs.lines', lines.length, '{count} line', '{count} lines')}{live ? ` · ${t('panel.logs.following', 'following')}` : ''}</span>}>
-        <PanelCapabilityState error={missing || tail.error} onRetry={missing ? refetch : tail.refetch} />
+        <PanelCapabilityState error={tail.error} onRetry={tail.refetch} />
         <RequestError error={tail.error} onRetry={tail.refetch} />
-        {!file && !missing && (
+        {!file && (
           <EmptyState icon={ScrollText} title={t('panel.logs.nothing_selected', 'Nothing selected')}><p>{t('panel.logs.nothing_selected_text', 'Choose a domain and a log file above. The last part of the file shows here and can be followed live.')}</p>{data && !data.files?.length && <p className="muted">{t('panel.logs.no_files_yet', 'No log files exist yet. The web server writes the first lines when a visitor opens one of your domains.')}</p>}</EmptyState>
         )}
         {file && tail.data && tail.data.size === 0 && <EmptyState icon={ScrollText} title={t('panel.logs.empty_log', 'This log is empty')}><p>{t('panel.logs.empty_log_text', 'Requests appear here as soon as the web server records them.')}</p></EmptyState>}
         {file && tail.data && tail.data.size > 0 && <pre className="log">{tail.data.content}</pre>}
         {file && tail.loading && !tail.data && <p className="muted">{t('panel.logs.reading', 'Reading the log…')}</p>}
-      </Card>
+      </Card>}
 
-      <Card title={t('panel.logs.files_title', 'Log files')} subtitle={data?.files?.length ? plural(t, 'panel.logs.files_count', data.files.length, '{count} file for {domain}', '{count} files for {domain}', { domain: domain || t('panel.logs.all_domains_lower', 'all domains') }) : undefined} padded={false}>
+      {!missing && <Card title={t('panel.logs.files_title', 'Log files')} subtitle={data?.files?.length ? plural(t, 'panel.logs.files_count', data.files.length, '{count} file for {domain}', '{count} files for {domain}', { domain: domain || t('panel.logs.all_domains_lower', 'all domains') }) : undefined} padded={false}>
         <DataTable
           columns={[
             { key: 'name', label: t('panel.logs.col_file', 'File'), render: (f) => <code>{f.name}</code> },
@@ -121,9 +122,9 @@ export default function AccessLogs({ fn }) {
             { label: t('panel.logs.view', 'View'), primary: true, onClick: () => { setFile(f.name); window.scrollTo({ top: 0, behavior: 'smooth' }); } },
             { label: t('common.download', 'Download'), onClick: () => { window.location.href = downloadHref(kind, f.name); } },
           ]}
-          emptyText={missing ? fill(t('panel.logs.files_empty_capability', 'Log files appear here once {kind} is available on this server.'), { kind: kindLabel }) : t('panel.logs.files_empty', 'No log files yet. The web server creates one per domain once it has served a request; archived months land in your logs folder.')}
+          emptyText={t('panel.logs.files_empty', 'No log files yet. The web server creates one per domain once it has served a request; archived months land in your logs folder.')}
         />
-      </Card>
+      </Card>}
     </PanelPage>
   );
 }

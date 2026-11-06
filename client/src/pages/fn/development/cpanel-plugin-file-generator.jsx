@@ -72,7 +72,7 @@ export default function CpanelPluginFileGenerator({ fn }) {
           </Card>
           <Card title="Permissions" subtitle="Each scope is shown to the administrator on the consent screen when the plugin is installed. Scopes implied by the options above are added automatically.">
             <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))' }}>
-              {vocab.data.permissions.map((p) => <label key={p.scope} className="radio"><input type="checkbox" checked={form.permissions.includes(p.scope)} onChange={() => togglePerm(p.scope)} /> <span><strong><code>{p.scope}</code></strong><small>{p.description}</small></span></label>)}
+              {vocab.data.permissions.map((p) => <label key={p.scope} className="radio" style={{ alignItems: 'center', minHeight: 48, padding: '6px 0' }}><input type="checkbox" checked={form.permissions.includes(p.scope)} onChange={() => togglePerm(p.scope)} style={{ marginTop: 0 }} /> <span><strong><code>{p.scope}</code></strong><small>{p.description}</small></span></label>)}
             </div>
             <p className="small muted">Parameterised scopes (<code>agent:op:&lt;family.op&gt;</code>, <code>net:outbound:&lt;host&gt;</code>) can be added to plugin.json by hand after generation.</p>
           </Card>

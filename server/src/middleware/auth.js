@@ -70,6 +70,11 @@ export function attachUser(ctx) {
   };
 }
 
+// Account users enrol through the panel's own two-factor routes, so a session
+// flagged by the core policy must still reach /me (the shell's redirect
+// decision) and those routes, or the panel shell loops on 403.
+const PANEL_ENROLMENT_OPEN = (mounted) => mounted === '/api/panel/me' || mounted.startsWith('/api/panel/security/two-factor');
+
 export function requireAuth(req, _res, next) {
   if (!req.user) return next(unauthorized());
   const mounted = req.baseUrl + req.path;
@@ -81,7 +86,7 @@ export function requireAuth(req, _res, next) {
   if (req.user.must_change_password && !mounted.includes('/auth/')) {
     return next(forbidden('You must change your password before continuing'));
   }
-  if (req.session?.mustEnroll2fa && !mounted.includes('/auth/')) {
+  if (req.session?.mustEnroll2fa && !mounted.includes('/auth/') && !PANEL_ENROLMENT_OPEN(mounted)) {
     return next(new HttpError(403, 'two_factor_required', 'The server security policy requires two-factor authentication for your role. Set it up to continue.'));
   }
   next();

@@ -73,7 +73,7 @@ export default function Preferences({ fn }) {
     <PanelPage fn={fn}>
       {!me && <Loading />}
       {me && (
-        <div className="grid-2">
+        <div className="grid-2" style={{ alignItems: 'start' }}>
           <Card title={t('panel.overview.contact', 'Contact information')} subtitle={t('panel.overview.contact_help', 'Where the server reaches you: password resets and the notices below go to these addresses.')}>
             <form onSubmit={saveContact}>
               <ErrorBanner error={error?.fields ? null : error} />
@@ -100,7 +100,10 @@ export default function Preferences({ fn }) {
           </Card>
           <Card title={t('panel.overview.language', 'Language')} subtitle={t('panel.overview.language_help', 'The language of this panel for your login. The server default applies until you pick one.')}>
             {actingAs ? (
-              <KeyValue items={[[t('panel.overview.language', 'Language'), prefs?.locale || t('panel.overview.server_default', 'Server default')], [t('panel.overview.note', 'Note'), t('panel.overview.language_acting', 'The language belongs to the account login and is not changed while logged in as the account.')]]} />
+              <>
+                <KeyValue items={[[t('panel.overview.language', 'Language'), prefs?.locale || t('panel.overview.server_default', 'Server default')]]} />
+                <p className="muted" style={{ marginTop: 10, marginBottom: 0 }}>{t('panel.overview.language_acting', 'The language belongs to the account login and is not changed while logged in as the account.')}</p>
+              </>
             ) : (
               <form onSubmit={saveLocale}>
                 <Field label={t('panel.overview.language', 'Language')} htmlFor="pref-locale" error={error?.fields?.locale}>

@@ -4,6 +4,8 @@ import { PageHeader, Card, KeyValue, formatBytes } from '../../../components/Com
 import { Button } from '../../../components/Form.jsx';
 import { RequestError, WindowSelect, StatGrid, LogNote } from '../../email/Shared.jsx';
 
+const isCapabilityError = (err) => Boolean(err) && (err.status === 501 || err.code === 'capability_missing' || err.code === 'binary_not_found');
+
 function Bar({ value, max }) {
   const pct = max ? Math.round((value / max) * 100) : 0;
   return <div className="progress-bar" style={{ minWidth: 120 }}><span style={{ width: `${pct}%` }} /></div>;
@@ -17,8 +19,8 @@ export default function ViewMailStatisticsSummary({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Mail volume on this server from the Exim main log: messages received, deliveries, failures, deferrals and SMTP-time rejections, by hour and by destination domain." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
-      <Card><div className="form-narrow"><WindowSelect value={hours} onChange={setHours} /></div></Card>
       <RequestError error={error} onRetry={refetch} />
+      {!isCapabilityError(error) && <Card><div className="form-narrow"><WindowSelect value={hours} onChange={setHours} /></div></Card>}
       {loading && !data && <p className="muted">Scanning the log…</p>}
       {t && (
         <>

@@ -139,8 +139,8 @@ export function TicketList({ refreshKey = 0, onOpen }) {
     { key: 'created_at', label: 'Opened', sortable: true, render: (r) => formatDate(r.createdAt) },
   ];
   return (
-    <Card title="Tickets" subtitle="Every ticket opened from this server, whether or not it could be emailed." actions={<Button size="sm" icon={RefreshCw} onClick={() => refetch()}>Refresh</Button>}>
-      <RequestError error={error} onRetry={refetch} />
+    <Card title="Tickets" subtitle="Every ticket opened from this server, whether or not it could be emailed." actions={<Button size="sm" icon={RefreshCw} onClick={() => refetch()}>Refresh</Button>} padded={false}>
+      {error && <div className="card-body"><RequestError error={error} onRetry={refetch} /></div>}
       <DataTable columns={columns} rows={data || []} loading={loading} total={meta?.total} page={table.state.page} pageSize={table.state.pageSize} onPageChange={table.setPage}
         sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Search subject or reference…"
         emptyText="No tickets yet. Tickets opened from this server will be listed here."

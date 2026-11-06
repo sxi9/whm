@@ -75,7 +75,7 @@ export default function EmailRoutingConfiguration({ fn }) {
             { key: 'mx', label: 'MX records', render: (r) => (r.mx.length ? <code className="small">{r.mx.map((m) => `${m.priority} ${m.value}`).join(', ')}</code> : <span className="muted">none</span>) },
           ]}
           rows={rows} loading={loading} error={error} rowKey={(r) => r.domain} emptyText="No zones yet. Each zone appears here with its mail routing once one is added."
-          toolbar={<TextInput value={filter} onChange={setFilter} placeholder="Filter domains" style={{ width: 220 }} />}
+          searchable q={filter} onSearch={setFilter} searchPlaceholder="Filter domains"
           rowActions={(r) => [{ label: 'Configure', primary: true, onClick: () => setEditing(r) }]}
         />
       </Card>

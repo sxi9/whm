@@ -100,10 +100,8 @@ export default function ModifyNews({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} actions={<Button variant="primary" onClick={() => setEditing(null)}>New item</Button>}>
-        <p className="muted">{isRoot ? 'Items appear at the top of the Home dashboard for the chosen audience while they are enabled and inside their time window.' : 'Items appear at the top of the Home dashboard of the accounts you own while they are enabled and inside their time window (Modify News privilege).'} Users can dismiss information and warnings per browser; critical items stay until you hide them.</p>
-      </PageHeader>
-      <Card padded={false} title="News items" actions={(
+      <PageHeader fn={fn} actions={<Button variant="primary" onClick={() => setEditing(null)}>New item</Button>} />
+      <Card padded={false} title="News items" subtitle={`${isRoot ? 'Shown at the top of the Home dashboard for the chosen audience' : 'Shown at the top of the Home dashboard of the accounts you own'} while enabled and inside the time window. Users can dismiss information and warnings; critical items stay until hidden.`} actions={(
         <Select value={status} onChange={setStatus} options={[{ value: 'active', label: 'Active' }, { value: 'scheduled', label: 'Scheduled' }, { value: 'expired', label: 'Expired' }, { value: 'disabled', label: 'Disabled' }]} placeholder="All statuses" />
       )}>
         {!list.loading && !list.error && rows.length === 0 && !q && !status ? (

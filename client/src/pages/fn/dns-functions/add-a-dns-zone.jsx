@@ -61,8 +61,8 @@ export default function AddDnsZone({ fn }) {
             {user.role === 'root' && <Field label="Template" error={error?.fields?.template}><Select value={form.template} onChange={set('template')} options={(templates || [{ name: 'standard' }]).map((t) => t.name)} /></Field>}
             <Field label="Default TTL" error={error?.fields?.ttl} help="Blank = server default"><NumberInput value={form.ttl} onChange={set('ttl')} min={0} placeholder="14400" /></Field>
           </div>
+          <FormActions><Button type="submit" variant="primary" loading={loading}>Add zone</Button></FormActions>
         </Card>
-        <FormActions><Button type="submit" variant="primary" loading={loading}>Add zone</Button></FormActions>
       </form>
     </>
   );

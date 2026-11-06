@@ -49,8 +49,8 @@ export default function RebuildTheIpAddressPool({ fn }) {
         )}
       </Card>
       <IpRequestError error={error} onRetry={refetch} />
-      {data && <Summary items={[['Total', data.length], ['Main', states.main || 0], ['Shared', states.shared || 0], ['Dedicated', states.dedicated || 0], ['Reserved', states.reserved || 0], ['Free', states.free || 0], ['Dynamic', states.unmanaged || 0], ['Not on host', states.missing || 0]]} />}
-      <Card title="IP address pool" subtitle="State of every address after the last rebuild" padded={false}>
+      {data && <Summary items={[['Total', data.length], ['Main', states.main || 0], ['Shared', states.shared || 0], ['Dedicated', states.dedicated || 0], ['Reserved', states.reserved || 0], ['Free', states.free || 0]]} />}
+      <Card title="IP address pool" subtitle={data ? `State of every address after the last rebuild · ${states.unmanaged || 0} dynamic · ${states.missing || 0} not on host` : 'State of every address after the last rebuild'} padded={false}>
         <DataTable
           columns={[
             { key: 'address', label: 'Address', render: (r) => <code>{r.address}</code> },

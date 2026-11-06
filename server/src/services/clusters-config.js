@@ -119,6 +119,7 @@ def('tweak', 'tweak.max_emails_per_hour', int(0, 1_000_000));
 def('tweak', 'tweak.prevent_unlimited_bandwidth', bool);
 
 def('security', 'security.2fa.required_for_root', bool);
+def('security', 'security.2fa.required_for_users', bool);
 def('security', 'security.cphulk.block_denylist_permanently', bool, 'cphulk');
 def('security', 'security.cphulk.enabled', bool, 'cphulk');
 def('security', 'security.cphulk.firewall_sync', bool, 'cphulk');

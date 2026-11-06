@@ -39,7 +39,7 @@ export function ChangePasswordPage() {
       <Card>
         <form onSubmit={submit} className="form-narrow">
           <ErrorBanner error={error} />
-          {!forced && <Field label="Current password"><TextInput type="password" value={current} onChange={setCurrent} autoComplete="current-password" required /></Field>}
+          {!forced && <Field label="Current password" required><TextInput type="password" value={current} onChange={setCurrent} autoComplete="current-password" required /></Field>}
           <Field label="New password" required><PasswordInput value={next} onChange={setNext} /></Field>
           <Field label="Confirm new password" required><TextInput type="password" value={confirm} onChange={setConfirm} autoComplete="new-password" required /></Field>
           <FormActions><Button type="submit" variant="primary" loading={loading}>Change password</Button></FormActions>

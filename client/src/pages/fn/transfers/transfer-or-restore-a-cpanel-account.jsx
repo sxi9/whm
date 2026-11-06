@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, StatusPill, CapabilityNotice, KeyValue, formatDate, formatBytes } from '../../../components/Common.jsx';
+import { PageHeader, Card, StatusPill, CapabilityNotice, KeyValue, formatDate, formatBytes, RefreshButton } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Field, TextInput, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { Upload } from 'lucide-react';
@@ -110,7 +110,7 @@ function PickArchive({ caps, onInstalled, onInspected }) {
     <>
       <ToolingNotice caps={caps} needs={['tar']} onInstalled={onInstalled} />
       <Uploader onInspected={onInspected} />
-      <Card title="Archives on this server" subtitle={data ? `Looking in ${data.dirs.join(', ')}` : undefined} padded={false} actions={<Button size="sm" variant="ghost" onClick={() => refetch()}>Refresh</Button>}>
+      <Card title="Archives on this server" subtitle={data ? `Looking in ${data.dirs.join(', ')}` : undefined} padded={false} actions={<RefreshButton size="sm" onClick={() => refetch()} />}>
         <ErrorBanner error={error} onRetry={refetch} />
         <CapabilityNotice error={inspectError} />
         {inspectError && inspectError.status !== 501 && <ErrorBanner error={inspectError} />}

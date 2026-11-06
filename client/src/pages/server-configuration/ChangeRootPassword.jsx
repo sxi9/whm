@@ -37,7 +37,7 @@ export default function ChangeRootPassword({ fn }) {
           <ErrorBanner error={error} />
           <Field label="New root password" required><PasswordInput value={password} onChange={setPassword} /></Field>
           <Field label="Confirm new password" required><TextInput type="password" value={confirmPw} onChange={setConfirmPw} autoComplete="new-password" /></Field>
-          <FormActions><Button type="submit" variant="danger" loading={busy}>Change root password</Button></FormActions>
+          <FormActions><Button type="submit" variant="primary" loading={busy}>Change root password</Button></FormActions>
         </form>
       </Card>
     </>

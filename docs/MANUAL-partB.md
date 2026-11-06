@@ -385,6 +385,17 @@ panel's own data lives in SQLite, so these pages work even when MySQL is down.
 - **Screen:** *Allow a remote host* (host, IP, or wildcard such as `203.0.113.%` / `%.example.com`, *Scope*);
   list with *Remove host*.
 - **Server:** `POST /access-hosts` re-provisions the account's users at the new host; `DELETE` drops them.
+- **PostgreSQL (local profile):** there are no per-host users; the panel keeps one managed block per account at
+  the end of `pg_hba.conf` (`# BEGIN Keel remote access: <account>` … `# END …`), one
+  `host <databases> <users> <address> scram-sha-256` line per host, written through the agent (`SHOW hba_file`,
+  else the newest cluster under `/etc/postgresql` or `/var/lib/pgsql`) and applied with `pg_reload_conf()`. Hosts
+  are IPs, CIDR networks, host names or `.domain` suffixes; `%` means `all` and `203.0.113.%` becomes
+  `203.0.113.0/24`. The block is rewritten when the account's databases or users change (the file lists them by
+  name; the `<account>_` prefix is enforced by the op). The file keeps its owner and mode and a `.whm-bak` copy
+  is left beside it. A remote PostgreSQL profile answers `422 unsupported`. **Operator steps:** set
+  `listen_addresses` in `postgresql.conf` and open port 5432 in the firewall for the allowed sources — the panel
+  never changes either; keep `password_encryption = scram-sha-256` (the default since PostgreSQL 14) or roles created
+  earlier with MD5 will not match the block's method.
 
 #### 20.6 Manage Database Profiles
 

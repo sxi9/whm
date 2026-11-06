@@ -43,11 +43,11 @@ export default function ResetAccountBandwidthLimit({ fn }) {
             { key: 'bandwidth_limit_mb', label: 'Limit', align: 'right', render: (r) => formatMb(r.bandwidth_limit_mb) },
             { key: 'status', label: 'Status', render: (r) => <StatusPill status={r.suspended ? 'suspended' : r.over_bandwidth ? 'warning' : 'active'}>{r.suspended ? `Suspended${/^bandwidth/i.test(r.suspend_reason || '') ? ' (bandwidth)' : ''}` : r.over_bandwidth ? 'Over limit' : 'Active'}</StatusPill> },
           ]}
-          rows={data || []} loading={loading} rowKey={(r) => r.username} selectable selected={selected} onSelectedChange={setSelected}
+          rows={data || []} loading={loading} rowKey={(r) => r.username} selectable selected={selected} onSelectedChange={setSelected} emptyText="No accounts yet. Accounts you create appear here."
           rowActions={(r) => [{ label: 'Reset', primary: true, onClick: () => reset([r.username]) }]}
           toolbar={(
             <>
-              <Toggle checked={unsuspend} onChange={setUnsuspend} label="Unsuspend bandwidth-suspended accounts" />
+              <span style={{ marginRight: 16 }}><Toggle checked={unsuspend} onChange={setUnsuspend} label="Unsuspend bandwidth-suspended accounts" /></span>
               <Button variant="primary" disabled={!selected.length} loading={busy} onClick={() => reset(selected)}>Reset selected ({selected.length})</Button>
               <Button loading={busy} disabled={!data?.length} onClick={() => reset([], true)}>Reset all</Button>
             </>

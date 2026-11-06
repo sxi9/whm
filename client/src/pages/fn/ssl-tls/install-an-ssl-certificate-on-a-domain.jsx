@@ -61,7 +61,7 @@ export default function InstallCertificate({ fn }) {
     <>
       <PageHeader fn={fn} />
       <RequestError error={domains.error} onRetry={domains.refetch} />
-      <div className="form-grid">
+      <div className="form-grid" style={{ alignItems: 'start' }}>
         <Card title="Domain">
           <Field label="Install on" required error={error?.fields?.domain}><DomainSelect value={form.domain} onChange={(v) => setForm({ ...form, domain: v, certId: '' })} /></Field>
           {form.domain && (
@@ -74,6 +74,10 @@ export default function InstallCertificate({ fn }) {
             <Select value={form.certId} onChange={pickStored} placeholder="Paste a certificate instead" options={candidates.map((c) => ({ value: String(c.id), label: `#${c.id} ${c.domain} · ${c.selfSigned ? 'self-signed' : c.issuer || 'unknown issuer'} · expires ${c.notAfter ? c.notAfter.slice(0, 10) : '?'}${c.hasKey ? '' : ' (no key stored)'}` }))} />
           </Field>
           <Field inline><Toggle checked={form.force} onChange={(v) => setForm({ ...form, force: v })} label="Install even if the certificate does not cover this domain or has expired" /></Field>
+          <FormActions>
+            <Button variant="primary" loading={busy} disabled={!form.domain || (!form.certId && !form.certPem.trim())} onClick={install}>Install</Button>
+            <Link className="btn" to="/ssl-tls/manage-ssl-hosts">Manage SSL hosts</Link>
+          </FormActions>
         </Card>
         <Card title="Or paste the certificate" subtitle="The private key is optional when a matching key is already stored for one of your accounts.">
           <Field label="Certificate (PEM)" error={error?.fields?.certPem}><Textarea value={form.certPem} onChange={(v) => setForm({ ...form, certPem: v, certId: '' })} rows={6} mono placeholder="-----BEGIN CERTIFICATE-----" disabled={Boolean(form.certId)} /></Field>
@@ -83,11 +87,7 @@ export default function InstallCertificate({ fn }) {
       </div>
       {preview && !preview.error && <Card title="Certificate preview"><CertificateSummary certificate={preview.certificate} chain={preview.chain} /></Card>}
       {preview?.error && <ErrorBanner error={preview.error} />}
-      <Card>
-        <FormActions>
-          <Button variant="primary" loading={busy} disabled={!form.domain || (!form.certId && !form.certPem.trim())} onClick={install}>Install</Button>
-          <Link className="btn" to="/ssl-tls/manage-ssl-hosts">Manage SSL hosts</Link>
-        </FormActions>
+      {(error || result) && <Card title="Result">
         {error && error.status === 422 && !error.fields?.domain && !error.fields?.certPem && !error.fields?.keyPem && <ErrorBanner error={error} />}
         {error && error.status !== 422 && <RequestError error={error} />}
         {result && (
@@ -100,7 +100,7 @@ export default function InstallCertificate({ fn }) {
             <CertificateSummary certificate={result.certificate} />
           </div>
         )}
-      </Card>
+      </Card>}
     </>
   );
 }

@@ -46,7 +46,7 @@ export function createPanelSecurityService(ctx) {
     if (req?.audit) req.audit(entry); else ctx.auditRecord?.(req ?? null, entry);
   };
   const op = (name, args, req) => agent.op(name, args, { req });
-  const require2fa = () => Boolean(settings.get('panel.require_2fa_for_users', false));
+  const require2fa = () => Boolean(settings.get('panel.require_2fa_for_users', false)) || Boolean(settings.get('security.2fa.required_for_users', false));
 
   function requireScopeShape(scope) {
     if (!scope?.username || !scope.accountId) throw new HttpError(403, 'panel_scope_required', 'No hosting account is bound to this session');

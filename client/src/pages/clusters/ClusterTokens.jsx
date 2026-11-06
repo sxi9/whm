@@ -8,8 +8,8 @@ import { Modal, useConfirm } from '../../components/Modal.jsx';
 import { useToast } from '../../components/Toast.jsx';
 
 const PURPOSE = {
-  dns: { label: 'zones', title: 'Tokens for remote panels (zones)', can: 'push zones to', issued: 'under Clusters > DNS Cluster', endpoints: 'ping, receiving zones and the zone import' },
-  config: { label: 'settings', title: 'Tokens for remote panels (settings)', can: 'exchange settings with', issued: 'under Clusters > Configuration Cluster', endpoints: 'ping, serving an export and receiving settings' },
+  dns: { label: 'zones', title: 'Zone tokens for peers', can: 'push zones to', issued: 'under Clusters > DNS Cluster', endpoints: 'ping, receiving zones and the zone import' },
+  config: { label: 'settings', title: 'Settings tokens for peers', can: 'exchange settings with', issued: 'under Clusters > Configuration Cluster', endpoints: 'ping, serving an export and receiving settings' },
 };
 
 // Tokens other panels use to reach this one. Each carries one purpose (zones
@@ -52,7 +52,7 @@ export function ClusterTokens({ tokens, hostname, purpose = 'dns', onChanged }) 
 
   return (
     <>
-      <Card title={p.title} subtitle={`A peer that wants to ${p.can} ${hostname || 'this server'} authenticates with one of these. Issue one per peer so each can be revoked on its own. A ${p.label} token is confined to ${p.endpoints}; every other API, including the other cluster's endpoints, answers it with 403.${purpose === 'dns' ? ' Tokens issued before the split (marked legacy) keep pushing zones only; reissue them when convenient.' : ''}`} padded={false}
+      <Card title={p.title} subtitle={`Issued to peers that ${p.can} ${hostname || 'this server'}; one per peer so each can be revoked on its own.`} padded={false}
         actions={<Button size="sm" icon={KeyRound} onClick={() => { setIssued(null); setError(null); setOpen(true); }}>Issue token</Button>}>
         <DataTable dense rows={tokens || []} rowKey={(t) => t.id} emptyText="No tokens issued yet. Each token you issue appears here with the peer it acts as, when it was last used and when it expires."
           columns={[

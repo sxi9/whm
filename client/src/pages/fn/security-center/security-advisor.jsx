@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, EmptyState, StatusPill, formatDate } from '../../../components/Common.jsx';
-import { Button, Textarea, ErrorBanner } from '../../../components/Form.jsx';
+import { Button, Textarea, ErrorBanner, FormActions } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, GradePill, FixLink } from '../../security/Shared.jsx';
@@ -50,6 +50,7 @@ export function AdvisoryListEditor({ value, onSave, saving = false }) {
   const [error, setError] = useState(null);
   useEffect(() => { setText(JSON.stringify(value ?? [], null, 2)); }, [value]);
   const count = Array.isArray(value) ? value.length : 0;
+  const dirty = text !== JSON.stringify(value ?? [], null, 2);
   const save = () => {
     let parsed;
     try { parsed = JSON.parse(text); } catch (err) { setError(new Error(`Not valid JSON: ${err.message}`)); return; }
@@ -58,10 +59,15 @@ export function AdvisoryListEditor({ value, onSave, saving = false }) {
     onSave(parsed);
   };
   return (
-    <Card title="PHP advisory list" subtitle={`${count} advisor${count === 1 ? 'y' : 'ies'} on file. Each entry: id, title, severity (critical, high, medium, low), published, url, affected ({ "8.3": "<8.3.36" }, "*" for a whole branch), fixedIn ({ "8.3": "8.3.36" }), note. Seeded from php.net's advisories of 21 and 23 October 2026.`} actions={<Button variant="primary" loading={saving} onClick={save}>Save list</Button>}>
+    <Card title="PHP advisory list" subtitle={`${count} advisor${count === 1 ? 'y' : 'ies'} on file, seeded from php.net.`}>
       <div id="advisories" />
       <Textarea mono rows={12} value={text} onChange={setText} aria-label="Advisory list JSON" />
+      <details className="small muted" style={{ marginTop: 8 }}>
+        <summary>Format</summary>
+        <p>A JSON array; each entry has <code>id</code>, <code>title</code>, <code>severity</code> (critical, high, medium, low), <code>published</code>, <code>url</code>, <code>affected</code> (<code>{'{ "8.3": "<8.3.36" }'}</code>, <code>"*"</code> for a whole branch), <code>fixedIn</code> (<code>{'{ "8.3": "8.3.36" }'}</code>) and <code>note</code>. Entries without an id are skipped by the scanner.</p>
+      </details>
       <ErrorBanner error={error} />
+      <FormActions><Button loading={saving} disabled={!dirty} onClick={save}>Save list</Button></FormActions>
     </Card>
   );
 }

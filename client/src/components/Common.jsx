@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import { Star, AlertTriangle, Download, Info } from 'lucide-react';
+import { Star, AlertTriangle, Download, Info, RefreshCw } from 'lucide-react';
 import { useFavorites } from '../hooks/useFavorites.js';
 import { useT } from '../i18n/useT.js';
 import { useShell } from '../panel/ShellContext.js';
@@ -78,8 +78,15 @@ export function EmptyState({ title, children, icon: Icon = Info }) {
   );
 }
 
+// The one Refresh control for page and card headers in both shells.
+export function RefreshButton({ onClick, loading = false, size, children = 'Refresh', ...rest }) {
+  return <button type="button" className={`btn ${size ? `btn-${size}` : ''} ${loading ? 'is-loading' : ''}`} onClick={onClick} disabled={loading || rest.disabled} {...rest}>{loading ? <span className="spinner" /> : <RefreshCw size={16} />}{children}</button>;
+}
+
 // Shown when the API says the feature's daemon is missing on this host.
-export function CapabilityNotice({ error, onRetry, packages }) {
+// Pages whose header already carries a Refresh pass showRetry={false} so the
+// same check is not offered twice.
+export function CapabilityNotice({ error, onRetry, packages, showRetry = true }) {
   if (!error) return null;
   if (error.code !== 'capability_missing' && error.code !== 'binary_not_found' && error.status !== 501) return null;
   const names = normalizePackages(packages);
@@ -93,15 +100,17 @@ export function CapabilityNotice({ error, onRetry, packages }) {
           ? <div style={{ marginTop: 6 }}><InstallPackages packages={names} onFinished={onRetry} /> <span className="muted small">The rest of the panel keeps working meanwhile.</span></div>
           : <p className="muted">Install the required software on this server (<Link to="/software/install-distro-packages?tab=search">Install Software</Link>) and refresh. The rest of the panel keeps working.</p>}
       </div>
-      {onRetry && <button className="btn btn-sm" onClick={onRetry}>Re-check</button>}
+      {onRetry && showRetry && <button className="btn btn-sm" onClick={onRetry}>Re-check</button>}
     </div>
   );
 }
 
-export function KeyValue({ items }) {
+// prose: values are sentences, so they read left-aligned next to the label
+// instead of as right-aligned paragraphs; a third tuple element `prose` marks one row.
+export function KeyValue({ items, prose = false, className = '' }) {
   return (
-    <dl className="kv">
-      {items.filter(Boolean).map(([k, v]) => <div key={k}><dt>{k}</dt><dd>{v ?? <span className="muted">—</span>}</dd></div>)}
+    <dl className={`kv ${prose ? 'kv-prose' : ''} ${className}`}>
+      {items.filter(Boolean).map(([k, v, rowProse]) => <div key={k}><dt>{k}</dt><dd className={rowProse ? 'prose' : undefined}>{v ?? <span className="muted">—</span>}</dd></div>)}
     </dl>
   );
 }

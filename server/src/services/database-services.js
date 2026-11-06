@@ -28,6 +28,30 @@ import { ssoEndpoint } from '../lib/sso-endpoint.js';
 export const PRIVILEGES = ['ALL PRIVILEGES', 'ALTER', 'ALTER ROUTINE', 'CREATE', 'CREATE ROUTINE', 'CREATE TEMPORARY TABLES', 'CREATE VIEW', 'DELETE', 'DROP', 'EVENT', 'EXECUTE', 'INDEX', 'INSERT', 'LOCK TABLES', 'REFERENCES', 'SELECT', 'SHOW VIEW', 'TRIGGER', 'UPDATE'];
 export const PG_PRIVILEGES = ['ALL PRIVILEGES', 'CONNECT', 'CREATE', 'TEMPORARY'];
 
+// An access host as pg_hba.conf takes it (contract §67): MySQL-style "%" patterns
+// on dotted quads become CIDR networks, "%" alone becomes "all"; IPs, CIDR
+// networks, host names and ".domain" suffixes pass through. Anything else
+// (a "%" inside a name, "_" wildcards) has no pg_hba.conf equivalent.
+export function pgHbaAddress(host) {
+  const h = String(host).trim();
+  if (h === '%') return 'all';
+  const dotted = h.match(/^(\d{1,3})(?:\.(\d{1,3}))?(?:\.(\d{1,3}))?\.%$/);
+  if (dotted) {
+    const octets = dotted.slice(1).filter((o) => o != null);
+    if (octets.some((o) => Number(o) > 255)) return null;
+    return `${[...octets, ...Array(4 - octets.length).fill('0')].join('.')}/${octets.length * 8}`;
+  }
+  if (h.includes('%') || h.includes('_')) return null;
+  if (net.isIP(h)) return h;
+  const cidr = h.match(/^(.+)\/(\d{1,3})$/);
+  if (cidr) {
+    const family = net.isIP(cidr[1]);
+    const bits = Number(cidr[2]);
+    return family && bits <= (family === 4 ? 32 : 128) ? h : null;
+  }
+  return /^\.?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/i.test(h) ? h.toLowerCase() : null;
+}
+
 // Tunables the configuration editor offers with inline help; any other [mysqld]
 // option can still be added by name.
 export const KNOWN_TUNABLES = [
@@ -372,6 +396,7 @@ export function createDatabaseServicesService(ctx) {
     const created = await run('database.create', args, req, profile);
     stmts.insertDb.run(account?.id ?? null, name, profile.id);
     req?.audit?.({ action: 'db.database.create', target: name, args: { account: account?.username ?? null, engine: profile.engine } });
+    await refreshPgHba(account, req, profile);
     return { ...created, name, account: account?.username ?? null, quota: account ? quotaFor(account) : null };
   }
 
@@ -384,6 +409,7 @@ export function createDatabaseServicesService(ctx) {
     const result = await run('database.drop', { name }, req, profile);
     stmts.deleteDb.run(name);
     req?.audit?.({ action: 'db.database.drop', target: name, args: { account: row?.account ?? null } });
+    if (row?.account_id != null) await refreshPgHba(stmts.accountById.get(row.account_id), req, profile);
     return { ...result, account: row?.account ?? null };
   }
 
@@ -469,6 +495,7 @@ export function createDatabaseServicesService(ctx) {
         throw err;
       }
     }
+    await refreshPgHba(account, req, profile);
     return { ...created, name, account: account?.username ?? null, hosts: isPg(profile) ? [] : hosts, grants, id: userId };
   }
 
@@ -489,6 +516,7 @@ export function createDatabaseServicesService(ctx) {
     const result = await run('user.drop', { user: name }, req, profile);
     stmts.deleteUser.run(name);
     req?.audit?.({ action: 'db.user.drop', target: name, args: { account: row?.account ?? null } });
+    if (row?.account_id != null) await refreshPgHba(stmts.accountById.get(row.account_id), req, profile);
     return { ...result, account: row?.account ?? null };
   }
 
@@ -691,6 +719,50 @@ export function createDatabaseServicesService(ctx) {
 
   // -------------------------------------------------------- access hosts ---
 
+  // PostgreSQL: remote access is a managed pg_hba.conf block per account, so it
+  // needs the server on this host (the file is local); a remote profile keeps
+  // the MySQL-only answer.
+  const pgHostsSupported = (profile) => Boolean(profile) && (!isPg(profile) || !isRemote(profile));
+
+  function assertPgHostsSupported(profile) {
+    if (!pgHostsSupported(profile)) throw new HttpError(422, 'unsupported', 'Remote access hosts need the PostgreSQL server on this host: its pg_hba.conf is edited here');
+  }
+
+  // Rewrites the account's pg_hba.conf block from `hosts` (default: its recorded
+  // and the global access hosts), its databases and its users. Addresses the
+  // file cannot express are skipped and reported.
+  async function syncPgHba(account, req, profile, hosts = null) {
+    const wanted = hosts ?? hostsFor(account.id).filter((h) => h !== 'localhost');
+    const addresses = [];
+    const skipped = [];
+    for (const h of wanted) {
+      const a = pgHbaAddress(h);
+      if (a) addresses.push(a); else skipped.push(h);
+    }
+    const databases = stmts.dbsForAccount.all(account.id).map((d) => d.name);
+    const users = stmts.usersForAccount.all(account.id).map((u) => u.name);
+    const args = { username: account.username, hosts: [...new Set(addresses)], databases, users };
+    const creds = credsFor(profile);
+    let result;
+    try {
+      result = await agent.op('db.pg.hba.write', creds ? { ...args, credentials: creds } : args, { req });
+    } catch (err) {
+      throw translateError(err, profile);
+    }
+    return { ...result, skipped };
+  }
+
+  // After a database or user of an account came or went on PostgreSQL: the
+  // block lists objects by name. A failure here never undoes the object; it is
+  // logged and the next access-host change rewrites the block anyway.
+  async function refreshPgHba(account, req, profile) {
+    if (!account || !isPg(profile) || isRemote(profile)) return;
+    if (!hostsFor(account.id).some((h) => h !== 'localhost')) return;
+    try { await syncPgHba(account, req, profile); } catch (err) { logger.warn({ err, account: account.username }, 'could not refresh the pg_hba.conf block of the account'); }
+  }
+
+  const accountsWithObjects = () => [...new Set([...stmts.dbRows.all(), ...stmts.userRows.all()].map((r) => r.account_id).filter((id) => id != null))].map((id) => stmts.accountById.get(id)).filter(Boolean);
+
   // Resellers see their own accounts' hosts plus the global ones (read-only for
   // them), since their users are provisioned at both.
   function listAccessHosts(query, user) {
@@ -698,7 +770,7 @@ export function createDatabaseServicesService(ctx) {
     if (!isRoot(user)) rows = rows.filter((r) => r.account_id == null || r.owner_id === user.id);
     if (query.account) rows = rows.filter((r) => r.account === query.account || (r.account_id == null && !isRoot(user)));
     const profile = activeRow();
-    return { data: rows.map(({ owner_id, ...r }) => ({ ...r, scope: r.account_id == null ? 'global' : 'account', editable: isRoot(user) || r.account_id != null })), meta: { total: rows.length, engine: profile?.engine ?? null, supported: profile ? !isPg(profile) : false } };
+    return { data: rows.map(({ owner_id, ...r }) => ({ ...r, scope: r.account_id == null ? 'global' : 'account', editable: isRoot(user) || r.account_id != null })), meta: { total: rows.length, engine: profile?.engine ?? null, supported: pgHostsSupported(profile) } };
   }
 
   async function addAccessHost(input, user, req) {
@@ -712,7 +784,18 @@ export function createDatabaseServicesService(ctx) {
     const users = account ? stmts.usersForAccount.all(account.id) : stmts.userRows.all().filter((u) => u.account_id != null);
     const applied = [];
     const failed = [];
-    if (!isPg(profile)) {
+    if (isPg(profile)) {
+      assertPgHostsSupported(profile);
+      if (!pgHbaAddress(host)) throw badRequest(`"${host}" cannot be expressed in pg_hba.conf: use an IP address, a network such as 203.0.113.0/24 (or 203.0.113.%), a host name or "%"`, { host: ['PostgreSQL takes IP addresses, CIDR networks, host names and ".domain" suffixes'] });
+      // Host first: every account the host applies to gets its block before the row exists.
+      for (const a of account ? [account] : accountsWithObjects()) {
+        const current = hostsFor(a.id).filter((h) => h !== 'localhost');
+        const r = await syncPgHba(a, req, profile, [...current, host]);
+        applied.push({ account: a.username, path: r.path, reloaded: r.reloaded, lines: r.lines });
+        if (r.reloadError) failed.push({ account: a.username, error: `pg_hba.conf written but not reloaded: ${r.reloadError}` });
+      }
+    } else {
+      if (host.includes('/')) throw badRequest(`"${host}": MySQL has no CIDR networks; use a pattern such as 203.0.113.%`, { host: ['Networks in CIDR form apply to PostgreSQL only'] });
       for (const u of users) {
         try {
           const existing = recordedHosts(u);
@@ -732,8 +815,8 @@ export function createDatabaseServicesService(ctx) {
       }
     }
     const { lastInsertRowid } = stmts.insertAccessHost.run(account?.id ?? null, host);
-    req?.audit?.({ action: 'db.access_host.add', target: host, args: { account: account?.username ?? null, users: applied.length, failed: failed.length } });
-    return { id: Number(lastInsertRowid), host, account: account?.username ?? null, scope: account ? 'account' : 'global', applied, failed, supported: !isPg(profile) };
+    req?.audit?.({ action: 'db.access_host.add', target: host, args: { account: account?.username ?? null, engine: profile.engine, users: applied.length, failed: failed.length } });
+    return { id: Number(lastInsertRowid), host, account: account?.username ?? null, scope: account ? 'account' : 'global', applied, failed, supported: pgHostsSupported(profile), ...(isPg(profile) ? { address: pgHbaAddress(host) } : {}) };
   }
 
   async function removeAccessHost(id, user, req) {
@@ -742,6 +825,19 @@ export function createDatabaseServicesService(ctx) {
     if (!row) throw notFound('Access host');
     if (row.account_id == null) assertRoot(user, 'Removing a global access host');
     else if (!isRoot(user) && row.owner_id !== user.id) throw forbidden('That access host belongs to another reseller');
+    if (isPg(profile) && !isRemote(profile)) {
+      await requireEngine(profile);
+      const rewritten = [];
+      for (const a of row.account_id != null ? [stmts.accountById.get(row.account_id)].filter(Boolean) : accountsWithObjects()) {
+        // Another rule (global vs per-account) may still grant the same host.
+        const remaining = stmts.accessHosts.all().filter((r) => r.id !== id && (r.account_id == null || r.account_id === a.id)).map((r) => r.host).filter((h) => h !== 'localhost');
+        await syncPgHba(a, req, profile, remaining);
+        rewritten.push(a.username);
+      }
+      stmts.deleteAccessHost.run(id);
+      req?.audit?.({ action: 'db.access_host.remove', target: row.host, args: { account: row.account ?? null, engine: 'postgres', accounts: rewritten.length } });
+      return { id, host: row.host, account: row.account ?? null, removedFrom: rewritten };
+    }
     // Only users the panel provisioned at this host are touched: a user that was
     // never cloned there (a failed add, or one adopted later) has nothing to drop.
     const users = isPg(profile) ? [] : stmts.usersAtHost.all({ host: row.host, account: row.account_id ?? null });

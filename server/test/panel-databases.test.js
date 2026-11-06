@@ -474,10 +474,33 @@ describe('/api/panel/databases', () => {
       const users = await get('/users').expect(200);
       expect(users.body.meta.engine).toBe('postgres');
       expect(users.body.data[0]).toMatchObject({ name: 'alice_app', hosts: [] });
+      // A local PostgreSQL profile supports remote hosts (pg_hba.conf, contract §67); without psql the add stops at 501.
       const hosts = await get('/access-hosts').expect(200);
-      expect(hosts.body).toEqual({ data: [], meta: { total: 0, engine: 'postgres', supported: false } });
-      expect((await post('/access-hosts', { host: '203.0.113.9' }).expect(422)).body.error.code).toBe('unsupported');
+      expect(hosts.body).toEqual({ data: [], meta: { total: 0, engine: 'postgres', supported: true } });
+      expect((await post('/access-hosts', { host: '203.0.113.9' }).expect(501)).body.error.code).toBe('capability_missing');
       expect((await post('/alice_shop/dump', {}).expect(501)).body.error.code).toBe('capability_missing');
+      const binaries = app.agent.ops['sys.binaries'];
+      const hba = [];
+      app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, n === 'psql' || binaries({ names: [n] })[n]])));
+      app.agent.set('db.pg.hba.write', (args) => { hba.push(args); return { path: '/etc/postgresql/16/main/pg_hba.conf', ...args, lines: args.hosts.length, changed: true, reloaded: true, reloadError: null }; });
+      await app.ctx.capabilities.refresh();
+      try {
+        const added = await post('/access-hosts', { host: '203.0.113.%' }).expect(201);
+        expect(added.body.data).toMatchObject({ host: '203.0.113.%', address: '203.0.113.0/24', scope: 'account', editable: true });
+        expect(hba.at(-1)).toMatchObject({ username: 'alice', hosts: ['203.0.113.0/24'], users: ['alice_app'] });
+        expect(hba.at(-1).databases).toEqual(expect.arrayContaining(['alice_shop']));
+        expect(hba.at(-1).databases.every((d) => d.startsWith('alice_'))).toBe(true);
+        expect((await post('/access-hosts', { host: 'bad_%name' }).expect(400)).body.error.message).toMatch(/pg_hba\.conf/);
+        expect((await get('/access-hosts').expect(200)).body.data.map((h) => h.host)).toEqual(['203.0.113.%']);
+        // Bob's plan has no postgres feature; with it, the row would still be 404 for him (the MySQL case above).
+        await del(`/access-hosts/${added.body.data.id}`, 'bob').expect(403);
+        await del(`/access-hosts/${added.body.data.id}`).expect(200);
+        expect(hba.at(-1)).toMatchObject({ username: 'alice', hosts: [] });
+        expect((await get('/access-hosts').expect(200)).body.data).toEqual([]);
+      } finally {
+        app.agent.set('sys.binaries', binaries);
+        await app.ctx.capabilities.refresh();
+      }
       const pma = await get('/phpmyadmin').expect(200);
       expect(pma.body.data).toMatchObject({ installed: false, url: null, engine: 'postgres' });
     } finally {

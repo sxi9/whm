@@ -59,4 +59,5 @@ export default function Forwarders({ fn }) {
 `GET /api/panel/me` → `{ user, account: { username, domain, ip, package, plan, features, limits,
 suspended, forcePasswordChange, demoMode, contactEmail, homeDir, shell, createdAt, domains[] },
 usage, counts, actingAs: null | { account, by, expiresAt }, policy: { require2fa,
-passwordSynced }, hostname, csrfToken }` — see `docs/design/customer-panel.md` §4.1.
+passwordSynced }, mustEnroll2fa, hostname, csrfToken }` — see `docs/design/customer-panel.md` §4.1
+(`require2fa` and `mustEnroll2fa` follow either 2FA switch, contract §66).

@@ -99,19 +99,17 @@ export default function ModifyUpgradeMultipleAccounts({ fn }) {
         <>
           <AccountSelector sel={sel} />
           <Card title="Changes to apply" subtitle="Tick a field to include it; untouched fields keep their per-account value">
-            <div className="form-grid">
+            <div className="form-grid" style={{ alignItems: 'start' }}>
               {FIELDS.filter((f) => !f.rootOnly || user.role === 'root').map((f) => (
-                <Field key={f.key} label={f.label} help={enabled[f.key] ? f.help : undefined} error={error?.fields?.[`changes.${f.key}`]}>
-                  <Toggle checked={Boolean(enabled[f.key])} onChange={(on) => toggle(f.key, on)} label={enabled[f.key] ? 'Change' : 'Keep per-account value'} />
+                <Field key={f.key} inline error={error?.fields?.[`changes.${f.key}`]}>
+                  <Toggle checked={Boolean(enabled[f.key])} onChange={(on) => toggle(f.key, on)} label={f.label} description={enabled[f.key] ? f.help : 'Keep per-account value'} />
                   {enabled[f.key] && <div style={{ marginTop: 6 }}>{control(f)}</div>}
                 </Field>
               ))}
-            </div>
-            {enabled.package && pkg && <p className="muted">Package <strong>{pkg.name}</strong>: {formatMb(pkg.disk_mb)} disk · {formatMb(pkg.bandwidth_mb)} bandwidth · shell {pkg.has_shell ? 'yes' : 'no'} · PHP {pkg.php_version || 'server default'} · {pkg.max_addons ?? 'unlimited'} addon domains · {pkg.max_db ?? 'unlimited'} databases</p>}
-            <div className="form-grid">
               <Field inline><Toggle checked={options.applyPhp} onChange={(v) => setOptions((o) => ({ ...o, applyPhp: v }))} label="Apply the package's PHP version to the virtual hosts" description="Only when a package is chosen and it pins a PHP version" /></Field>
               <Field inline><Toggle checked={options.requireDaemons} onChange={(v) => setOptions((o) => ({ ...o, requireDaemons: v }))} label="Require installed services" description="Refuse to start when quota tools or Apache are missing instead of leaving items pending" /></Field>
             </div>
+            {enabled.package && pkg && <p className="muted">Package <strong>{pkg.name}</strong>: {formatMb(pkg.disk_mb)} disk · {formatMb(pkg.bandwidth_mb)} bandwidth · shell {pkg.has_shell ? 'yes' : 'no'} · PHP {pkg.php_version || 'server default'} · {pkg.max_addons ?? 'unlimited'} addon domains · {pkg.max_db ?? 'unlimited'} databases</p>}
             <FormActions><Button variant="primary" loading={busy} disabled={!ready} onClick={runPreview}>Preview differences</Button></FormActions>
           </Card>
         </>

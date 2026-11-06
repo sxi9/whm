@@ -63,9 +63,9 @@ export default function LimitBandwidthUsage({ fn }) {
           columns={[
             { key: 'username', label: 'User', render: (r) => <code>{r.username}</code> },
             { key: 'domain', label: 'Domain' },
-            { key: 'bandwidth_used_mb', label: 'Used', align: 'right', render: (r) => formatMb(r.bandwidth_used_mb) },
-            { key: 'bandwidth_limit_mb', label: 'Limit', align: 'right', render: (r) => formatMb(r.bandwidth_limit_mb) },
-            { key: 'bandwidth_percent', label: 'Usage', render: (r) => (r.bandwidth_percent == null ? <span className="muted">Unlimited</span> : <StatusPill status={r.over_bandwidth ? 'failed' : r.bandwidth_percent >= 80 ? 'warning' : 'ok'}>{r.bandwidth_percent}%</StatusPill>) },
+            { key: 'bandwidth_used_mb', label: 'Used', align: 'right', width: 120, render: (r) => formatMb(r.bandwidth_used_mb) },
+            { key: 'bandwidth_limit_mb', label: 'Limit', align: 'right', width: 120, render: (r) => formatMb(r.bandwidth_limit_mb) },
+            { key: 'bandwidth_percent', label: 'Usage', align: 'right', width: 120, render: (r) => (r.bandwidth_percent == null ? <span className="muted">Unlimited</span> : <StatusPill status={r.over_bandwidth ? 'failed' : r.bandwidth_percent >= 80 ? 'warning' : 'ok'}>{r.bandwidth_percent}%</StatusPill>) },
           ]}
           rows={all || []} rowKey={(r) => r.username} dense
           rowActions={(r) => [{ label: 'Edit', primary: true, onClick: () => setUsername(r.username) }]}

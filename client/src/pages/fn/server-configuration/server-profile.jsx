@@ -41,7 +41,7 @@ export default function ServerProfile({ fn }) {
               {choice && choice !== data.current && <Button onClick={() => setChoice(null)}>Cancel</Button>}
             </FormActions>
           </Card>
-          <div className="form-grid">
+          <div className="form-grid" style={{ alignItems: 'start' }}>
             <Card title="Monitored services" subtitle={selected === data.current ? 'As configured now' : `After switching to ${def.label}`}>
               <div className="table-wrap"><table><thead><tr><th>Service</th><th>Monitored</th></tr></thead><tbody>
                 {data.services.map((s) => { const will = def.monitoredServices.includes(s.name); return <tr key={s.name}><td>{s.displayName}<br /><small className="muted"><code>{s.name}</code></small></td><td><StatusPill status={will ? 'enabled' : 'disabled'}>{will ? 'monitored' : 'not monitored'}</StatusPill>{will !== s.monitored && <small className="muted"> (now: {s.monitored ? 'monitored' : 'off'})</small>}</td></tr>; })}

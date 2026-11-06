@@ -92,7 +92,8 @@ export function BundledPluginShell({ fn, id, overview: Overview, tabs = [] }) {
   if (!plugin) return <EnablePrompt fn={fn} id={id} status={status} error={error} checking={checking} onChanged={reload} />;
   if (status && status.canUse === false) return <RootOnlyNotice fn={fn} status={status} />;
   const canManage = Boolean(status?.canManage);
-  const pages = (plugin.pages || []).filter((p) => tabs.includes(p.route) && (canManage || p.route !== '/settings'));
+  // Action-kind pages run a job rather than show a view; the overview offers them as buttons.
+  const pages = (plugin.pages || []).filter((p) => tabs.includes(p.route) && p.kind !== 'action' && (canManage || p.route !== '/settings'));
   const active = tab === 'overview' ? null : pages.find((p) => p.route === tab);
   const nav = (
     <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 16 }}>

@@ -163,6 +163,14 @@ export function createPanelDomainsService(ctx) {
     }
   }
 
+  // A domain that still serves an application (contract §65) is not removed:
+  // its unit would keep running on a vanished name and the app rows would
+  // outlive the domain. Checked before any side effect of the removal.
+  function assertNoApps(scope, domain) {
+    const n = typeof ctx.panelApps?.countForDomain === 'function' ? ctx.panelApps.countForDomain(scope, domain) : 0;
+    if (n > 0) throw new HttpError(409, 'in_use', `${domain} still serves ${n} application(s); move or remove them in the Application Manager first`);
+  }
+
   // Seam S1: ctx.web.removeVhost(domain, req). Until it lands the vhost row is
   // re-synced from the remaining account_domains rows, which drops the spec of
   // the removed name from the next render but leaves its file for the integrator's op.
@@ -291,6 +299,7 @@ export function createPanelDomainsService(ctx) {
     async removeAddon(scope, domain, { removeZone = true, removeDocroot = false } = {}, req) {
       assertFeature(scope, 'addondomains');
       const row = assertDomain(scope, domain, ['addon']);
+      assertNoApps(scope, domain);
       const warnings = [];
       let ssl = null;
       const cert = typeof ctx.ssl?.certForDomain === 'function' ? ctx.ssl.certForDomain(domain) : null;
@@ -340,6 +349,7 @@ export function createPanelDomainsService(ctx) {
     async removeSub(scope, domain, { removeDocroot = false } = {}, req) {
       assertFeature(scope, 'subdomains');
       const row = assertDomain(scope, domain, ['sub']);
+      assertNoApps(scope, domain);
       const warnings = [];
       const web = await dropVhost(scope, domain, req, warnings);
       const dns = await dnsRecordsFor(scope, domain, { ipv4: [], ipv6: scope.account.ipv6 ? [] : null }, req, warnings);

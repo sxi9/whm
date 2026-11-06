@@ -59,8 +59,8 @@ export default function DiskUsage({ fn }) {
         <div className="stat" data-stat="folder">
           <div className="label">{dir ? <><code>~/{dir}</code> {t('panel.files.uses', 'uses')}</> : t('panel.files.home_uses', 'Your home directory uses')}</div>
           <div className="value">{data ? formatBytes(folderBytes) : '—'}</div>
-          <div className={`meter ${meterTone(folderPercent)}`}><span style={{ width: `${folderPercent ?? 0}%` }} /></div>
-          <div className="muted small" style={{ marginTop: 6 }}>{folderPercent != null ? fill(t('panel.files.percent_of_plan', '{percent}% of the plan\'s {quota}'), { percent: folderPercent, quota: formatMb(usage.diskQuotaMb) }) : t('panel.files.no_disk_limit', 'No disk limit on this plan')}</div>
+          <div className={`meter ${meterTone(folderPercent)}`}><span style={{ width: `${error ? 0 : folderPercent ?? 0}%` }} /></div>
+          <div className="muted small" style={{ marginTop: 6 }}>{error ? '—' : folderPercent != null ? fill(t('panel.files.percent_of_plan', '{percent}% of the plan\'s {quota}'), { percent: folderPercent, quota: formatMb(usage.diskQuotaMb) }) : t('panel.files.no_disk_limit', 'No disk limit on this plan')}</div>
         </div>
         <div className="stat" data-stat="account">
           <div className="label">{t('panel.files.whole_account', 'Whole account')}</div>
@@ -71,7 +71,7 @@ export default function DiskUsage({ fn }) {
         <div className="stat" data-stat="measured">
           <div className="label">{t('panel.files.sub_folders', 'Sub-folders')}</div>
           <div className="value">{data ? rows.filter((r) => r.depth <= 1).length : '—'}</div>
-          <div className="muted small" style={{ marginTop: 6 }}>{data?.measuredAt ? <>{t('panel.files.measured', 'Measured')} <time dateTime={data.measuredAt}>{formatDate(data.measuredAt)}</time>{data.cached ? t('panel.files.figures_cached', '; the figures are kept for five minutes') : ''}</> : data ? t('panel.files.fresh_figures', 'Fresh figures from the server') : t('panel.files.measuring', 'Measuring…')}</div>
+          <div className="muted small" style={{ marginTop: 6 }}>{error ? t('panel.files.du_empty_error', 'This folder could not be measured.') : data?.measuredAt ? <>{t('panel.files.measured', 'Measured')} <time dateTime={data.measuredAt}>{formatDate(data.measuredAt)}</time>{data.cached ? t('panel.files.figures_cached', '; the figures are kept for five minutes') : ''}</> : data ? t('panel.files.fresh_figures', 'Fresh figures from the server') : t('panel.files.measuring', 'Measuring…')}</div>
         </div>
       </div>
 

@@ -59,8 +59,11 @@ export function RedirectForm({ open, domains, domain, initial, onClose, onSaved 
   );
 }
 
+// With a single domain the header's "Add redirect" is the one call to action, so
+// the row does not repeat it; with several, each row offers its own.
 export function RedirectsTable({ rows, loading, error, onEdit, onRemove, emptyText }) {
   const { t } = useT();
+  const single = rows.length === 1;
   const columns = [
     { key: 'domain', label: t('panel.domains.col_domain', 'Domain'), render: (r) => <strong>{r.domain}</strong> },
     { key: 'targetUrl', label: t('panel.domains.redirects_to', 'Redirects to'), render: (r) => (r.redirect ? <a href={r.redirect.targetUrl} target="_blank" rel="noopener noreferrer">{r.redirect.targetUrl}</a> : <span className="muted">{t('panel.domains.no_redirect', 'No redirect')}</span>) },
@@ -73,7 +76,7 @@ export function RedirectsTable({ rows, loading, error, onEdit, onRemove, emptyTe
     <DataTable columns={columns} rows={rows} loading={loading} error={error} emptyText={emptyText} rowKey={(r) => r.domain}
       rowActions={(r) => (r.redirect
         ? [{ label: t('panel.domains.edit', 'Edit'), primary: true, onClick: () => onEdit(r) }, { label: t('panel.domains.remove', 'Remove'), primary: true, danger: true, onClick: () => onRemove(r) }]
-        : [{ label: t('panel.domains.add_redirect', 'Add redirect'), primary: true, onClick: () => onEdit(r) }])} />
+        : single ? [] : [{ label: t('panel.domains.add_redirect', 'Add redirect'), primary: true, onClick: () => onEdit(r) }])} />
   );
 }
 
@@ -139,7 +142,7 @@ export default function Redirects({ fn }) {
         <div className="banner banner-info"><Info size={18} /><div><strong>{t('panel.domains.redirects_not_applied', 'Redirects are saved but not yet applied')}</strong><p>{t('panel.domains.redirects_not_applied_help', 'The web server on this host cannot apply them yet; they take effect as soon as it can.')}</p></div></div>
       )}
       <Card title={t('panel.domains.redirects', 'Redirects')} subtitle={fill(t('panel.domains.redirects_count', '{count} of {total} domains redirect somewhere else'), { count: withRedirect, total: names.length })} padded={false}
-        actions={<Toggle checked={onlyRedirected} onChange={setOnlyRedirected} label={t('panel.domains.only_redirected', 'Only domains with a redirect')} />}>
+        actions={names.length > 1 && <Toggle checked={onlyRedirected} onChange={setOnlyRedirected} label={t('panel.domains.only_redirected', 'Only domains with a redirect')} />}>
         <PanelCapabilityState error={error} onRetry={() => { refetchDomains(); load(names); }} />
         <RedirectsTable rows={rows} loading={domainsLoading || redirects.loading} error={error && error.status !== 501 ? error : null}
           emptyText={onlyRedirected ? t('panel.domains.redirects_empty_filter', 'No domain redirects anywhere yet. Choose a domain and add a redirect to send its visitors to another address.') : t('panel.domains.redirects_empty', 'Your domains appear here once the account is provisioned')}

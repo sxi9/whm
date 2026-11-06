@@ -25,9 +25,9 @@ export default function ModuleInstallers({ fn }) {
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
       {data && (
-        <Card title="Available installers" subtitle="Each runtime's own package tool, run non-interactively by the agent. Missing tools are regular distro packages.">
+        <Card title="Available installers" subtitle="Each runtime's own package tool, run non-interactively by the agent. Missing tools are regular distro packages." padded={false}>
           <div className="table-wrap">
-            <table>
+            <table className="dense">
               <thead><tr><th>Runtime</th><th>Version</th><th>Installer</th><th>Install with</th></tr></thead>
               <tbody>
                 {RUNTIMES.map((r) => (

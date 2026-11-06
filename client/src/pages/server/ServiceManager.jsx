@@ -21,17 +21,17 @@ export default function ServiceManager({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Choose which services start at boot and which the panel monitors and restarts automatically when they fail." />
+      <PageHeader fn={fn} description="Choose which services start at boot and which the panel monitors and restarts automatically when they fail. The switches apply once a service is installed." />
       <Card padded={false}>
         <DataTable
           columns={[
-            { key: 'displayName', label: 'Service', render: (s) => <><div>{s.displayName}</div><small className="muted">{s.unit ? <code>{s.unit}</code> : `looks for: ${s.candidates.join(', ')}`}</small></> },
+            { key: 'displayName', label: 'Service', width: 220, render: (s) => <><div>{s.displayName}</div><small className="muted">{s.unit ? <code>{s.unit}</code> : `looks for: ${s.candidates.join(', ')}`}</small></> },
             { key: 'state', label: 'Status', render: (s) => <StatusPill status={s.active ? 'active' : s.installed ? 'down' : 'not-installed'}>{s.active ? 'Up' : s.installed ? 'Down' : 'Not installed'}</StatusPill> },
             { key: 'unitEnabled', label: 'Start at boot', render: (s) => <Toggle checked={Boolean(s.unitEnabled)} disabled={!s.installed} onChange={(v) => unit(s, v)} /> },
-            { key: 'monitored', label: 'Monitor', render: (s) => <Toggle checked={s.monitored} onChange={(v) => configure(s, { monitored: v })} /> },
-            { key: 'restartOnFailure', label: 'Auto-restart', render: (s) => <Toggle checked={s.restartOnFailure} onChange={(v) => configure(s, { restartOnFailure: v })} /> },
+            { key: 'monitored', label: 'Monitor', render: (s) => <Toggle checked={s.monitored} disabled={!s.installed} onChange={(v) => configure(s, { monitored: v })} /> },
+            { key: 'restartOnFailure', label: 'Auto-restart', render: (s) => <Toggle checked={s.restartOnFailure} disabled={!s.installed} onChange={(v) => configure(s, { restartOnFailure: v })} /> },
           ]}
-          rows={data || []} loading={loading} error={error} rowKey={(s) => s.name}
+          rows={data || []} loading={loading} error={error} rowKey={(s) => s.name} dense
           rowActions={(s) => (!s.installed ? [] : [{ label: 'Restart', primary: true, onClick: () => run(s, 'restart') }, s.active ? { label: 'Stop', danger: true, onClick: () => run(s, 'stop') } : { label: 'Start', onClick: () => run(s, 'start') }])}
         />
       </Card>

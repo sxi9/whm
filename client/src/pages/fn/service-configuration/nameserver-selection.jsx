@@ -47,14 +47,16 @@ export default function NameserverSelection({ fn }) {
               ['Package manager', data.detect?.packageManager || 'none detected'],
             ]} />
             <div style={{ marginTop: 16 }}>
-              <Field label="Role" help="master answers authoritatively for the panel's zones; slave pulls zones from a master; standalone serves local zones only">
+              <Field label="Role" help="Master answers authoritatively for the panel's zones; slave pulls zones from a master; standalone serves local zones only.">
                 <Select value={currentRole} onChange={setRole} options={[{ value: 'master', label: 'Master (authoritative)' }, { value: 'slave', label: 'Slave (secondary)' }, { value: 'standalone', label: 'Standalone' }]} />
               </Field>
             </div>
             <RequestError error={capError} onRetry={() => setCapError(null)} />
             <DaemonSelector candidates={data.detect?.candidates || []} current={data.active} selected={data.settings.server} onSelect={select} busy={busy} pkgAvailable={data.pkgAvailable} disabledLabel="Disable DNS service" packageManager={data.detect?.packageManager} />
             {result && <div style={{ marginTop: 12 }}><StepList steps={result.steps} /></div>}
-            <p className="muted" style={{ marginTop: 10 }}>PowerDNS is selected and started here; the panel writes BIND-style zone files, so with PowerDNS use its <code>bind</code> backend pointed at the panel's zone directory, or manage zones in <Link to="/dns-functions/dns-zone-manager">DNS Zone Manager</Link> for BIND.</p>
+            {data.settings.server === 'pdns'
+              ? <p className="muted" style={{ marginTop: 10 }}>The panel writes BIND-style zone files, so with PowerDNS use its <code>bind</code> backend pointed at the panel's zone directory.</p>
+              : data.settings.server !== 'disabled' && <p className="muted" style={{ marginTop: 10 }}>Zones are managed in <Link to="/dns-functions/dns-zone-manager">DNS Zone Manager</Link>.</p>}
           </Card>
           <JobCard jobId={jobId} title="Package installation" onFinished={() => { refetch(); toast.info('Installation finished; select the nameserver again to enable it'); }} />
         </>

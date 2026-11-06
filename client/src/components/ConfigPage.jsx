@@ -61,12 +61,30 @@ export function ConfigPage({ fn, title, description, prefix, groups, onSaved, ex
   );
 }
 
+// One entry per line; commas still split so pasted comma lists keep working.
+// The draft is kept as text so a line being typed is not trimmed away.
+function ListInput({ value, onChange, placeholder }) {
+  const list = Array.isArray(value) ? value : value ? [String(value)] : [];
+  const [text, setText] = useState(list.join('\n'));
+  const [synced, setSynced] = useState(list.join('\n'));
+  const joined = list.join('\n');
+  if (joined !== synced) { setSynced(joined); setText(joined); }
+  const rows = Math.min(8, Math.max(3, list.length + 1));
+  return (
+    <textarea className="input textarea" rows={rows} value={text} placeholder={placeholder} onChange={(e) => {
+      const next = e.target.value;
+      const parsed = next.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+      setText(next); setSynced(parsed.join('\n')); onChange(parsed);
+    }} />
+  );
+}
+
 export function ConfigField({ field, value, onChange }) {
   const { label, help, type = 'text', options, placeholder } = field;
   if (type === 'toggle') return <Field inline><Toggle checked={value} onChange={onChange} label={label} description={help} /></Field>;
   if (type === 'number') return <Field label={label} help={help}><NumberInput value={value} onChange={onChange} placeholder={placeholder} min={field.min} max={field.max} /></Field>;
   if (type === 'select') return <Field label={label} help={help}><Select value={value} onChange={onChange} options={options} placeholder={placeholder} /></Field>;
   if (type === 'textarea') return <Field label={label} help={help}><Textarea value={value} onChange={onChange} rows={field.rows || 6} mono={field.mono} /></Field>;
-  if (type === 'list') return <Field label={label} help={help || 'Comma-separated'}><TextInput value={Array.isArray(value) ? value.join(', ') : value ?? ''} onChange={(v) => onChange(v.split(',').map((s) => s.trim()).filter(Boolean))} placeholder={placeholder} /></Field>;
+  if (type === 'list') return <Field label={label} help={help || 'One per line'}><ListInput value={value} onChange={onChange} placeholder={placeholder} /></Field>;
   return <Field label={label} help={help}><TextInput value={value ?? ''} onChange={onChange} placeholder={placeholder} type={field.inputType || 'text'} /></Field>;
 }

@@ -7,3 +7,5 @@ export const NODE_LINK_PATHS = Array.from({ length: NODE_LINK_MAJORS.max - NODE_
 export const PHP_MINORS = ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5', '8.6', '9.0', '9.1'];
 export const PHP_UNIT_PATHS = PHP_MINORS.map((m) => `/etc/systemd/system/keel-php${m}-fpm.service`);
 export const PHP_LINK_PATHS = PHP_MINORS.map((m) => `/usr/local/bin/php${m}`);
+// Where a local PostgreSQL keeps pg_hba.conf (Debian clusters, RHEL data directories); db.pg.hba.write edits it in place.
+export const PG_HBA_ROOTS = ['/etc/postgresql', '/var/lib/pgsql'];

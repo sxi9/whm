@@ -1,16 +1,17 @@
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, KeyValue, StatusPill, formatDate } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Button } from '../../../components/Form.jsx';
 import { useAuth } from '../../../auth/AuthContext.jsx';
 import { InstallPackages } from '../../../components/InstallPackages.jsx';
-import { RequestError, useLocales, LocalePills, TranslationProgress, LocaleLinks } from '../../locales/Shared.jsx';
+import { RequestError, useLocales, LocalePills, TranslationProgress } from '../../locales/Shared.jsx';
 
 export const localePackages = (family) => (family === 'rhel' ? ['glibc-langpack-en'] : ['locales']);
 
 export default function ViewAvailableLocales({ fn }) {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const isRoot = user?.role === 'root';
   const { locales, loading, error, refetch, defaultCode, baseKeys } = useLocales();
   const system = useApi('/locales/system', { enabled: isRoot });
@@ -28,9 +29,13 @@ export default function ViewAvailableLocales({ fn }) {
             { key: 'state', label: 'State', render: (l) => <LocalePills locale={l} /> },
             { key: 'progress', label: 'Translated', render: (l) => <TranslationProgress stats={l.stats} /> },
             { key: 'source', label: 'Source', render: (l) => <span className="small">{l.source}{l.copiedFrom ? ` of ${l.copiedFrom}` : ''}</span> },
-            { key: 'updated', label: 'Updated', render: (l) => <span className="small">{formatDate(l.updatedAt)}</span> },
-            { key: 'actions', label: '', render: (l) => (isRoot ? <LocaleLinks code={l.code} /> : <Link className="btn btn-sm" to={`/locales/locale-xml-download?code=${l.code}`}>Download XML</Link>) },
-          ]} />
+            { key: 'updated', label: 'Updated', render: (l) => <span className="small" style={{ whiteSpace: 'nowrap' }}>{formatDate(l.updatedAt)}</span> },
+          ]}
+          rowActions={(l) => (isRoot ? [
+            { label: 'Edit', primary: true, onClick: () => navigate(`/locales/edit-a-locale?code=${l.code}`) },
+            { label: 'Copy', onClick: () => navigate(`/locales/copy-a-locale?from=${l.code}`) },
+            { label: 'Download XML', onClick: () => navigate(`/locales/locale-xml-download?code=${l.code}`) },
+          ] : [{ label: 'Download XML', primary: true, onClick: () => navigate(`/locales/locale-xml-download?code=${l.code}`) }])} />
       </Card>
       {isRoot && (
         <Card title="Operating system locale" subtitle="What the host itself runs with (LANG and LC_* from the system locale file). Separate from the panel's interface language." actions={<Button size="sm" onClick={() => system.refetch()}>Re-read</Button>}>

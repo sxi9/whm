@@ -54,9 +54,6 @@ export function DataTable({
             </tr>
           </thead>
           <tbody>
-            {loading && rows.length === 0 && <tr><td colSpan={columns.length + 2} className="table-state"><span className="spinner" /> Loading…</td></tr>}
-            {error && <tr><td colSpan={columns.length + 2} className="table-state error">{error.message}</td></tr>}
-            {!loading && !error && rows.length === 0 && <tr><td colSpan={columns.length + 2} className="table-state">{emptyText}</td></tr>}
             {rows.map((row) => {
               const k = rowKey(row);
               return (
@@ -70,14 +67,20 @@ export function DataTable({
           </tbody>
         </table>
       </div>
-      {pageCount != null && (
+      {/* The states sit outside the scrolling table so the sentence wraps inside the card at phone widths. */}
+      {loading && rows.length === 0 && <div className="table-state"><span className="spinner" /> Loading…</div>}
+      {error && <div className="table-state error">{error.message}</div>}
+      {!loading && !error && rows.length === 0 && <div className="table-state">{emptyText}</div>}
+      {pageCount != null && total > 0 && (
         <div className="datatable-footer">
-          <span className="muted">{total === 0 ? 'No results' : `${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, total)} of ${total}`}</span>
-          <div className="pager">
-            <button className="btn btn-sm btn-icon" disabled={page <= 1} onClick={() => onPageChange?.(page - 1)} aria-label="Previous page"><ChevronLeft size={16} /></button>
-            <span>Page {page} of {pageCount}</span>
-            <button className="btn btn-sm btn-icon" disabled={page >= pageCount} onClick={() => onPageChange?.(page + 1)} aria-label="Next page"><ChevronRight size={16} /></button>
-          </div>
+          <span className="muted">{`${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, total)} of ${total}`}</span>
+          {pageCount > 1 && (
+            <div className="pager">
+              <button className="btn btn-sm btn-icon" disabled={page <= 1} onClick={() => onPageChange?.(page - 1)} aria-label="Previous page"><ChevronLeft size={16} /></button>
+              <span>Page {page} of {pageCount}</span>
+              <button className="btn btn-sm btn-icon" disabled={page >= pageCount} onClick={() => onPageChange?.(page + 1)} aria-label="Next page"><ChevronRight size={16} /></button>
+            </div>
+          )}
         </div>
       )}
     </div>

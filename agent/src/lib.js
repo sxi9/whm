@@ -10,7 +10,7 @@ const deployDirOf = (app) => path.resolve(path.dirname(fileURLToPath(import.meta
 // of these; anything else is refused even for root. Operators can extend the list
 // in the agent config, never the API.
 export { NODE_LINK_MAJORS, NODE_LINK_PATHS, PHP_MINORS, PHP_UNIT_PATHS, PHP_LINK_PATHS } from './managed-paths.js';
-import { NODE_LINK_PATHS, PHP_UNIT_PATHS, PHP_LINK_PATHS } from './managed-paths.js';
+import { NODE_LINK_PATHS, PHP_UNIT_PATHS, PHP_LINK_PATHS, PG_HBA_ROOTS } from './managed-paths.js';
 
 export const DEFAULT_ALLOWED_ROOTS = [
   '/home', '/var/lib/whm', '/etc/whm', '/var/log/whm',
@@ -18,6 +18,8 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/bind', '/var/named', '/var/lib/bind', '/var/cache/bind',
   '/etc/exim', '/etc/exim4', '/etc/dovecot', '/var/spool/exim', '/var/spool/exim4', '/var/log/exim', '/var/log/exim4', '/var/log/mail.log',
   '/etc/mysql', '/etc/my.cnf', '/etc/my.cnf.d', '/var/lib/mysql-files',
+  // pg_hba.conf of a local PostgreSQL (db.pg.hba.write).
+  ...PG_HBA_ROOTS,
   '/etc/pure-ftpd', '/etc/proftpd', '/etc/vsftpd.conf',
   '/etc/ssl/whm', '/etc/letsencrypt', '/etc/pki/tls/whm', '/etc/ssl/private/pure-ftpd.pem',
   '/etc/php', '/etc/opt/remi', '/etc/php-fpm.d',
@@ -32,6 +34,8 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/root/.acme.sh', '/var/log/letsencrypt',
   '/etc/default/spamassassin', '/etc/default/spamd', '/etc/sysconfig/spamassassin', '/etc/exim.conf', '/var/log/exim_mainlog', '/var/log/exim_rejectlog',
   '/opt/cpanel', '/etc/php.ini', '/etc/php.d', '/etc/opt/rh', '/var/run/reboot-required', '/var/run/reboot-required.pkgs',
+  // Account application units (apps.unit.*): the files `systemctl link` points at; /etc/systemd/system itself stays closed.
+  '/etc/whm/apps',
   '/etc/vsftpd',
   '/usr/local/whm/hooks',
   '/etc/default/locale', '/etc/locale.conf',

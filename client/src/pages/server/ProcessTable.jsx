@@ -3,7 +3,7 @@ import { api, queryString } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { DataTable } from '../../components/DataTable.jsx';
 import { Select, TextInput, NumberInput, Field, FormActions, Button } from '../../components/Form.jsx';
-import { CapabilityNotice, formatBytes, formatDuration } from '../../components/Common.jsx';
+import { Card, CapabilityNotice, formatBytes, formatDuration } from '../../components/Common.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { Modal, useConfirm } from '../../components/Modal.jsx';
 
@@ -39,10 +39,10 @@ export function ProcessTable({ manage = false, base = '/system-health' }) {
   };
 
   const missing = error && (error.code === 'capability_missing' || error.status === 501);
-  if (missing) return <div className="card-body"><CapabilityNotice error={error} onRetry={() => api.post('/system/capabilities/refresh').then(() => refetch()).catch(toast.error)} /></div>;
+  if (missing) return <CapabilityNotice error={error} onRetry={() => api.post('/system/capabilities/refresh').then(() => refetch()).catch(toast.error)} />;
 
   return (
-    <>
+    <Card padded={false}>
       <DataTable
         columns={[
           { key: 'pid', label: 'PID', width: 80 },
@@ -79,6 +79,6 @@ export function ProcessTable({ manage = false, base = '/system-health' }) {
           </>
         )}
       </Modal>
-    </>
+    </Card>
   );
 }

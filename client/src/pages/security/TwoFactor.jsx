@@ -38,6 +38,7 @@ export default function TwoFactor({ fn }) {
     try { await api.post('/auth/2fa/disable', body); toast.success('Two-factor authentication disabled'); setDisabling(null); await refresh(); } catch (err) { setDisabling((d) => ({ ...d, error: err })); } finally { setBusy(false); }
   };
   const setPolicy = async (v) => { try { await api.put('/system/settings', { 'security.2fa.required_for_root': v }); toast.success('Policy saved'); refetch(); } catch (err) { toast.error(err); } };
+  const setUsersPolicy = async (v) => { try { await api.put('/system/settings', { 'security.2fa.required_for_users': v }); toast.success('Policy saved'); refetch(); } catch (err) { toast.error(err); } };
 
   return (
     <>
@@ -81,6 +82,7 @@ export default function TwoFactor({ fn }) {
       {user.role === 'root' && settings && (
         <Card title="Server policy">
           <Field inline><Toggle checked={Boolean(settings['security.2fa.required_for_root'])} onChange={setPolicy} label="Require two-factor authentication for the root user" description="Root cannot log in without an authenticator once enabled." /></Field>
+          <Field inline><Toggle checked={Boolean(settings['security.2fa.required_for_users'])} onChange={setUsersPolicy} label="Require two-factor authentication for account users" description="Account holders must enrol an authenticator at their next sign-in to the account panel; until then only the enrolment page opens. Resellers are covered by Configure Security Policies." /></Field>
         </Card>
       )}
     </>

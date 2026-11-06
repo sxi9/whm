@@ -79,14 +79,7 @@ export default function MailQueueManager({ fn }) {
       <PageHeader fn={fn} description="Messages waiting in the Exim spool (exim -bp). Search by id, sender or recipient, then deliver, freeze, thaw or delete them; flushing runs the whole queue now." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
       <RequestError error={error} onRetry={refetch} />
       {meta && <StatGrid stats={[['In queue', meta.queueTotal], ['Frozen', meta.queueFrozen, meta.queueFrozen ? 'warn' : null], ['Matching', meta.total]]} />}
-      <Card padded={false} actions={(
-        <>
-          <Button size="sm" variant="primary" loading={busy} disabled={!selected.length} onClick={() => act('deliver', selected)}>Deliver ({selected.length})</Button>
-          <Button size="sm" loading={busy} disabled={!selected.length} onClick={() => act('freeze', selected)}>Freeze</Button>
-          <Button size="sm" loading={busy} disabled={!selected.length} onClick={() => act('thaw', selected)}>Thaw</Button>
-          <Button size="sm" variant="danger" loading={busy} disabled={!selected.length} onClick={() => act('remove', selected)}>Delete</Button>
-        </>
-      )}>
+      <Card padded={false} title="Queue" subtitle="Select messages to deliver, freeze, thaw or delete them together.">
         <DataTable
           columns={[
             { key: 'id', label: 'Message id', render: (m) => <button className="link-button" onClick={() => setViewing(m.id)}><code>{m.id}</code></button> },
@@ -100,7 +93,20 @@ export default function MailQueueManager({ fn }) {
           sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort}
           searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Search id, sender or recipient"
           selectable selected={selected} onSelectedChange={setSelected} rowKey={(m) => m.id} dense emptyText="The mail queue is empty. Messages waiting in the spool are listed here."
-          toolbar={<Field inline><Select value={frozen} onChange={(v) => { setFrozen(v); table.setPage(1); }} options={[{ value: 'true', label: 'Frozen only' }, { value: 'false', label: 'Not frozen' }]} placeholder="All messages" /></Field>}
+          toolbar={(
+            <>
+              {selected.length > 0 && (
+                <>
+                  <span className="muted small">{selected.length} selected</span>
+                  <Button size="sm" loading={busy} onClick={() => act('deliver', selected)}>Deliver now</Button>
+                  <Button size="sm" loading={busy} onClick={() => act('freeze', selected)}>Freeze</Button>
+                  <Button size="sm" loading={busy} onClick={() => act('thaw', selected)}>Thaw</Button>
+                  <Button size="sm" variant="danger-ghost" loading={busy} onClick={() => act('remove', selected)}>Delete</Button>
+                </>
+              )}
+              <Field inline><Select value={frozen} onChange={(v) => { setFrozen(v); table.setPage(1); }} options={[{ value: 'true', label: 'Frozen only' }, { value: 'false', label: 'Not frozen' }]} placeholder="All messages" /></Field>
+            </>
+          )}
           rowActions={(m) => [
             { label: 'View', primary: true, onClick: () => setViewing(m.id) },
             { label: 'Deliver now', onClick: () => act('deliver', [m.id]) },
@@ -114,8 +120,8 @@ export default function MailQueueManager({ fn }) {
           <Button variant="primary" loading={busy} onClick={() => flush(false)}>Flush queue (exim -qf)</Button>
           <Button loading={busy} onClick={() => flush(true)}>Force flush incl. frozen (exim -qff)</Button>
           <Button loading={busy} onClick={() => bulk('thaw', { frozen: true }, 'Thaws every frozen message so Exim retries it on the next queue run.')}>Thaw all frozen</Button>
-          <Button variant="danger" loading={busy} onClick={() => bulk('remove', { frozen: true }, 'Deletes every frozen message from the spool.')}>Delete all frozen</Button>
-          <Button variant="danger" loading={busy} onClick={() => bulk('remove', { olderThanMinutes: 1440 }, 'Deletes every message that has been queued for more than 24 hours.')}>Delete older than 24 h</Button>
+          <Button variant="danger-ghost" loading={busy} onClick={() => bulk('remove', { frozen: true }, 'Deletes every frozen message from the spool.')}>Delete all frozen</Button>
+          <Button variant="danger-ghost" loading={busy} onClick={() => bulk('remove', { olderThanMinutes: 1440 }, 'Deletes every message that has been queued for more than 24 hours.')}>Delete older than 24 h</Button>
         </div>
         {flushJob && <div style={{ marginTop: 12 }}><ProgressLog jobId={flushJob} onFinished={flushFinished} /></div>}
         {last && <pre className="log" style={{ marginTop: 12 }}>{last.output || JSON.stringify({ ...last, output: undefined }, null, 2)}</pre>}
