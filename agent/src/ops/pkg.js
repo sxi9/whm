@@ -1737,6 +1737,20 @@ defineOp('pkg.node.install', {
   },
 });
 
+defineOp('pkg.node.release', {
+  description: 'The latest official nodejs.org build of a major version for this architecture (SHASUMS256 lookup; changes nothing)',
+  timeoutMs: 120_000,
+  schema: z.object({ major: nodeMajor }).strict(),
+  run: async ({ major }) => {
+    const arch = NODE_ARCH[process.arch];
+    if (!arch) throw new OpError('unsupported', `No official Node.js build exists for the ${process.arch} architecture`);
+    const index = await exec('curl', [...CURL_SHORT, `https://nodejs.org/dist/latest-v${major}.x/SHASUMS256.txt`], { timeoutMs: 90_000, maxBuffer: BIG });
+    const pick = pickNodeTarball(index.stdout, major, arch);
+    if (!pick) throw new OpError('not_found', `nodejs.org publishes no linux-${arch} build for Node.js ${major}.x`);
+    return { major, arch, ...pick };
+  },
+});
+
 defineOp('pkg.node.remove', {
   description: 'Remove a Node.js build under /opt/keel/node/<major> and the node<major>/npm<major>/npx<major> links that point into it',
   destructive: true,
@@ -1952,12 +1966,22 @@ defineOp('pkg.php.build', {
   },
 });
 
+defineOp('pkg.php.release', {
+  description: 'The newest php.net release of a minor (JSON index lookup; changes nothing)',
+  timeoutMs: 120_000,
+  schema: z.object({ minor: phpMinor }).strict(),
+  run: async ({ minor }) => {
+    const index = await exec('curl', [...CURL_SHORT, `${PHP_RELEASES_URL}?json&version=${minor}`], { timeoutMs: 90_000, maxBuffer: BIG });
+    return { minor, ...parsePhpRelease(index.stdout, minor) };
+  },
+});
+
 async function phpVersionAt(bin) {
   try { const r = await exec(bin, ['-n', '-r', 'echo PHP_VERSION;'], { allowFailure: true, timeoutMs: PROBE_TIMEOUT }); return r.code === 0 ? r.stdout.trim().match(/^\d[\d.]*/)?.[0] ?? null : null; } catch { return null; }
 }
 
 defineOp('pkg.php.build.finish', {
-  description: 'After pkg.php.build: write the keel-php<minor>-fpm unit, enable and start it, place /usr/local/bin/php<minor> and drop the build directory; idempotent',
+  description: 'After pkg.php.build: write the keel-php<minor>-fpm unit, enable and start it (restart it when it already exists), place /usr/local/bin/php<minor> and drop the build directory; idempotent',
   timeoutMs: 10 * 60_000,
   schema: z.object({ minor: phpMinor }).strict(),
   run: async ({ minor }, ctx) => {
@@ -1968,19 +1992,28 @@ defineOp('pkg.php.build.finish', {
     const marker = buildDirsFor(root, minor).map(readBuildMarker).find(Boolean);
     if (buildLive(marker)) throw new OpError('in_use', `A build of PHP ${minor} started ${marker.startedAt} is still running`);
     const version = (await phpVersionAt(binary)) || marker?.version || null;
+    // A unit that is running belongs to an earlier build of the minor: the new
+    // binaries are picked up by a restart, enable --now would leave the old
+    // php-fpm running. A unit file alone is not enough: a first enable that
+    // failed, or a unit the admin stopped, gets enable --now again rather than
+    // a restart that would leave it unenabled or start what was stopped on purpose.
+    const wasActive = hasBinary('systemctl') && fs.existsSync(unitFile) ? await unitActive(unit) === true : false;
     writeAtomic(unitFile, renderPhpUnit(minor), { mode: 0o644 });
     let active = null;
+    let enabled = null;
     let unitError = null;
     if (hasBinary('systemctl')) {
       await exec('systemctl', ['daemon-reload'], { allowFailure: true, timeoutMs: 120_000 });
-      const r = await exec('systemctl', ['enable', '--now', `${unit}.service`], { allowFailure: true, timeoutMs: 180_000 });
+      const r = await exec('systemctl', wasActive ? ['restart', `${unit}.service`] : ['enable', '--now', `${unit}.service`], { allowFailure: true, timeoutMs: 180_000 });
       if (r.code !== 0) unitError = (r.stderr || r.stdout).trim().split('\n').pop() || `systemctl exited with status ${r.code}`;
       active = await unitActive(unit);
+      const en = await exec('systemctl', ['is-enabled', `${unit}.service`], { allowFailure: true, timeoutMs: 60_000 });
+      enabled = en.code === 0 ? true : en.stdout.trim() === 'disabled' ? false : null;
     }
     const placed = placeSymlink(link, binary, root);
     const buildDirsRemoved = removeBuildDirs(root, minor);
     fs.rmSync(buildLockPath(root, minor), { force: true });
-    return { minor, version, prefix, binary, unit, unitFile, active, ...(unitError ? { unitError } : {}), link: placed.placed ? link : null, ...(placed.placed ? {} : { linkConflict: placed.reason }), buildDirsRemoved };
+    return { minor, version, prefix, binary, unit, unitFile, active, enabled, ...(unitError ? { unitError } : {}), ...(wasActive ? { restarted: true } : {}), link: placed.placed ? link : null, ...(placed.placed ? {} : { linkConflict: placed.reason }), buildDirsRemoved };
   },
 });
 

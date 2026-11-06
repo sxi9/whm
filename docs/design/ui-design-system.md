@@ -91,3 +91,7 @@ interface is "the account panel". The words *cPanel* and *WHM* appear only when 
 external cPanel product (migration sources, cpmove archives, API compatibility notes).
 Function keys, routes, API prefixes, settings keys and plugin ids never change when a label
 changes — pin the slug in `client/src/nav.js` instead.
+
+## Menus
+
+Every popover menu (a row's ⋯ actions, the user menu, any dropdown of commands) is built on `hooks/useMenu.js` through `components/Menu.jsx`. A menu opens on click or ArrowDown, never on hover, and is never closed by the pointer leaving anything: it closes on a press outside the trigger and the menu, on Escape (focus returns to the trigger), on Tab (focus returns to the trigger first so the native Tab continues from there), on a route change and, for a floating menu, it follows the trigger on scroll and resize (useMenu's `closeOnScroll` option closes instead when a consumer uses the hook directly). The trigger carries `aria-haspopup="menu"`, `aria-expanded` and `aria-controls`; the list is `role="menu"` with `role="menuitem"` entries, and ArrowDown/ArrowUp/Home/End move between them. Floating menus are portalled to `<body>` (`theme/menu.css`) so cards and scrolling tables never clip them; they flip above the trigger near the bottom of the viewport.

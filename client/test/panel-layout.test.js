@@ -85,7 +85,9 @@ describe('PanelShell for role user', () => {
     expect(html).toContain('class="probe"');
     expect(html).not.toContain('audit-log');
     expect(html).not.toContain('license-banner');
-    expect(html).not.toContain('Expand all');
+    // The group list has its own Expand all / Collapse all (panel.home.* strings), no admin-only chrome.
+    expect(html).toContain('title="Expand all"');
+    expect(html).toContain('title="Collapse all"');
     expect(html).toContain('Signed in as demo');
   });
 

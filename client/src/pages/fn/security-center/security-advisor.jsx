@@ -3,15 +3,20 @@ import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, EmptyState, StatusPill, formatDate } from '../../../components/Common.jsx';
 import { Button, Textarea, ErrorBanner } from '../../../components/Form.jsx';
+import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, GradePill, FixLink } from '../../security/Shared.jsx';
+import { useJobRunner, JobPanel } from '../../software/Shared.jsx';
 
 const ORDER = ['critical', 'warning', 'info', 'ok'];
 const TITLES = { critical: 'Critical', warning: 'Warnings', info: 'Informational', ok: 'Passed checks' };
 
 // One graded finding. Advisory findings (PHP CVEs) carry the affected versions
-// and a link to the upstream advisory next to the in-panel fix link.
-export function FindingRow({ finding: f }) {
+// and a link to the upstream advisory next to the in-panel fix link. A finding
+// with `actions` (contract §63: { label, path, body }) renders one button per
+// action; the page runs it through `onAction`.
+export function FindingRow({ finding: f, onAction, busy = false }) {
+  const actions = Array.isArray(f.actions) ? f.actions.filter((a) => a && typeof a.path === 'string' && a.label) : [];
   return (
     <tr>
       <td style={{ width: 90 }}><GradePill grade={f.grade} /></td>
@@ -20,12 +25,13 @@ export function FindingRow({ finding: f }) {
         {f.detail && <small className="muted" style={{ whiteSpace: 'pre-line' }}>{f.detail}</small>}
         {Array.isArray(f.versions) && f.versions.length > 0 && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
-            {f.versions.map((v) => <StatusPill key={v.id || v.version} status={v.unknown ? 'unknown' : 'failed'}>{v.version || `${v.minor}.x`}{v.fixedIn ? ` → ${v.fixedIn}` : ' · no fix for this branch'}</StatusPill>)}
+            {f.versions.map((v) => <StatusPill key={v.id || v.version} status={v.unknown ? 'unknown' : 'failed'}>{v.version || `${v.minor}.x`}{v.candidate ? ` → ${v.candidate} available` : v.fixedIn ? ` → ${v.fixedIn}` : ' · no fix for this branch'}</StatusPill>)}
           </div>
         )}
       </td>
       <td className="actions-col">
         <div className="row-actions">
+          {actions.map((a) => <Button key={`${a.path}:${a.label}`} size="sm" variant={f.grade === 'critical' ? 'danger' : 'primary'} loading={busy} onClick={() => onAction?.(a, f)}>{a.label}</Button>)}
           {f.url && <a className="btn btn-sm" href={f.url} target="_blank" rel="noreferrer noopener">{f.advisory || 'Advisory'}</a>}
           <FixLink fix={f.fix} />
         </div>
@@ -74,11 +80,19 @@ function AdvisoryListCard() {
 
 export default function SecurityAdvisor({ fn }) {
   const toast = useToast();
+  const confirm = useConfirm();
   const { data, loading, error, refetch, setData } = useApi('/security/advisor');
   const [busy, setBusy] = useState(false);
   const scan = async () => {
     setBusy(true);
     try { const { data: run } = await api.post('/security/advisor/scan'); setData(run); toast.success(`Scan complete: ${run.summary.critical} critical, ${run.summary.warning} warnings`); } catch (err) { toast.error(err); } finally { setBusy(false); }
+  };
+  // A finding's action is a POST the server named (contract §63); the job it
+  // starts streams below and the scan is repeated when it finishes.
+  const runner = useJobRunner({ onFinished: scan });
+  const act = async (action, finding) => {
+    if (!(await confirm({ title: `${action.label}?`, message: `Runs ${action.label.toLowerCase()} as a background job (${finding.title}). The advisor scans again when it finishes.`, confirmLabel: action.label, danger: finding.grade === 'critical' }))) return;
+    runner.start(() => api.post(action.path, action.body ?? {}), action.label);
   };
   const findings = data?.findings || [];
 
@@ -102,13 +116,15 @@ export default function SecurityAdvisor({ fn }) {
                 <div className="table-wrap">
                   <table>
                     <tbody>
-                      {rows.map((f) => <FindingRow key={f.id} finding={f} />)}
+                      {rows.map((f) => <FindingRow key={f.id} finding={f} onAction={act} busy={runner.busy} />)}
                     </tbody>
                   </table>
                 </div>
               </Card>
             );
           })}
+          <ErrorBanner error={runner.error} />
+          <JobPanel runner={runner} title="Update progress" />
         </>
       )}
       <AdvisoryListCard />

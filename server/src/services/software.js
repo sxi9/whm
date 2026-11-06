@@ -30,6 +30,11 @@ import { RUNTIMES, TOOLS, RUNTIME_KEYS, PHP_SOURCE_PREFIX, PHP_SOURCE_MINORS, re
 // software.update.status({ cached })                      -> pending OS updates; cached: true serves the last recorded check
 //   software.runtimes.catalog()                             -> one-click runtime/tool catalog with installed state (contract §51)
 //   software.runtimes.install({ runtime, version } | { tool }, user, req) -> { job } (job type software.runtime.install)
+//   software.updates.critical({ versions?, fresh? })         -> { checkedAt, packagesCheckedAt, items: [{ kind, id, label, current, candidate,
+//                                                              severity, reasons, action }] } (contract §63; cached 10 min, never throws)
+//   software.updates.rowUpdate(list, kind, id)               -> { candidate, severity, reasons } | null for a catalog row
+//   software.php.update(version, user, req)                  -> { job, version, candidate, method } (job type software.php.update; 422 without a candidate)
+//   software.runtimes.update({ runtime, version } | { tool }, user, req) -> { job } (job type software.runtime.update)
 // Lazily used when present: ctx.web.setPhpVersion(domain, version, req, { reload }) (the 4th argument is advisory: the web category
 // may skip the Apache reload until the last domain of a batch), ctx.web.setListenPorts({ http, https, bind }, req),
 // ctx.web.apache.settings().defaultPhpVersion, ctx.ssl.certForDomain(domain) + ctx.ssl.bundlePaths(domain).
@@ -252,7 +257,7 @@ export function createSoftwareService(ctx) {
   }
 
   // --- one-click runtimes and tools (contract §51) ----------------------------
-  const RUNTIME_JOB_TYPES = ['software.runtime.install', 'software.runtime.remove'];
+  const RUNTIME_JOB_TYPES = ['software.runtime.install', 'software.runtime.remove', 'software.runtime.update'];
   // One pkg.repo.status per distinct repo of the runtimes that fall back to a
   // source build; a failed probe (offline) is null, state 'unknown'.
   async function probeRepos(repos) {
@@ -280,8 +285,9 @@ export function createSoftwareService(ctx) {
   }
 
   const runtimes = {
-    async catalog({ repoStatus = null } = {}) {
+    async catalog({ repoStatus = null, updates: withUpdates = true } = {}) {
       const d = await pkg.detect();
+      const crit = withUpdates ? await updates.critical().catch(() => null) : null;
       const fam = d.family ?? null;
       let detected = {};
       try { detected = await op('pkg.runtime.detect'); } catch (err) { logger.warn({ err }, 'runtime detection failed'); }
@@ -302,7 +308,9 @@ export function createSoftwareService(ctx) {
           const state = detectedVersion(key, v, detected);
           const packages = entry.installer ? [] : (fam ? packagesFor(entry, fam, v) : null) ?? [];
           const repo = entry.repo === 'epel' ? (fam === 'rhel' ? 'epel' : null) : entry.repo ?? null;
-          const row = { id: v ?? key, label: v ? `${entry.label} ${v}` : entry.label, installed: state.installed, version: state.version, packages, repo, note, ...(key === 'nodejs' && v ? { path: state.path ?? `/opt/keel/node/${v}`, bin: `/usr/local/bin/node${v}` } : {}) };
+          // critical() keys PHP items by the installed id (ea-php83, php83, system on EL layouts), not the catalog id.
+          const update = crit && state.installed ? updates.rowUpdate(crit, key === 'php' ? 'php' : 'runtime', key === 'php' ? state.id ?? v : v ? `${key}:${v}` : key) : null;
+          const row = { id: v ?? key, label: v ? `${entry.label} ${v}` : entry.label, installed: state.installed, version: state.version, packages, repo, note, update, ...(key === 'nodejs' && v ? { path: state.path ?? `/opt/keel/node/${v}`, bin: `/usr/local/bin/node${v}` } : {}) };
           if (!entry.source) return row;
           const rs = repo ? repos[repo] ?? null : null;
           const avail = state.installed ? { state: 'installed', method: state.source ? 'source' : 'package', note } : availability(entry, repo, rs, d.capability ? fam : null, detected.os, v);
@@ -310,7 +318,7 @@ export function createSoftwareService(ctx) {
         });
         return { key, label: entry.label, single: Boolean(entry.single), installer: entry.installer ?? null, source: Boolean(entry.source), versions };
       });
-      const tools = toolEntries.map((t) => ({ ...t, installed: installedSet && t.packages.length ? t.packages.every((p) => installedSet.has(p)) : null }));
+      const tools = toolEntries.map((t) => { const installed = installedSet && t.packages.length ? t.packages.every((p) => installedSet.has(p)) : null; return { ...t, installed, update: crit && installed ? updates.rowUpdate(crit, 'tool', t.key) : null }; });
       return { family: fam, os: detected.os ?? null, manager: d.manager ?? null, capability: Boolean(d.capability), runtimes: runtimeList, tools };
     },
     async install({ runtime, version, tool, method }, user, req) {
@@ -413,6 +421,52 @@ export function createSoftwareService(ctx) {
       job.progress(100, 'done');
       return { runtime: 'nodejs', version: String(major), removed: true, ...result };
     },
+    // Direct update of an installed runtime or tool (contract §63): packages
+    // through pkg.upgrade, a Node.js major through a fresh nodejs.org build.
+    async update({ runtime, version, tool }, user, req) {
+      if (runtime === 'php') throw unprocessable('PHP versions are updated through the PHP Version Manager (POST /software/php/update)', { runtime: ['Use /software/php/update'] });
+      if (RUNTIMES[runtime]?.installer !== 'node') requirePkg();
+      const fam = capabilities.has('pkg') ? await family().catch(() => null) : null;
+      const plan = resolveInstall({ runtime, version, tool }, fam);
+      const label = plan.version ? `${plan.label} ${plan.version}` : plan.label;
+      if (plan.installer === 'node') {
+        const { versions } = await op('pkg.node.list');
+        if (!(versions || []).some((n) => n.major === plan.major)) throw unprocessable(`Node.js ${plan.major} is not installed under /opt/keel/node; install it first`, { version: ['Install it from Install Software first'] });
+      } else {
+        const present = await pkg.isInstalled(plan.packages);
+        if (!plan.packages.some((p) => present[p])) throw unprocessable(`${label} is not installed; there is nothing to update`, { [tool ? 'tool' : 'runtime']: ['Install it first'] });
+      }
+      const job = enqueue('software.runtime.update', { kind: plan.kind, key: plan.key, version: plan.version, family: fam, packages: plan.packages, major: plan.major ?? null }, user);
+      const target = plan.version ? `${plan.key}:${plan.version}` : plan.key;
+      req?.audit?.({ action: 'software.runtime.update', target, args: { kind: plan.kind, key: plan.key, version: plan.version, method: plan.installer === 'node' ? 'node' : 'package', packages: plan.packages, jobId: job.id } });
+      return { job, target, packages: plan.packages, method: plan.installer === 'node' ? 'node' : 'package' };
+    },
+    async updateJob(job) {
+      const { kind, key, version, packages, major } = job.params;
+      const entry = kind === 'tool' ? TOOLS.find((t) => t.key === key) : RUNTIMES[key];
+      const label = version ? `${entry?.label ?? key} ${version}` : entry?.label ?? key;
+      let detected = null;
+      if (key === 'nodejs') {
+        job.progress(10, `installing the latest Node.js ${major}.x build`);
+        const r = await runLongOp(job, 'pkg.node.install', { major }, `${label} update`);
+        detected = r.version ?? null;
+      } else {
+        job.log(`${label}: upgrading ${JSON.stringify(packages)}`);
+        job.progress(10, `upgrading ${packages.length} package(s)`);
+        await runLongOp(job, 'pkg.upgrade', { packages, dist: false }, `${label} upgrade`);
+        job.progress(80, 'checking what is still pending');
+        try { recordCheck(await job.agent.op('pkg.upgradable')); } catch (err) { job.log(`post-upgrade check failed: ${err.message}`, 'warn'); }
+      }
+      job.progress(92, 're-detecting capabilities');
+      await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after runtime update failed'); job.log(`capability re-detection failed: ${err.message}`, 'warn'); });
+      if (kind === 'runtime') {
+        try { detected = detectedVersion(key, version ?? key, await job.agent.op('pkg.runtime.detect')).version ?? detected; } catch (err) { job.log(`runtime detection failed: ${err.message}`, 'warn'); }
+      }
+      updates.invalidate();
+      job.log(`${label}: ${detected ? `now ${detected}` : 'updated'}`);
+      job.progress(100, 'done');
+      return { kind, [kind === 'tool' ? 'tool' : 'runtime']: key, version, packages, updated: true, detected, method: key === 'nodejs' ? 'node' : 'package' };
+    },
   };
 
   // --- system update -------------------------------------------------------
@@ -497,6 +551,114 @@ export function createSoftwareService(ctx) {
         return { count: pending.count, security: pending.security, autoJobId: run.id };
       }
       return { count: pending.count, security: pending.security };
+    },
+  };
+
+  // --- critical updates (contract §63) ---------------------------------------
+  // One list for the Home banner, the PHP Version Manager, Install Software and
+  // the Security Advisor: PHP advisories, pending package updates of the
+  // runtimes/tools/web stack and newer Node.js builds. Cached ten minutes; every
+  // probe is isolated so a failing one (offline, no PHP) never blocks a page.
+  const CRITICAL_TTL_MS = 10 * 60_000;
+  const RELEASE_TTL_MS = 6 * 60 * 60_000;
+  const SEVERITY_RANK = { critical: 0, security: 1, update: 2 };
+  const WEB_STACK = [['apache', 'Apache', ['apache2', 'httpd']], ['nginx', 'NGINX', ['nginx']], ['exim', 'Exim', ['exim4', 'exim']], ['dovecot', 'Dovecot', ['dovecot']], ['mariadb', 'MariaDB', ['mariadb']], ['mysql', 'MySQL', ['mysql-server', 'mysql-community-server']], ['postgresql', 'PostgreSQL', ['postgresql']], ['pure-ftpd', 'Pure-FTPd', ['pure-ftpd']], ['proftpd', 'ProFTPD', ['proftpd']], ['openssl', 'OpenSSL', ['openssl']]];
+  const RELEASE_SHAPES = { php: ['software.php.releases', 'pkg.php.release', (k) => ({ minor: k }), (r) => typeof r?.version === 'string' && /^\d+\.\d+\.\d+$/.test(r.version)], node: ['software.node.releases', 'pkg.node.release', (k) => ({ major: Number(k) }), (r) => typeof r?.version === 'string' && /^v\d+\.\d+\.\d+$/.test(r.version)] };
+  let criticalCache = null;
+  // The newest upstream release of a PHP minor / Node major, kept six hours in
+  // settings; a failed lookup serves the stale entry when there is one.
+  async function releaseFor(kind, key) {
+    const [setting, opName, args, valid] = RELEASE_SHAPES[kind];
+    const cache = S(setting, {}) || {};
+    const hit = cache[key];
+    if (hit && Date.now() - (Date.parse(hit.at) || 0) < RELEASE_TTL_MS) return hit;
+    try {
+      const r = await op(opName, args(key));
+      if (!valid(r)) throw new Error(`${opName} answered without a usable version`);
+      const entry = { version: r.version, sha256: r.sha256 ?? null, file: r.filename ?? r.file ?? null, at: new Date().toISOString() };
+      settings.set(setting, { ...cache, [key]: entry });
+      return entry;
+    } catch (err) {
+      logger.warn({ err, kind, key }, 'release lookup failed');
+      return hit ?? null;
+    }
+  }
+  const pendingItem = ({ kind, id, label, hits, action }) => ({ kind, id, label, current: hits[0].current ?? null, candidate: hits[0].candidate ?? null, severity: hits.some((p) => p.security) ? 'security' : 'update', reasons: hits.map((p) => `${p.name} ${p.current ?? ''} → ${p.candidate}${p.security ? ' (security)' : ''}`.replace(/\s+/g, ' ')), packages: hits.map((p) => p.name), action });
+  const updates = {
+    async critical({ versions = null, fresh = false } = {}) {
+      if (!fresh && criticalCache && Date.now() - criticalCache.at < CRITICAL_TTL_MS) return criticalCache.value;
+      const items = [];
+      const cached = S('software.updates.last_check', null);
+      const pending = Array.isArray(cached?.packages) ? cached.packages : [];
+      // Advisories the last advisor run found backported by the distribution are not open on that version.
+      const backported = new Set();
+      try { for (const f of ctx.security?.advisor?.last?.()?.findings || []) if (/\.backported$/.test(String(f.id)) && f.advisory) for (const h of f.versions || []) backported.add(`${f.advisory}|${h.id}`); } catch (err) { logger.warn({ err }, 'advisor findings unreadable'); }
+      try {
+        const installed = versions ?? (capabilities.has('php') ? (await php.versions()).versions : []);
+        for (const v of installed) {
+          const advisories = (v.advisories || []).filter((a) => !backported.has(`${a.id}|${v.id}`));
+          const prefix = v.packagePrefix || null;
+          const hits = prefix ? pending.filter((p) => String(p.name).startsWith(prefix)) : [];
+          let candidate = null; let release = null;
+          if (hits.length) candidate = (hits.find((p) => p.name === `${prefix}fpm`) ?? hits.find((p) => p.name === `${prefix}cli`) ?? hits[0]).candidate ?? null;
+          else if (v.layout === 'keel' && /^\d+\.\d+$/.test(String(v.id))) {
+            release = await releaseFor('php', v.id);
+            if (release && v.version && compareVersions(release.version, v.version) > 0) candidate = release.version;
+          }
+          if (!advisories.length && !candidate) continue;
+          const severity = advisories.some((a) => a.grade === 'critical') ? 'critical' : advisories.length || hits.some((p) => p.security) ? 'security' : 'update';
+          const reasons = [
+            ...advisories.map((a) => `${a.id}: ${a.title}${a.fixedIn ? ` (fixed in ${a.fixedIn})` : ''}`),
+            ...(hits.length ? [`${hits.length} package update${hits.length === 1 ? '' : 's'} pending${hits.some((p) => p.security) ? ' (security)' : ''}`] : []),
+            ...(release && candidate ? [`php.net released ${release.version}`] : []),
+          ];
+          items.push({ kind: 'php', id: v.id, label: v.label || `PHP ${v.id}`, current: v.version ?? null, candidate, severity, reasons, layout: v.layout ?? null, packages: hits.map((p) => p.name), unit: v.fpmUnit ?? null, action: candidate ? { method: 'POST', path: '/software/php/update', body: { version: v.id } } : null });
+        }
+      } catch (err) { logger.warn({ err }, 'php update check failed'); }
+      let fam = null;
+      if (pending.length && capabilities.has('pkg')) {
+        try { fam = await family(); } catch (err) { logger.warn({ err }, 'pkg.detect failed'); }
+      }
+      if (fam) {
+        const byName = new Map(pending.map((p) => [p.name, p]));
+        const pick = (names) => (names || []).map((n) => byName.get(n)).filter(Boolean);
+        for (const key of RUNTIME_KEYS) {
+          const entry = RUNTIMES[key];
+          if (key === 'php' || entry.installer) continue;
+          for (const v of entry.single ? [null] : entry.versions) {
+            const hits = pick(packagesFor(entry, fam, v));
+            if (hits.length) items.push(pendingItem({ kind: 'runtime', id: v ? `${key}:${v}` : key, label: v ? `${entry.label} ${v}` : entry.label, hits, action: { method: 'POST', path: '/software/runtimes/update', body: v ? { runtime: key, version: v } : { runtime: key } } }));
+          }
+        }
+        for (const t of TOOLS) {
+          const hits = pick(packagesFor(t, fam));
+          if (hits.length) items.push(pendingItem({ kind: 'tool', id: t.key, label: t.label, hits, action: { method: 'POST', path: '/software/runtimes/update', body: { tool: t.key } } }));
+        }
+        for (const [id, label, prefixes] of WEB_STACK) {
+          const hits = pending.filter((p) => prefixes.some((x) => p.name === x || String(p.name).startsWith(`${x}-`)));
+          if (hits.length) items.push(pendingItem({ kind: 'package', id, label, hits, action: { method: 'POST', path: '/software/update/run', body: { packages: hits.map((p) => p.name), dist: false, refreshIndex: false } } }));
+        }
+      }
+      try {
+        const { versions: nodes } = await op('pkg.node.list');
+        for (const n of nodes || []) {
+          if (!n?.version || !Number.isInteger(n.major)) continue;
+          const release = await releaseFor('node', String(n.major));
+          if (!release || compareVersions(release.version, n.version) <= 0) continue;
+          items.push({ kind: 'runtime', id: `nodejs:${n.major}`, label: `Node.js ${n.major}`, current: n.version, candidate: release.version, severity: 'update', reasons: [`nodejs.org released ${release.version}`], packages: [], action: { method: 'POST', path: '/software/runtimes/update', body: { runtime: 'nodejs', version: String(n.major) } } });
+        }
+      } catch (err) { logger.warn({ err }, 'node update check failed'); }
+      items.sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || a.label.localeCompare(b.label));
+      const value = { checkedAt: new Date().toISOString(), packagesCheckedAt: cached?.at ?? null, items };
+      criticalCache = { at: Date.now(), value };
+      return value;
+    },
+    refresh() { return updates.critical({ fresh: true }); },
+    invalidate() { criticalCache = null; },
+    // { candidate, severity, reasons } for a catalog row, or null.
+    rowUpdate(list, kind, id) {
+      const item = list?.items?.find((i) => i.kind === kind && i.id === id);
+      return item ? { candidate: item.candidate, severity: item.severity, reasons: item.reasons } : null;
     },
   };
 
@@ -857,7 +1019,8 @@ export function createSoftwareService(ctx) {
       if (capabilities.has('php')) {
         try { installed = await php.versions({ modules: false }); } catch (err) { logger.warn({ err }, 'php version listing failed'); }
       }
-      const rc = await runtimes.catalog();
+      const rc = await runtimes.catalog({ updates: false });
+      const crit = await updates.critical({ versions: installed.versions }).catch(() => null);
       const phpRuntime = rc.runtimes.find((r) => r.key === 'php') ?? { versions: [] };
       const offered = php.offeredVersions();
       const usage = php.usage();
@@ -866,7 +1029,7 @@ export function createSoftwareService(ctx) {
       const findInstalled = (id) => installed.versions.find((x) => x.id === id || /php(\d+)$/.exec(String(x.id))?.[1] === digits(id) || String(x.version || '').startsWith(`${id}.`)) ?? null;
       const isOffered = (id, inst) => Boolean(inst) && (offered === null || offered.includes(id));
       const isSource = (inst) => Boolean(inst.source || inst.layout === 'keel');
-      const shapeInstalled = (inst) => ({ installed: true, version: inst.version ?? null, binary: inst.binary ?? null, iniPath: inst.iniPath ?? null, fpmInstalled: inst.fpmInstalled ?? null, fpmActive: inst.fpmActive ?? null, fpmUnit: inst.fpmUnit ?? null, isDefault: Boolean(inst.isDefault), isSystemDefault: inst.id === installed.effectiveDefault, advisories: inst.advisories ?? [], source: isSource(inst), layout: inst.layout ?? null, method: isSource(inst) ? 'source' : 'package', ...(isSource(inst) ? { prefix: `${PHP_SOURCE_PREFIX}/${inst.id}` } : {}) });
+      const shapeInstalled = (inst) => ({ installed: true, version: inst.version ?? null, binary: inst.binary ?? null, iniPath: inst.iniPath ?? null, fpmInstalled: inst.fpmInstalled ?? null, fpmActive: inst.fpmActive ?? null, fpmUnit: inst.fpmUnit ?? null, isDefault: Boolean(inst.isDefault), isSystemDefault: inst.id === installed.effectiveDefault, advisories: inst.advisories ?? [], source: isSource(inst), layout: inst.layout ?? null, method: isSource(inst) ? 'source' : 'package', update: updates.rowUpdate(crit, 'php', inst.id), ...(isSource(inst) ? { prefix: `${PHP_SOURCE_PREFIX}/${inst.id}` } : {}) });
       const seen = new Set();
       const versions = phpRuntime.versions.map((v) => {
         const inst = findInstalled(v.id);
@@ -877,7 +1040,7 @@ export function createSoftwareService(ctx) {
         const avail = inst ? { state: 'installed', note: null } : availability(RUNTIMES.php, v.repo, rs, rc.capability ? rc.family : null, rc.os, v.id);
         return {
           id, catalogVersion: v.id, label: inst ? inst.label ?? v.label : v.label, state: avail.state,
-          ...(inst ? shapeInstalled(inst) : { installed: false, version: null, binary: null, iniPath: null, fpmInstalled: null, fpmActive: null, fpmUnit: null, isDefault: false, isSystemDefault: false, advisories: [], source: false, layout: null, method: avail.method, ...(avail.method === 'source' ? { prefix: `${PHP_SOURCE_PREFIX}/${v.id}` } : {}) }),
+          ...(inst ? shapeInstalled(inst) : { installed: false, version: null, binary: null, iniPath: null, fpmInstalled: null, fpmActive: null, fpmUnit: null, isDefault: false, isSystemDefault: false, advisories: [], source: false, layout: null, method: avail.method, update: null, ...(avail.method === 'source' ? { prefix: `${PHP_SOURCE_PREFIX}/${v.id}` } : {}) }),
           offered: isOffered(id, inst), domains: usage[id] ?? 0, ...(inst ? dependants(id) : { webDefault: false, plans: 0, vhosts: 0 }), packages: avail.method === 'source' || (inst && isSource(inst)) ? [] : v.packages ?? [], repo: v.repo ?? null, repoStatus: rs, note: avail.note ?? runtimeNote('php', rc.family),
         };
       });
@@ -932,6 +1095,54 @@ export function createSoftwareService(ctx) {
       if (offered?.includes(version)) settings.set('php.offered_versions', offered.filter((id) => id !== version));
       job.progress(100, 'done');
       return { version, packages: result.packages ?? [], removed: true, ...(result.layout ? { layout: result.layout } : {}), ...(result.prefix ? { prefix: result.prefix } : {}) };
+    },
+    // Direct update of an installed version (contract §63): the pending
+    // packages of its prefix, or a fresh php.net build over a Keel prefix.
+    async update(version, user, req) {
+      requirePhp();
+      const list = await updates.critical({ fresh: true });
+      const item = list.items.find((i) => i.kind === 'php' && i.id === version);
+      if (!item) {
+        const { versions } = await php.versions();
+        if (!versions.some((v) => v.id === version)) throw unprocessable(`PHP "${version}" is not installed on this server`, { version: ['Pick one of the installed versions'] });
+        throw unprocessable(`PHP ${version} has no pending update`, { version: ['Nothing newer is available for it'] });
+      }
+      if (!item.candidate) throw unprocessable(`PHP ${version} is affected by ${item.reasons[0] ?? 'an advisory'}, but no newer build or package is available yet`, { version: ['No fix is available yet; check again later or move its sites to another version'] });
+      const method = item.layout === 'keel' ? 'source' : 'package';
+      const job = enqueue('software.php.update', { version, layout: item.layout, candidate: item.candidate, current: item.current, packages: item.packages, unit: item.unit, method }, user);
+      req?.audit?.({ action: 'software.php.update', target: version, args: { from: item.current, to: item.candidate, method, packages: item.packages, jobId: job.id } });
+      return { job, version, candidate: item.candidate, method };
+    },
+    async updateJob(job) {
+      const { version, layout, candidate, current, packages, unit, method } = job.params;
+      job.log(`PHP ${version}: ${current ?? 'unknown'} → ${candidate} (${method === 'source' ? 'php.net source build' : JSON.stringify(packages)})`);
+      let build = null; let restarted = false;
+      if (method === 'source') {
+        job.progress(5, `downloading and building PHP ${candidate}`);
+        await runLongOp(job, 'pkg.php.build', { minor: version }, `PHP ${version} build`);
+        job.progress(85, `restarting keel-php${version}-fpm`);
+        build = await job.agent.op('pkg.php.build.finish', { minor: version });
+        const unitName = build.unit ?? `keel-php${version}-fpm`;
+        if (build.unitError || build.active === false) throw new Error(`PHP ${build.version ?? candidate} built but ${unitName} did not come back: ${build.unitError ?? 'unit inactive'}; see journalctl -u ${unitName}`);
+        restarted = Boolean(build.restarted);
+        job.log(`${unitName} ${restarted ? 'restarted' : 'started'} with PHP ${build.version ?? candidate}`);
+      } else {
+        job.progress(10, `upgrading ${packages.length} package(s)`);
+        await runLongOp(job, 'pkg.upgrade', { packages, dist: false }, `PHP ${version} upgrade`);
+        if (unit) {
+          job.progress(80, `reloading ${unit}`);
+          try { await job.agent.op('svc.reload', { unit }); restarted = true; job.log(`${unit} reloaded`); } catch (err) { job.log(`${unit} could not be reloaded: ${err.message}`, 'warn'); }
+        }
+        job.progress(85, 'checking what is still pending');
+        try { recordCheck(await job.agent.op('pkg.upgradable')); } catch (err) { job.log(`post-upgrade check failed: ${err.message}`, 'warn'); }
+      }
+      job.progress(92, 're-detecting capabilities');
+      await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after PHP update failed'); job.log(`capability re-detection failed: ${err.message}`, 'warn'); });
+      let detected = null;
+      try { detected = (await job.agent.op('pkg.php.versions')).versions.find((v) => v.id === version)?.version ?? null; job.log(`PHP ${version} now reports PHP_VERSION ${detected ?? 'unknown'}`); } catch (err) { job.log(`PHP re-detection failed: ${err.message}`, 'warn'); }
+      updates.invalidate();
+      job.progress(100, 'done');
+      return { version, layout: layout ?? null, method, from: current ?? null, to: detected ?? build?.version ?? candidate, candidate, packages, restarted, updated: true };
     },
   };
 
@@ -1340,10 +1551,12 @@ export function createSoftwareService(ctx) {
     'software.php.resync': (job) => php.resyncJob(job),
     'software.php.apply': (job) => php.applyJob(job),
     'software.php.remove': (job) => php.removeJob(job),
+    'software.php.update': (job) => php.updateJob(job),
     'software.ea4.build': (job) => ea4.buildJob(job),
     'software.runtime.install': (job) => runtimes.installJob(job),
     'software.runtime.remove': (job) => runtimes.removeJob(job),
+    'software.runtime.update': (job) => runtimes.updateJob(job),
   };
 
-  return { pkg, update, rpm, modules, perl, panel, php, ini, nginx, ea4, runtimes, jobs, resolveDomain, runs };
+  return { pkg, update, updates, rpm, modules, perl, panel, php, ini, nginx, ea4, runtimes, jobs, resolveDomain, runs };
 }

@@ -109,6 +109,30 @@ describe('Install Software page', () => {
     expect(TABS).toEqual(['runtimes', 'tools', 'search', 'installed', 'history']);
   });
 
+  it('lists installed runtimes and tools with updates above each tab, with the Update button, from the critical list', () => {
+    fixtures.responses.clear();
+    set('/software/pkg/detect', { data: detect });
+    set('/software/pkg/recent', { data: [] });
+    set('/software/runtimes/recent', { data: [] });
+    set('/software/runtimes', { data: catalog });
+    set('/software/updates/critical', { data: { items: [
+      { kind: 'php', id: '8.3', label: 'PHP 8.3', current: '8.3.19', candidate: '8.3.36-1', severity: 'critical', reasons: ['CVE-2026-109619: PHP2Shell'], packages: ['php8.3-fpm'], action: { method: 'POST', path: '/software/php/update', body: { version: '8.3' } } },
+      { kind: 'runtime', id: 'nodejs:22', label: 'Node.js 22', current: 'v22.14.0', candidate: 'v22.15.0', severity: 'update', reasons: ['nodejs.org released v22.15.0'], packages: [], action: { method: 'POST', path: '/software/runtimes/update', body: { runtime: 'nodejs', version: '22' } } },
+      { kind: 'tool', id: 'git', label: 'Git', current: '2.43.0-1', candidate: '2.43.0-2', severity: 'update', reasons: ['git 2.43.0-1 → 2.43.0-2'], packages: ['git'], action: { method: 'POST', path: '/software/runtimes/update', body: { tool: 'git' } } },
+    ] } });
+    const runtimes = render(h(InstallSoftware, { fn }));
+    expect(runtimes).toContain('Installed runtimes with updates');
+    expect(runtimes).toContain('Update to 8.3.36-1');
+    expect(runtimes).toContain('Update to v22.15.0');
+    expect(runtimes).not.toContain('Update to 2.43.0-2');
+    const tools = render(h(InstallSoftware, { fn }), '/software/install-distro-packages?tab=tools');
+    expect(tools).toContain('Installed tools with updates');
+    expect(tools).toContain('Update to 2.43.0-2');
+    expect(tools).not.toContain('Update to 8.3.36-1');
+    const search = render(h(InstallSoftware, { fn }), '/software/install-distro-packages?tab=search');
+    expect(search).not.toContain('with updates');
+  });
+
   it('shows the tools grid on the tools tab', () => {
     fixtures.responses.clear();
     set('/software/pkg/detect', { data: detect });
@@ -256,8 +280,8 @@ describe('pages that used to link to the package search', () => {
       versions: [
         row({ id: '8.5', label: 'PHP 8.5', state: 'unsupported', repoStatus: { present: false, supported: false, detail: 'ppa:ondrej/php has no packages for Ubuntu resolute' }, note: 'ppa:ondrej/php has no packages for Ubuntu resolute' }),
         row({ id: '8.4', label: 'PHP 8.4', state: 'available', packages: ['php8.4-fpm', 'php8.4-cli'], method: 'package' }),
-        row({ id: '8.3', label: 'PHP 8.3', state: 'installed', installed: true, version: '8.3.19', binary: '/usr/bin/php8.3', fpmInstalled: true, fpmActive: true, fpmUnit: 'php8.3-fpm', isDefault: true, isSystemDefault: true, offered: true, domains: 3, method: 'package' }),
-        row({ id: '8.2', label: 'PHP 8.2', state: 'installed', installed: true, version: '8.2.29', binary: '/usr/bin/php8.2', fpmInstalled: true, fpmActive: false, fpmUnit: 'php8.2-fpm', offered: false, domains: 0, method: 'package' }),
+        row({ id: '8.3', label: 'PHP 8.3', state: 'installed', installed: true, version: '8.3.19', binary: '/usr/bin/php8.3', fpmInstalled: true, fpmActive: true, fpmUnit: 'php8.3-fpm', isDefault: true, isSystemDefault: true, offered: true, domains: 3, method: 'package', update: { candidate: '8.3.36-1', severity: 'critical', reasons: ['CVE-2026-109619: PHP2Shell (fixed in 8.3.36)'] } }),
+        row({ id: '8.2', label: 'PHP 8.2', state: 'installed', installed: true, version: '8.2.29', binary: '/usr/bin/php8.2', fpmInstalled: true, fpmActive: false, fpmUnit: 'php8.2-fpm', offered: false, domains: 0, method: 'package', update: { candidate: null, severity: 'critical', reasons: ['CVE-2026-109619: PHP2Shell'] } }),
         row({ id: '8.1', label: 'PHP 8.1', state: 'available', method: 'source', repoStatus: { present: false, supported: false, detail: 'ppa:ondrej/php has no packages for Ubuntu resolute' }, note: 'Built from the official php.net source into /opt/keel/php/8.1 (about 15 minutes); packages from ppa:ondrej/php are not available for ubuntu 26.04' }),
         row({ id: '7.4', label: 'PHP 7.4 (Keel build)', state: 'installed', installed: true, version: '7.4.33', binary: '/opt/keel/php/7.4/bin/php', fpmInstalled: true, fpmActive: true, fpmUnit: 'keel-php7.4-fpm', offered: false, domains: 0, method: 'source', source: true }),
       ],
@@ -289,6 +313,10 @@ describe('pages that used to link to the package search', () => {
     expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*" disabled="" title="This is the system default; set another version as default first">Remove<\/button>/);
     expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*">Remove<\/button>/);
     expect(html).toContain('>Set as default</button>');
+    // Direct update (contract §63): the row's `update` decides the button; null candidate = nothing to update to yet.
+    expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*" title="CVE-2026-109619: PHP2Shell \(fixed in 8\.3\.36\)">Update to 8\.3\.36-1<\/button>/);
+    expect((html.match(/>Update to /g) || []).length).toBe(1);
+    expect(html).toContain('no fix available yet');
     expect(html).toContain('>System default<');
     expect(html).toContain('php8.2-fpm · stopped');
     expect(html).toContain('Offered to accounts');

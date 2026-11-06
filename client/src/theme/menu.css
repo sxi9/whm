@@ -1,0 +1,7 @@
+/* Shared popover menus (components/Menu.jsx, hooks/useMenu.js). A floating
+   menu is portalled to <body> and placed against the trigger's viewport
+   rectangle by inline style; the look stays that of .menu-items in base.css. */
+.menu-items.menu-portal { position: fixed; top: auto; right: auto; bottom: auto; left: auto; z-index: 60; max-height: calc(100vh - 16px); overflow-y: auto; }
+.menu-items:focus { outline: none; }
+.menu-item:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.menu-divider { height: 1px; background: var(--border); margin: 4px 6px; }

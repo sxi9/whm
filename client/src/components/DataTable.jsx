@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { ChevronDown, ChevronUp, ChevronsUpDown, Search, ChevronLeft, ChevronRight, MoreHorizontal } from 'lucide-react';
+import { Menu } from './Menu.jsx';
 
 export function DataTable({
   columns, rows = [], loading = false, error = null, emptyText = 'No records to show yet',
@@ -84,15 +85,6 @@ export function DataTable({
 }
 
 export function RowActions({ actions }) {
-  const [open, setOpen] = useState(false);
-  const [pos, setPos] = useState(null);
-  // The menu is positioned against the viewport so the card's rounded clipping
-  // and the table's horizontal scroll never cut it off.
-  const toggle = (e) => {
-    const r = e.currentTarget.getBoundingClientRect();
-    setPos({ top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) });
-    setOpen((o) => !o);
-  };
   const visible = (actions || []).filter(Boolean);
   if (!visible.length) return null;
   const primary = visible.filter((a) => a.primary);
@@ -101,14 +93,8 @@ export function RowActions({ actions }) {
     <div className="row-actions">
       {primary.map((a) => <button key={a.label} className={`btn btn-sm ${a.danger ? 'btn-danger-ghost' : ''}`} onClick={a.onClick} disabled={a.disabled}>{a.label}</button>)}
       {rest.length > 0 && (
-        <div className="menu" onMouseLeave={() => setOpen(false)}>
-          <button className="btn btn-sm btn-icon" onClick={toggle} aria-label="More actions"><MoreHorizontal size={16} /></button>
-          {open && (
-            <div className="menu-items right floating" style={pos ? { top: pos.top, right: pos.right } : undefined}>
-              {rest.map((a) => <button key={a.label} className={`menu-item ${a.danger ? 'danger' : ''}`} onClick={() => { setOpen(false); a.onClick(); }} disabled={a.disabled}>{a.label}</button>)}
-            </div>
-          )}
-        </div>
+        <Menu floating align="right" items={rest.map((a) => ({ label: a.label, onClick: a.onClick, danger: a.danger, disabled: a.disabled }))}
+          trigger={(props) => <button {...props} className="btn btn-sm btn-icon" aria-label="More actions"><MoreHorizontal size={16} /></button>} />
       )}
     </div>
   );

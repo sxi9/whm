@@ -878,11 +878,11 @@ describe('pkg.php.build.finish', () => {
     const r = await runOp('pkg.php.build.finish', { minor: '8.4' }, ctx);
     const unitFile = path.join(dirs.WHM_SYSTEMD_UNIT_DIR, 'keel-php8.4-fpm.service');
     const link = path.join(dirs.WHM_LOCAL_BIN_DIR, 'php8.4');
-    expect(r).toEqual({ minor: '8.4', version: '8.4.27', prefix, binary: path.join(prefix, 'bin', 'php'), unit: 'keel-php8.4-fpm', unitFile, active: true, link, buildDirsRemoved: [build] });
+    expect(r).toEqual({ minor: '8.4', version: '8.4.27', prefix, binary: path.join(prefix, 'bin', 'php'), unit: 'keel-php8.4-fpm', unitFile, active: true, enabled: true, link, buildDirsRemoved: [build] });
     expect(fs.readFileSync(unitFile, 'utf8')).toBe(renderPhpUnit('8.4'));
     expect(fs.statSync(unitFile).mode & 0o777).toBe(0o644);
     expect(fs.readlinkSync(link)).toBe(path.join(prefix, 'bin', 'php'));
-    expect(calls).toEqual([['daemon-reload'], ['enable', '--now', 'keel-php8.4-fpm.service'], ['is-active', 'keel-php8.4-fpm.service']]);
+    expect(calls).toEqual([['daemon-reload'], ['enable', '--now', 'keel-php8.4-fpm.service'], ['is-active', 'keel-php8.4-fpm.service'], ['is-enabled', 'keel-php8.4-fpm.service']]);
     expect(fs.existsSync(build)).toBe(false);
     expect(fs.existsSync(other)).toBe(true);
     const again = await runOp('pkg.php.build.finish', { minor: '8.4' }, ctx);
@@ -989,5 +989,186 @@ describe('pkg.php.remove for a Keel build', () => {
     process.env.WHM_KEEL_PHP_DIR = '/usr/share/keel-php';
     try { expect((await opError(runOp('pkg.php.remove', { version: '8.4' }, ctx))).code).toBe('path_not_allowed'); } finally { process.env.WHM_KEEL_PHP_DIR = prev; }
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('pkg.php.release / pkg.node.release (read-only release lookups)', () => {
+  it('take only the PHP minor / Node major the installers take; nothing runs on a rejected schema', async () => {
+    for (const bad of [...INJECTION, '8.4.1', '7.3', 84, null]) expect((await opError(runOp('pkg.php.release', { minor: bad }, ctx))).code, String(bad)).toBe('invalid_args');
+    for (const bad of [15, 31, '20', '20; rm -rf /', null, NaN]) expect((await opError(runOp('pkg.node.release', { major: bad }, ctx))).code, String(bad)).toBe('invalid_args');
+    expect((await opError(runOp('pkg.php.release', { minor: '8.4', wait: false }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.node.release', { major: 20, url: 'https://evil' }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.php.release', {}, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.node.release', {}, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+    expect(catalog.get('pkg.php.release').destructive).toBe(false);
+    expect(catalog.get('pkg.node.release').destructive).toBe(false);
+  });
+
+  it('resolves a PHP minor through php.net\'s JSON index over https only, with the sha256 of the .tar.xz', async () => {
+    exec.mockImplementation(async (bin, argv) => {
+      expect(bin).toBe('curl');
+      expect(argv.slice(0, 7)).toEqual(['-fsSL', '--proto', '=https', '--proto-redir', '=https', '--max-time', '60']);
+      expect(argv[argv.length - 1]).toBe('https://www.php.net/releases/index.php?json&version=8.4');
+      return ok(RELEASE('8.4.27', { sha256: SRC_SHA }));
+    });
+    expect(await runOp('pkg.php.release', { minor: '8.4' }, ctx)).toEqual({ minor: '8.4', version: '8.4.27', filename: 'php-8.4.27.tar.xz', sha256: SRC_SHA });
+    expect(exec).toHaveBeenCalledTimes(1);
+    exec.mockImplementation(async () => ok('{"version":""}'));
+    expect((await opError(runOp('pkg.php.release', { minor: '8.4' }, ctx))).code).toBe('not_found');
+    exec.mockImplementation(async () => ok(RELEASE('8.3.1')));
+    expect((await opError(runOp('pkg.php.release', { minor: '8.4' }, ctx))).code).toBe('invalid_release');
+    expect(fs.readdirSync(dirs.WHM_KEEL_PHP_DIR)).toEqual([]);
+  });
+
+  it.skipIf(!archOk)('resolves a Node.js major through the SHASUMS256 index for this architecture and downloads nothing', async () => {
+    exec.mockImplementation(async (bin, argv) => {
+      expect(bin).toBe('curl');
+      expect(argv[argv.length - 1]).toBe('https://nodejs.org/dist/latest-v20.x/SHASUMS256.txt');
+      return ok(`${SHA_A}  node-v20.19.4-linux-${arch}.tar.xz\n${'b'.repeat(64)}  node-v20.19.4-darwin-${arch}.tar.gz\n`);
+    });
+    expect(await runOp('pkg.node.release', { major: 20 }, ctx)).toEqual({ major: 20, arch, version: 'v20.19.4', file: `node-v20.19.4-linux-${arch}.tar.xz`, sha256: SHA_A });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(fs.readdirSync(dirs.WHM_NODE_DIR)).toEqual([]);
+    exec.mockImplementation(async () => ok(`${SHA_A}  node-v20.19.4-darwin-${arch}.tar.gz\n`));
+    expect((await opError(runOp('pkg.node.release', { major: 20 }, ctx))).code).toBe('not_found');
+  });
+});
+
+describe('pkg.php.build.finish over an already registered unit (update of a Keel build)', () => {
+  const unitFileFor = () => path.join(dirs.WHM_SYSTEMD_UNIT_DIR, 'keel-php8.4-fpm.service');
+  // The unit's state before the op, then what systemctl answers once the op acted on it.
+  const systemctl = (calls, { activeBefore, enabledAfter = 'enabled' }) => {
+    let acted = false;
+    return async (bin, argv) => {
+      if (bin === 'systemctl') {
+        calls.push(argv);
+        if (argv[0] === 'is-active') return acted || activeBefore ? ok('active\n') : { stdout: 'inactive\n', stderr: '', code: 3 };
+        if (argv[0] === 'is-enabled') return enabledAfter === 'enabled' ? ok('enabled\n') : { stdout: `${enabledAfter}\n`, stderr: '', code: 1 };
+        acted = true;
+        return ok();
+      }
+      if (bin.endsWith(path.join('bin', 'php'))) return ok('8.4.28');
+      throw new Error(`unexpected ${bin} ${argv.join(' ')}`);
+    };
+  };
+
+  it.skipIf(!linux)('restarts a running unit instead of enabling it and reports restarted: true', async () => {
+    const prefix = fakeKeelTree('8.4');
+    fs.writeFileSync(unitFileFor(), '[Unit]\nDescription=old\n');
+    hasBinary.mockImplementation((name) => name === 'systemctl');
+    const calls = [];
+    exec.mockImplementation(systemctl(calls, { activeBefore: true }));
+    const r = await runOp('pkg.php.build.finish', { minor: '8.4' }, ctx);
+    expect(r).toMatchObject({ minor: '8.4', version: '8.4.28', prefix, unit: 'keel-php8.4-fpm', active: true, enabled: true, restarted: true });
+    expect(calls).toEqual([['is-active', 'keel-php8.4-fpm.service'], ['daemon-reload'], ['restart', 'keel-php8.4-fpm.service'], ['is-active', 'keel-php8.4-fpm.service'], ['is-enabled', 'keel-php8.4-fpm.service']]);
+    expect(fs.readFileSync(unitFileFor(), 'utf8')).toBe(renderPhpUnit('8.4'));
+  });
+
+  it.skipIf(!linux)('enables a unit whose file exists but which is not running (first enable failed, or stopped by the admin) instead of restarting it', async () => {
+    fakeKeelTree('8.4');
+    fs.writeFileSync(unitFileFor(), renderPhpUnit('8.4'));
+    hasBinary.mockImplementation((name) => name === 'systemctl');
+    const calls = [];
+    exec.mockImplementation(systemctl(calls, { activeBefore: false }));
+    const r = await runOp('pkg.php.build.finish', { minor: '8.4' }, ctx);
+    expect(r).toMatchObject({ active: true, enabled: true });
+    expect(r.restarted).toBeUndefined();
+    expect(calls).toEqual([['is-active', 'keel-php8.4-fpm.service'], ['daemon-reload'], ['enable', '--now', 'keel-php8.4-fpm.service'], ['is-active', 'keel-php8.4-fpm.service'], ['is-enabled', 'keel-php8.4-fpm.service']]);
+  });
+
+  it.skipIf(!linux)('reports enabled: false when systemctl says so, and never probes a unit that has no file yet', async () => {
+    fakeKeelTree('8.4');
+    hasBinary.mockImplementation((name) => name === 'systemctl');
+    const calls = [];
+    exec.mockImplementation(systemctl(calls, { activeBefore: true, enabledAfter: 'disabled' }));
+    const r = await runOp('pkg.php.build.finish', { minor: '8.4' }, ctx);
+    expect(r).toMatchObject({ active: true, enabled: false });
+    expect(r.restarted).toBeUndefined();
+    expect(calls[0]).toEqual(['daemon-reload']);
+    expect(calls[1]).toEqual(['enable', '--now', 'keel-php8.4-fpm.service']);
+  });
+});
+
+describe('php-build.sh over a live prefix (update of a Keel build)', () => {
+  it('guards the discovery marker and the seeded configuration so a rebuild keeps the running version and the operator\'s php.ini', () => {
+    expect(buildScript).toMatch(/^if \[ \$fresh = 1 \]; then rm -f "\$KEEL_PHP_PREFIX\/\.keel-build-ok"; fi$/m);
+    expect(buildScript).not.toMatch(/^rm -f "\$KEEL_PHP_PREFIX\/\.keel-build-ok"/m);
+    expect(buildScript).toMatch(/^\[ -e "\$KEEL_PHP_PREFIX\/lib\/php\.ini" \] \|\| install -m 0644 php\.ini-production "\$KEEL_PHP_PREFIX\/lib\/php\.ini"$/m);
+    expect(buildScript).toMatch(/^\[ -e "\$KEEL_PHP_PREFIX\/lib\/conf\.d\/10-opcache\.ini" \] \|\| printf 'zend_extension=opcache\\n' > "\$KEEL_PHP_PREFIX\/lib\/conf\.d\/10-opcache\.ini"$/m);
+    expect(buildScript.match(/php\.ini-production/g)).toHaveLength(1);
+    // php-fpm.conf and keel-idle.conf stay panel-owned and are regenerated on every run; the marker is still written last.
+    expect(buildScript).toMatch(/^mv "\$fpmconf\.tmp" "\$fpmconf"$/m);
+    expect(buildScript).toMatch(/^mv "\$idle\.tmp" "\$idle"$/m);
+    expect(buildScript.trimEnd().split('\n').pop()).toBe(': > "$KEEL_PHP_PREFIX/.keel-build-ok"');
+  });
+
+  // The script only accepts a prefix under /opt/keel/php, so the real run needs a writable
+  // /opt/keel/php (the Linux host clone); configure, make and the built binaries are shims.
+  const keelRoot = '/opt/keel/php';
+  const canRun = linux && fs.existsSync('/bin/bash') && (() => { try { fs.accessSync(keelRoot, fs.constants.W_OK); return true; } catch { return false; } })();
+  it.skipIf(!canRun)('keeps .keel-build-ok, php.ini and 10-opcache.ini across a rebuild, and keeps them when the rebuild fails', async () => {
+    const { execFile } = await import('node:child_process');
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'keel-php-build-'));
+    const prefix = path.join(keelRoot, `.rebuild-test-${process.pid}`);
+    const freshPrefix = path.join(keelRoot, `.fresh-test-${process.pid}`);
+    const src = path.join(work, 'php-8.4.28');
+    const shims = path.join(work, 'bin');
+    const scriptPath = path.join(work, 'php-build.sh');
+    const run = (env) => new Promise((resolve) => execFile('/bin/bash', [scriptPath], { env: { ...process.env, PATH: `${shims}:${process.env.PATH}`, ...env }, maxBuffer: 1 << 20 }, (err, stdout, stderr) => resolve({ code: err ? err.code ?? 1 : 0, stdout, stderr })));
+    fs.mkdirSync(src); fs.mkdirSync(shims);
+    fs.writeFileSync(scriptPath, buildScript);
+    fs.writeFileSync(path.join(src, 'configure'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(src, 'php.ini-production'), 'memory_limit = 128M\n');
+    // make install writes the binaries the script runs afterwards; make records whether the marker was present while it ran and fails on demand.
+    fs.writeFileSync(path.join(shims, 'make'), [
+      '#!/bin/sh',
+      'if [ -e "$KEEL_TEST_FAIL" ]; then echo "make: simulated failure" >&2; exit 2; fi',
+      'if [ -e "$KEEL_PHP_PREFIX/.keel-build-ok" ]; then echo present >> "$KEEL_TEST_LOG"; else echo absent >> "$KEEL_TEST_LOG"; fi',
+      'if [ "$1" = install ]; then',
+      '  mkdir -p "$KEEL_PHP_PREFIX/bin" "$KEEL_PHP_PREFIX/sbin" "$KEEL_PHP_PREFIX/lib"',
+      '  printf \'#!/bin/sh\\necho "== built PHP 8.4.28"\\n\' > "$KEEL_PHP_PREFIX/bin/php"; chmod 755 "$KEEL_PHP_PREFIX/bin/php"',
+      '  printf \'#!/bin/sh\\nexit 0\\n\' > "$KEEL_PHP_PREFIX/sbin/php-fpm"; chmod 755 "$KEEL_PHP_PREFIX/sbin/php-fpm"',
+      'fi',
+      'exit 0',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const log = path.join(work, 'make.log');
+    const failFlag = path.join(work, 'fail');
+    const env = { KEEL_PHP_SRC: src, KEEL_PHP_PREFIX: prefix, KEEL_PHP_MINOR: '8.4', KEEL_PHP_JOBS: '1', KEEL_FPM_USER: 'nobody', KEEL_FPM_GROUP: 'nogroup', KEEL_TEST_LOG: log, KEEL_TEST_FAIL: failFlag };
+    try {
+      const first = await run(env);
+      expect(first.code, first.stderr).toBe(0);
+      expect(fs.existsSync(path.join(prefix, '.keel-build-ok'))).toBe(true);
+      expect(fs.readFileSync(path.join(prefix, 'lib', 'php.ini'), 'utf8')).toBe('memory_limit = 128M\n');
+      expect(fs.readFileSync(path.join(prefix, 'lib', 'conf.d', '10-opcache.ini'), 'utf8')).toBe('zend_extension=opcache\n');
+      expect(fs.readFileSync(log, 'utf8').trim().split('\n')).toEqual(['absent', 'absent']);
+      // The operator edited both files; the rebuild must keep them and the marker must stay for the whole run.
+      fs.writeFileSync(path.join(prefix, 'lib', 'php.ini'), 'memory_limit = 512M\n');
+      fs.writeFileSync(path.join(prefix, 'lib', 'conf.d', '10-opcache.ini'), 'zend_extension=opcache\nopcache.memory_consumption=256\n');
+      fs.writeFileSync(log, '');
+      const second = await run(env);
+      expect(second.code, second.stderr).toBe(0);
+      expect(fs.readFileSync(log, 'utf8').trim().split('\n')).toEqual(['present', 'present']);
+      expect(fs.existsSync(path.join(prefix, '.keel-build-ok'))).toBe(true);
+      expect(fs.readFileSync(path.join(prefix, 'lib', 'php.ini'), 'utf8')).toBe('memory_limit = 512M\n');
+      expect(fs.readFileSync(path.join(prefix, 'lib', 'conf.d', '10-opcache.ini'), 'utf8')).toBe('zend_extension=opcache\nopcache.memory_consumption=256\n');
+      expect(fs.readFileSync(path.join(prefix, 'etc', 'php-fpm.conf'), 'utf8')).toContain('[global]');
+      // A failed rebuild keeps the prefix, the marker and the configuration: the version that still serves stays listed.
+      fs.writeFileSync(failFlag, '');
+      const failed = await run(env);
+      expect(failed.code).not.toBe(0);
+      expect(fs.existsSync(path.join(prefix, '.keel-build-ok'))).toBe(true);
+      expect(fs.existsSync(path.join(prefix, 'bin', 'php'))).toBe(true);
+      expect(fs.readFileSync(path.join(prefix, 'lib', 'php.ini'), 'utf8')).toBe('memory_limit = 512M\n');
+      // A fresh prefix that fails is removed entirely.
+      const fresh = await run({ ...env, KEEL_PHP_PREFIX: freshPrefix });
+      expect(fresh.code).not.toBe(0);
+      expect(fs.existsSync(freshPrefix)).toBe(false);
+    } finally {
+      fs.rmSync(prefix, { recursive: true, force: true });
+      fs.rmSync(freshPrefix, { recursive: true, force: true });
+      fs.rmSync(work, { recursive: true, force: true });
+    }
   });
 });

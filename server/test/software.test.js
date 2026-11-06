@@ -525,7 +525,7 @@ describe('Install Software (one-click runtimes and tools)', () => {
     expect(d.runtimes.find((r) => r.key === 'ruby')).toMatchObject({ single: true, versions: [{ id: 'ruby', installed: false, packages: ['ruby-full'] }] });
     // composer's EPEL repo is RHEL-only.
     expect(d.runtimes.find((r) => r.key === 'composer').versions[0].repo).toBeNull();
-    expect(d.tools.find((t) => t.key === 'git')).toEqual({ key: 'git', label: 'Git', packages: ['git'], installed: true });
+    expect(d.tools.find((t) => t.key === 'git')).toEqual({ key: 'git', label: 'Git', packages: ['git'], installed: true, update: null });
     expect(d.tools.find((t) => t.key === 'bind')).toMatchObject({ packages: ['bind9', 'bind9utils'], installed: false });
     expect(d.tools.find((t) => t.key === 'cpanminus').packages).toEqual(['cpanminus']);
     expect(app.agent.callsTo('pkg.runtime.detect')).toHaveLength(1);
@@ -1620,5 +1620,234 @@ describe('EasyApache 4', () => {
     expect((await del(`/api/software/ea4/profiles/${copy.body.data.id}`)).body.data.deleted).toBe(true);
     expect((await get(`/api/software/ea4/profiles/${copy.body.data.id}`)).status).toBe(404);
     expect((await del(`/api/software/ea4/profiles/${created.body.data.id}`)).status).toBe(200);
+  });
+});
+
+describe('Critical updates and direct Update buttons (contract §63)', () => {
+  const PHP83 = { ...PHP, packagePrefix: 'php8.3-' };
+  const PHP82P = { ...PHP82, packagePrefix: 'php8.2-' };
+  const KEEL84 = keelVersion('8.4');
+  const stock = () => ({ versions: [PHP, PHP82], defaultId: phpCliDefault, defaultBinary: `/usr/bin/php${phpCliDefault}` });
+  const pendingCheck = (packages) => app.ctx.settings.set('software.updates.last_check', { at: '2026-11-06T05:41:00.000Z', manager: 'apt', count: packages.length, security: packages.filter((p) => p.security).length, rebootRequired: false, packages, truncated: false });
+  const PENDING = [
+    { name: 'php8.3-fpm', current: '8.3.6-1', candidate: '8.3.36-1', repo: 'ondrej', security: true },
+    { name: 'php8.3-cli', current: '8.3.6-1', candidate: '8.3.36-1', repo: 'ondrej', security: true },
+    { name: 'git', current: '2.43.0-1', candidate: '2.43.0-2', repo: 'noble-updates', security: false },
+    { name: 'openssl', current: '3.0.13-0ubuntu3.4', candidate: '3.0.13-0ubuntu3.5', repo: 'noble-security', security: true },
+    { name: 'libssl3', current: '3.0.13-0ubuntu3.4', candidate: '3.0.13-0ubuntu3.5', repo: 'noble-security', security: true },
+    { name: 'vim', current: '9.0', candidate: '9.1', repo: 'noble-updates', security: false },
+  ];
+  const withVersions = (versions) => app.agent.set('pkg.php.versions', () => ({ versions, defaultId: phpCliDefault, defaultBinary: `/usr/bin/php${phpCliDefault}` }));
+  const SHA_A = 'a'.repeat(64);
+  const SHA_B = 'b'.repeat(64);
+
+  it('registers both update jobs and keeps the endpoints root-only', async () => {
+    expect(app.ctx.jobs.types()).toContain('software.php.update');
+    expect(app.ctx.jobs.types()).toContain('software.runtime.update');
+    expect((await reseller.get('/api/software/updates/critical')).status).toBe(403);
+    expect((await mutate(reseller, 'post', '/api/software/updates/critical/refresh', {}, resellerCsrf)).status).toBe(403);
+    expect((await mutate(reseller, 'post', '/api/software/php/update', { version: '8.3' }, resellerCsrf)).status).toBe(403);
+    expect((await mutate(reseller, 'post', '/api/software/runtimes/update', { tool: 'git' }, resellerCsrf)).status).toBe(403);
+  });
+
+  it('builds the list from advisories, the cached update check, php.net and nodejs.org releases, sorted by severity, and caches it', async () => {
+    pendingCheck(PENDING);
+    withVersions([PHP83, PHP82P, KEEL84]);
+    nodeVersions = [{ major: 22, version: 'v22.11.0', path: '/opt/keel/node/22', bin: '/opt/keel/node/22/bin/node' }];
+    app.agent.set('pkg.php.release', ({ minor }) => ({ minor, version: `${minor}.35`, filename: `php-${minor}.35.tar.xz`, sha256: SHA_A }));
+    app.agent.set('pkg.node.release', ({ major }) => ({ major, arch: 'x64', version: `v${major}.14.0`, file: `node-v${major}.14.0-linux-x64.tar.xz`, sha256: SHA_B }));
+    app.ctx.settings.set('software.php.releases', null);
+    app.ctx.settings.set('software.node.releases', null);
+    app.agent.calls.length = 0;
+    try {
+      const res = await post('/api/software/updates/critical/refresh');
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const { items, packagesCheckedAt } = res.body.data;
+      expect(packagesCheckedAt).toBe('2026-11-06T05:41:00.000Z');
+      expect(items.map((i) => [i.kind, i.id, i.severity])).toEqual([
+        ['php', '8.2', 'critical'], ['php', '8.3', 'critical'], ['package', 'openssl', 'security'], ['tool', 'git', 'update'], ['runtime', 'nodejs:22', 'update'], ['php', '8.4', 'update'],
+      ]);
+      const php83 = items[1];
+      expect(php83).toMatchObject({ label: 'PHP 8.3', current: '8.3.6', candidate: '8.3.36-1', layout: 'debian', packages: ['php8.3-fpm', 'php8.3-cli'], unit: 'php8.3-fpm', action: { method: 'POST', path: '/software/php/update', body: { version: '8.3' } } });
+      expect(php83.reasons[0]).toMatch(/^CVE-2026-109619: .*\(fixed in 8\.3\.36\)$/);
+      expect(php83.reasons).toContain('2 package updates pending (security)');
+      // Affected, but nothing newer to install: the item stays with no action.
+      expect(items[0]).toMatchObject({ label: 'PHP 8.2', current: '8.2.20', candidate: null, action: null });
+      expect(items[0].reasons).toHaveLength(1);
+      expect(items[2]).toMatchObject({ label: 'OpenSSL', current: '3.0.13-0ubuntu3.4', candidate: '3.0.13-0ubuntu3.5', packages: ['openssl'], action: { path: '/software/update/run', body: { packages: ['openssl'], dist: false, refreshIndex: false } } });
+      expect(items[3]).toMatchObject({ label: 'Git', current: '2.43.0-1', candidate: '2.43.0-2', packages: ['git'], action: { path: '/software/runtimes/update', body: { tool: 'git' } } });
+      expect(items[4]).toMatchObject({ label: 'Node.js 22', current: 'v22.11.0', candidate: 'v22.14.0', action: { path: '/software/runtimes/update', body: { runtime: 'nodejs', version: '22' } } });
+      expect(items[5]).toMatchObject({ label: 'PHP 8.4 (Keel build)', current: '8.4.33', candidate: '8.4.35', layout: 'keel', packages: [], action: { body: { version: '8.4' } }, reasons: ['php.net released 8.4.35'] });
+      expect(items.some((i) => i.packages.includes('vim') || i.packages.includes('libssl3'))).toBe(false);
+      expect(app.agent.callsTo('pkg.php.release').map((c) => c.args)).toEqual([{ minor: '8.4' }]);
+      expect(app.agent.callsTo('pkg.node.release').map((c) => c.args)).toEqual([{ major: 22 }]);
+      expect(app.ctx.settings.get('software.php.releases')['8.4']).toMatchObject({ version: '8.4.35', sha256: SHA_A });
+      expect(app.ctx.settings.get('software.node.releases')['22']).toMatchObject({ version: 'v22.14.0' });
+      // Served from the cache: no agent call at all for a plain GET; the release lookups are cached six hours even on a refresh.
+      app.agent.calls.length = 0;
+      expect((await get('/api/software/updates/critical')).body.data.items).toHaveLength(6);
+      expect(app.agent.calls).toHaveLength(0);
+      await post('/api/software/updates/critical/refresh');
+      expect(app.agent.callsTo('pkg.php.release')).toHaveLength(0);
+      expect(app.agent.callsTo('pkg.node.release')).toHaveLength(0);
+      // Catalog rows carry the same verdict.
+      const cat = (await get('/api/software/php/catalog')).body.data.versions;
+      expect(cat.find((v) => v.id === '8.3').update).toEqual({ candidate: '8.3.36-1', severity: 'critical', reasons: php83.reasons });
+      expect(cat.find((v) => v.id === '8.2').update).toMatchObject({ candidate: null, severity: 'critical' });
+      expect(cat.find((v) => v.id === '8.5').update).toBeNull();
+      const rt = (await get('/api/software/runtimes')).body.data;
+      expect(rt.tools.find((t) => t.key === 'git').update).toMatchObject({ candidate: '2.43.0-2', severity: 'update' });
+      expect(rt.runtimes.find((r) => r.key === 'nodejs').versions.find((v) => v.id === '22').update).toMatchObject({ candidate: 'v22.14.0' });
+      expect(rt.tools.find((t) => t.key === 'imagemagick').update).toBeNull();
+    } finally {
+      app.agent.set('pkg.php.versions', stock);
+      app.agent.set('pkg.php.release', () => ({}));
+      app.agent.set('pkg.node.release', () => ({}));
+    }
+  });
+
+  it('never blocks: a failing probe only drops its items, and an empty host answers an empty list', async () => {
+    pendingCheck([]);
+    app.agent.fail('pkg.node.list', 'command_failed', 'boom');
+    app.agent.fail('pkg.php.versions', 'timeout', 'agent timed out');
+    try {
+      const res = await post('/api/software/updates/critical/refresh');
+      expect(res.status).toBe(200);
+      expect(res.body.data.items).toEqual([]);
+    } finally { app.agent.set('pkg.node.list', () => ({ system: { version: 'v22.11.0', path: '/usr/bin/node' }, versions: nodeVersions })); app.agent.set('pkg.php.versions', stock); }
+  });
+
+  it('attaches update to an Install Software PHP row whose installed id differs from the catalog id (ea4/remi layouts)', async () => {
+    const EA83 = { ...PHP, id: 'ea-php83', label: 'ea-php83', binary: '/opt/cpanel/ea-php83/root/usr/bin/php', layout: 'ea4', packagePrefix: 'ea-php83-', fpmUnit: 'ea-php83-php-fpm', iniPath: '/opt/cpanel/ea-php83/root/etc/php.ini' };
+    pendingCheck([{ name: 'ea-php83-php-fpm', current: '8.3.6-1', candidate: '8.3.36-1', repo: 'ea4', security: true }]);
+    withVersions([EA83]);
+    app.agent.set('pkg.runtime.detect', () => ({ ...detectRuntimes(), php: [{ id: 'ea-php83', version: '8.3.6', layout: 'ea4' }] }));
+    try {
+      const res = await post('/api/software/updates/critical/refresh');
+      expect(res.status).toBe(200);
+      expect(res.body.data.items.filter((i) => i.kind === 'php').map((i) => i.id)).toEqual(['ea-php83']);
+      const row = (await get('/api/software/runtimes')).body.data.runtimes.find((r) => r.key === 'php').versions.find((v) => v.id === '8.3');
+      expect(row).toMatchObject({ installed: true, version: '8.3.6', update: { candidate: '8.3.36-1', severity: 'critical' } });
+      expect((await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === 'ea-php83').update).toMatchObject({ candidate: '8.3.36-1' });
+    } finally {
+      app.agent.set('pkg.runtime.detect', () => detectRuntimes());
+      app.agent.set('pkg.php.versions', stock);
+      app.ctx.software.updates.invalidate();
+    }
+  });
+
+  it('refuses a PHP update without a candidate (422) and for a version that is not installed', async () => {
+    pendingCheck(PENDING);
+    withVersions([PHP83, PHP82P, KEEL84]);
+    app.agent.calls.length = 0;
+    try {
+      const none = await post('/api/software/php/update', { version: '8.2' });
+      expect(none.status).toBe(422);
+      expect(none.body.error.message).toMatch(/no newer build or package is available yet/);
+      expect((await post('/api/software/php/update', { version: '9.9' })).status).toBe(422);
+      expect((await post('/api/software/php/update', { version: '9.9' })).body.error.message).toMatch(/not installed/);
+      expect((await post('/api/software/php/update', { version: '8.3; rm' })).status).toBe(422);
+      expect(app.agent.callsTo('pkg.upgrade')).toHaveLength(0);
+      expect(app.agent.callsTo('pkg.php.build')).toHaveLength(0);
+      pendingCheck([]);
+      const clean = await post('/api/software/php/update', { version: '8.3' });
+      expect(clean.status).toBe(422);
+      expect(clean.body.error.message).toMatch(/no newer build or package/);
+    } finally { app.agent.set('pkg.php.versions', stock); }
+  });
+
+  it('updates a packaged version: pkg.upgrade of its pending packages, FPM reload, pending re-check, re-detection, audit', async () => {
+    pendingCheck(PENDING);
+    withVersions([PHP83, PHP82P, KEEL84]);
+    app.agent.calls.length = 0;
+    try {
+      const res = await post('/api/software/php/update', { version: '8.3' });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(res.body.data).toMatchObject({ version: '8.3', candidate: '8.3.36-1', method: 'package', job: { type: 'software.php.update' } });
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, job.error).toBe('done');
+      expect(job.result).toMatchObject({ version: '8.3', method: 'package', from: '8.3.6', candidate: '8.3.36-1', packages: ['php8.3-fpm', 'php8.3-cli'], restarted: true, updated: true });
+      expect(app.agent.callsTo('pkg.upgrade').map((c) => c.args)).toEqual([{ packages: ['php8.3-fpm', 'php8.3-cli'], dist: false, wait: false }]);
+      expect(app.agent.callsTo('svc.reload').map((c) => c.args)).toEqual([{ unit: 'php8.3-fpm' }]);
+      const names = app.agent.calls.map((c) => c.name);
+      expect(names.indexOf('svc.reload')).toBeGreaterThan(names.indexOf('pkg.upgrade'));
+      expect(names.indexOf('pkg.upgradable')).toBeGreaterThan(names.indexOf('svc.reload'));
+      expect(names.lastIndexOf('pkg.php.versions')).toBeGreaterThan(names.indexOf('pkg.upgradable'));
+      expect(app.agent.callsTo('pkg.php.build')).toHaveLength(0);
+      expect(app.ctx.db.prepare("SELECT 1 AS x FROM audit_log WHERE action = 'software.php.update' AND target = '8.3'").get()).toBeTruthy();
+      // The cached check was replaced by the post-upgrade simulation (the mock reports libssl3 + vim), so the banner no longer lists PHP 8.3 packages.
+      expect(app.ctx.settings.get('software.updates.last_check').packages.map((p) => p.name)).toEqual(['libssl3', 'vim']);
+      expect((await get('/api/software/updates/critical')).body.data.items.find((i) => i.kind === 'php' && i.id === '8.3')).toMatchObject({ candidate: null });
+    } finally { app.agent.set('pkg.php.versions', stock); }
+  });
+
+  it('updates a Keel build: pkg.php.build then pkg.php.build.finish, which restarts the registered unit', async () => {
+    pendingCheck([]);
+    withVersions([PHP83, PHP82P, KEEL84]);
+    app.agent.set('pkg.php.release', ({ minor }) => ({ minor, version: `${minor}.35`, filename: `php-${minor}.35.tar.xz`, sha256: SHA_A }));
+    app.ctx.settings.set('software.php.releases', null);
+    app.agent.set('pkg.php.build', ({ minor }) => ({ minor, version: `${minor}.35`, prefix: `/opt/keel/php/${minor}`, background: false, code: 0, output: [`Building PHP ${minor}.35`] }));
+    app.agent.set('pkg.php.build.finish', ({ minor }) => ({ minor, version: `${minor}.35`, prefix: `/opt/keel/php/${minor}`, unit: `keel-php${minor}-fpm`, active: true, restarted: true, link: `/usr/local/bin/php${minor}`, buildDirsRemoved: [] }));
+    app.agent.calls.length = 0;
+    try {
+      const res = await post('/api/software/php/update', { version: '8.4' });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(res.body.data).toMatchObject({ version: '8.4', candidate: '8.4.35', method: 'source' });
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, job.error).toBe('done');
+      expect(job.result).toMatchObject({ version: '8.4', layout: 'keel', method: 'source', from: '8.4.33', candidate: '8.4.35', restarted: true, packages: [] });
+      expect(app.agent.callsTo('pkg.php.build').map((c) => c.args)).toEqual([{ minor: '8.4', wait: false }]);
+      expect(app.agent.callsTo('pkg.php.build.finish').map((c) => c.args)).toEqual([{ minor: '8.4' }]);
+      expect(app.agent.callsTo('pkg.upgrade')).toHaveLength(0);
+      expect(app.agent.callsTo('pkg.install')).toHaveLength(0);
+      const names = app.agent.calls.map((c) => c.name);
+      expect(names.indexOf('pkg.php.build.finish')).toBeGreaterThan(names.indexOf('pkg.php.build'));
+      expect(names.indexOf('sys.binaries')).toBeGreaterThan(names.indexOf('pkg.php.build.finish'));
+      // A unit that does not come back fails the job.
+      app.agent.set('pkg.php.build.finish', ({ minor }) => ({ minor, version: `${minor}.35`, unit: `keel-php${minor}-fpm`, active: false, unitError: 'Job for keel-php8.4-fpm.service failed', restarted: true }));
+      const again = await post('/api/software/php/update', { version: '8.4' });
+      expect(again.status).toBe(202);
+      const failed = await waitForJob(app.ctx, again.body.data.job.id);
+      expect(failed.status).toBe('failed');
+      expect(failed.error).toMatch(/keel-php8\.4-fpm did not come back/);
+    } finally {
+      app.agent.set('pkg.php.versions', stock);
+      app.agent.set('pkg.php.release', () => ({}));
+      app.agent.reset('pkg.php.build'); app.agent.reset('pkg.php.build.finish');
+    }
+  });
+
+  it('updates runtimes and tools: packages through pkg.upgrade, a Node.js major through a fresh build; refuses PHP and anything not installed', async () => {
+    pendingCheck(PENDING);
+    nodeVersions = [{ major: 22, version: 'v22.11.0', path: '/opt/keel/node/22', bin: '/opt/keel/node/22/bin/node' }];
+    app.agent.calls.length = 0;
+    const git = await post('/api/software/runtimes/update', { tool: 'git' });
+    expect(git.status, JSON.stringify(git.body)).toBe(202);
+    expect(git.body.data).toMatchObject({ target: 'git', packages: ['git'], method: 'package', job: { type: 'software.runtime.update' } });
+    let job = await waitForJob(app.ctx, git.body.data.job.id);
+    expect(job.status, job.error).toBe('done');
+    expect(job.result).toMatchObject({ kind: 'tool', tool: 'git', packages: ['git'], updated: true, method: 'package' });
+    expect(app.agent.callsTo('pkg.upgrade').map((c) => c.args)).toEqual([{ packages: ['git'], dist: false, wait: false }]);
+    expect(app.agent.callsTo('pkg.upgradable')).toHaveLength(1);
+    app.agent.calls.length = 0;
+    const node = await post('/api/software/runtimes/update', { runtime: 'nodejs', version: '22' });
+    expect(node.status, JSON.stringify(node.body)).toBe(202);
+    expect(node.body.data).toMatchObject({ target: 'nodejs:22', method: 'node' });
+    job = await waitForJob(app.ctx, node.body.data.job.id);
+    expect(job.status, job.error).toBe('done');
+    expect(job.result).toMatchObject({ kind: 'runtime', runtime: 'nodejs', version: '22', detected: 'v22.0.0', method: 'node' });
+    expect(app.agent.callsTo('pkg.node.install').map((c) => c.args)).toEqual([{ major: 22, wait: false }]);
+    expect(app.agent.callsTo('pkg.upgrade')).toHaveLength(0);
+    expect(app.ctx.db.prepare("SELECT 1 AS x FROM audit_log WHERE action = 'software.runtime.update' AND target = 'nodejs:22'").get()).toBeTruthy();
+    app.agent.calls.length = 0;
+    expect((await post('/api/software/runtimes/update', { runtime: 'php', version: '8.3' })).status).toBe(422);
+    expect((await post('/api/software/runtimes/update', { runtime: 'nodejs', version: '18' })).status).toBe(422);
+    expect((await post('/api/software/runtimes/update', { tool: 'ffmpeg' })).status).toBe(422);
+    expect((await post('/api/software/runtimes/update', { tool: 'git', version: '1' })).status).toBe(422);
+    expect((await post('/api/software/runtimes/update', { runtime: 'ruby', tool: 'git' })).status).toBe(422);
+    expect((await post('/api/software/runtimes/update', {})).status).toBe(422);
+    expect(app.agent.callsTo('pkg.upgrade')).toHaveLength(0);
+    expect(app.agent.callsTo('pkg.node.install')).toHaveLength(0);
+    app.ctx.settings.set('software.updates.last_check', null);
   });
 });

@@ -137,6 +137,17 @@ export default function MultiPhpManager({ fn }) {
     if (!(await confirm({ title: `Remove ${versionLabel(v)}?`, message, confirmLabel: 'Remove', danger: true }))) return;
     runner.start(() => api.post('/software/php/remove', { version: v.id }), `Remove ${versionLabel(v)}`);
   };
+  // Direct update of an installed version (contract §63): the row's `update`
+  // comes from the same list as the Home banner; null means nothing newer.
+  const update = async (v) => {
+    const u = v.update;
+    if (!u?.candidate) return;
+    const message = v.source
+      ? `Rebuilds PHP ${v.id} from the official php.net ${u.candidate} source over ${PHP_SOURCE_PREFIX}/${v.id} (about 15 minutes) and restarts keel-php${v.id}-fpm. ${u.reasons?.join(' ') || ''}`
+      : `Upgrades the pending php${v.id}-* packages to ${u.candidate} and reloads ${v.fpmUnit || 'PHP-FPM'}. ${u.reasons?.join(' ') || ''}`;
+    if (!(await confirm({ title: `Update ${versionLabel(v)} to ${u.candidate}?`, message, confirmLabel: 'Update', danger: u.severity === 'critical' }))) return;
+    runner.start(() => api.post('/software/php/update', { version: v.id }), `Update ${versionLabel(v)}`);
+  };
   const setOffered = async (v, on) => {
     setBusy(true); setError(null);
     try {
@@ -185,6 +196,8 @@ export default function MultiPhpManager({ fn }) {
                       <td><Toggle checked={Boolean(v.offered)} disabled={!v.installed || busy} onChange={(on) => setOffered(v, on)} label={v.installed ? (v.offered ? 'Offered' : 'Hidden') : 'Install first'} /></td>
                       <td className="actions-col">
                         {!v.installed && <Button size="sm" variant="primary" loading={runner.busy} disabled={v.state === 'unsupported'} title={v.state === 'unsupported' ? v.note || 'Not available for this OS' : v.method === 'source' ? `Built from the php.net source into ${PHP_SOURCE_PREFIX}/${v.id}` : undefined} onClick={() => install(v)}>Install</Button>}
+                        {v.installed && v.update?.candidate && <Button size="sm" variant={v.update.severity === 'critical' ? 'danger' : 'primary'} loading={runner.busy} title={v.update.reasons?.join('\n') || undefined} onClick={() => update(v)}>Update to {v.update.candidate}</Button>}
+                        {v.installed && v.update && !v.update.candidate && <span className="muted small" title={v.update.reasons?.join('\n') || undefined}>no fix available yet</span>}
                         {v.installed && !v.isSystemDefault && <Button size="sm" loading={busy} onClick={() => setDefault(v.id)}>Set as default</Button>}
                         {v.installed && <Button size="sm" variant="danger" loading={runner.busy} disabled={Boolean(blocker)} title={blocker || undefined} onClick={() => remove(v)}>Remove</Button>}
                       </td>

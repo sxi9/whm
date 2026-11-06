@@ -31,6 +31,10 @@ const runtimeInstallBody = z.object({ runtime: z.enum(RUNTIME_KEYS).optional(), 
   .refine((b) => !(b.tool && b.version), { message: 'Tools have no version', path: ['version'] })
   .refine((b) => !(b.method && b.runtime !== 'php'), { message: 'Only PHP has an install method', path: ['method'] });
 const runtimeRemoveBody = z.object({ runtime: z.literal('nodejs'), version: catalogVersion }).strict();
+// Direct update of an installed runtime/tool (contract §63); PHP goes through /php/update.
+const runtimeUpdateBody = z.object({ runtime: z.enum(RUNTIME_KEYS).optional(), version: catalogVersion.optional(), tool: z.enum(TOOL_KEYS).optional() }).strict()
+  .refine((b) => Boolean(b.runtime) !== Boolean(b.tool), { message: 'Give either runtime or tool', path: ['runtime'] })
+  .refine((b) => !(b.tool && b.version), { message: 'Tools have no version', path: ['version'] });
 const idParam = z.object({ id: fields.id });
 const domainParam = z.object({ domain: fields.hostname });
 const httpUrl = z.string().max(2048).url().refine((u) => /^https?:\/\//i.test(u), 'Must be an http(s) URL');
@@ -87,6 +91,11 @@ export async function register(ctx) {
   r.get('/runtimes/recent', requireRoot, wrap(() => s.runtimes.recent()));
   r.post('/runtimes/install', requireRoot, validate({ body: runtimeInstallBody }), accepted((req) => s.runtimes.install(req.body, req.user, req)));
   r.post('/runtimes/remove', requireRoot, validate({ body: runtimeRemoveBody }), accepted((req) => s.runtimes.remove(req.body, req.user, req)));
+  r.post('/runtimes/update', requireRoot, validate({ body: runtimeUpdateBody }), accepted((req) => s.runtimes.update(req.body, req.user, req)));
+
+  // Critical updates (contract §63): the Home banner, catalog rows and the advisor share this list.
+  r.get('/updates/critical', requireRoot, wrap(() => s.updates.critical()));
+  r.post('/updates/critical/refresh', requireRoot, wrap(() => s.updates.refresh()));
 
   // System Update
   // Page loads get the recorded check; ?refresh=true runs the simulation again.
@@ -117,6 +126,7 @@ export async function register(ctx) {
   r.get('/php/usage', requireRoot, wrap(() => s.php.usage()));
   r.put('/php/offered', requireRoot, validate({ body: z.object({ versions: z.array(phpVersionId).max(50).nullable() }).strict() }), wrap((req) => s.php.setOffered(req.body.versions, req.user, req)));
   r.post('/php/remove', requireRoot, validate({ body: z.object({ version: phpVersionId }).strict() }), accepted((req) => s.php.remove(req.body.version, req.user, req)));
+  r.post('/php/update', requireRoot, validate({ body: z.object({ version: phpVersionId }).strict() }), accepted((req) => s.php.update(req.body.version, req.user, req)));
   r.get('/php/versions', requireReseller, validate({ query: z.object({ modules: z.enum(['true', 'false']).default('false') }) }), wrap((req) => s.php.versions({ modules: req.query.modules === 'true', user: req.user })));
   r.put('/php/default', requireRoot, validate({ body: z.object({ version: phpVersionId }).strict() }), maybeAccepted((req) => s.php.setSystemDefault(req.body.version, req.user, req)));
   r.get('/php/domains', requireReseller, validate({ query: pagination.extend({ account: fields.username.optional(), pageSize: z.coerce.number().int().min(1).max(500).default(500), sort: z.enum(['domain', 'account', 'type', 'effective']).optional() }) }), wrap((req) => s.php.domains(req.user, req.query)));

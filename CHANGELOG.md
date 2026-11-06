@@ -9,6 +9,30 @@ not for the commit log.
 ## [Unreleased]
 
 ### Added
+- **Direct Update buttons for critical issues (PHP and other software).** The admin Home opens with an *Updates that
+  need attention* card whenever something needs one: installed PHP versions hit by an advisory from the Security
+  Advisor's list (critical when the advisory is critical/high), pending security or regular package updates of the
+  runtimes, tools and web stack (Apache, NGINX, Exim, Dovecot, MariaDB/MySQL, PostgreSQL, FTP, OpenSSL — from the cached
+  OS update check), and Node.js builds under `/opt/keel/node` behind nodejs.org's latest release; each row carries the
+  current and candidate version, the reasons and an **Update** button that runs the right job after a confirm (a version
+  with an advisory but nothing newer to install shows *no fix available yet*). PHP Version Manager rows show
+  **Update to x.y.z**, Install Software lists the installed runtimes/tools with updates above its tabs, and a Security
+  Advisor PHP finding renders **Update PHP x.y to …** next to its fix link. `GET /api/software/updates/critical`
+  (cached 10 min, `POST …/refresh`), `POST /api/software/php/update { version }` → job `software.php.update`
+  (packages: `pkg.upgrade` of the version's pending packages + FPM reload; Keel build: `pkg.php.build` +
+  `pkg.php.build.finish`, which now **restarts** a running `keel-php<minor>-fpm` and reports whether it is enabled; the
+  rebuild keeps the version listed while it runs and keeps the operator's `php.ini`), `POST
+  /api/software/runtimes/update { runtime, version | tool }` → job `software.runtime.update` (packages or a fresh
+  nodejs.org build); read-only agent ops `pkg.php.release` / `pkg.node.release` (cached 6 h in settings). Contract §63,
+  manual §22.2/§22.5.
+- **Collapsible dashboard sections.** Every category on the admin Home *Tools* card and every group on the
+  account panel home is a disclosure: its header (chevron, icon tile, name, function count) collapses or expands
+  the tiles, with *Collapse all* / *Expand all* on the card and the same chevron on the *Favorites* card; a filter
+  keeps every matching section open. The choice is remembered in the browser (`whm.home.sections`,
+  `keel.panel.home.sections`; `{ slug: false }` = collapsed, open by default). The account panel sidebar gains the
+  admin sidebar's *Expand all* / *Collapse all*, and in both sidebars the category of the current page is opened
+  once per navigation and can be closed again. Headers carry `aria-expanded` / `aria-controls` and work from the
+  keyboard (shared hook `client/src/hooks/useCollapsedSections.js`; manual A "Home", C §1.1).
 - **PHP source builds — every catalog PHP version installs on every supported host.** When no repository
   carries a version for the host (Ubuntu 26.04 "resolute" and `ppa:ondrej/php`), the catalog no longer marks it
   *Not available for this OS*: it is *Available* with `method: 'source'`, and Install (PHP Version Manager or
@@ -179,6 +203,10 @@ not for the commit log.
 - `scripts/install.sh` installs every workspace with one root `npm ci` and prunes dev dependencies last.
 
 ### Fixed
+- Row "more actions" (⋯) menus and the admin shell's user menu closed as soon as the pointer moved
+  onto them (the floating menu sat outside the wrapper whose `mouseleave` closed it). Every popover
+  menu now shares `useMenu` / `Menu`: opens on click, closes on an outside press, Escape (focus
+  returns to the button), Tab or a route change; arrow keys move between the items.
 - Subdomain and addon docroots were created `user:user 0750`, so Apache answered 403; they are now
   handed to the web server group by root (0755 only when no web server is installed).
 - `db.revoke` emitted `REVOKE ALL PRIVILEGES, GRANT OPTION ON db.*` (syntax error): changing or

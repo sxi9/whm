@@ -27,6 +27,18 @@ describe('Security Advisor PHP advisory finding', () => {
     expect(html).toContain('MultiPHP Manager');
   });
 
+  it('renders one button per server-named action and marks the version the candidate is for (contract §63)', () => {
+    const calls = [];
+    const withAction = { ...finding, versions: [{ ...finding.versions[0], candidate: '8.3.36-1' }, finding.versions[1]], actions: [{ label: 'Update PHP 8.3 to 8.3.36-1', path: '/software/php/update', body: { version: '8.3' } }, { label: 'bogus', body: {} }] };
+    const html = render(<table><tbody><FindingRow finding={withAction} onAction={(a, f) => calls.push([a, f.id])} /></tbody></table>);
+    expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*">Update PHP 8\.3 to 8\.3\.36-1<\/button>/);
+    expect(html).not.toContain('bogus');
+    expect(html).toContain('8.3.35 → 8.3.36-1 available');
+    expect(html).toContain('8.1.x · no fix for this branch');
+    expect(html).toContain('href="/software/multiphp-manager"');
+    expect(render(<table><tbody><FindingRow finding={finding} /></tbody></table>)).not.toContain('<button');
+  });
+
   it('renders plain findings without an advisory column', () => {
     const html = render(<table><tbody><FindingRow finding={{ id: 'ssh.password', grade: 'warning', title: 'SSH password authentication is enabled' }} /></tbody></table>);
     expect(html).toContain('SSH password authentication is enabled');

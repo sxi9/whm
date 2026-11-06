@@ -1612,3 +1612,75 @@ already uses (§4.11 of the customer-panel design).
   100/300/500/1000 lines, follow every 10 s, one card per file with the lines newest first. Keys `panel.logs/errors.*` and
   `panel.logs.errors_*`; shared strings reuse `panel.logs.*`.
 - Tests: `server/test/panel-logs-errors.test.js`, `client/test/panel-logs-errors.test.jsx`.
+
+## 63. Critical updates (`ctx.software.updates.critical`, `software.php.update`, `software.runtime.update`, agent `pkg.php.release` / `pkg.node.release`)
+One list feeds the admin Home banner, the PHP Version Manager rows, Install Software and the Security Advisor's PHP
+findings, so every page agrees on what needs an update and what runs when the operator presses **Update**.
+- **Service:** `ctx.software.updates.critical({ versions?, fresh? })` → `{ checkedAt, packagesCheckedAt, items }`, root only
+  (the routes), cached in memory for 10 minutes (`fresh: true` recomputes; `updates.invalidate()` drops the cache, which
+  every update job does when it finishes). It never throws: each probe is isolated and a failure only costs its items.
+  `items[]` = `{ kind: 'php'|'runtime'|'tool'|'package', id, label, current, candidate, severity: 'critical'|'security'|'update',
+  reasons: string[], packages: string[], action: { method: 'POST', path, body } | null }` sorted critical → security →
+  update, then by label; PHP items also carry `layout` and `unit`. Sources:
+  1. **PHP advisories** — every installed version from `php.versions()` (or the `versions` the caller already fetched) with
+     its `advisories` from `ctx.security.phpAdvisories.forVersion`, minus the ones the last advisor run reported as
+     `php.advisory.<id>.backported` for that version. A `critical` grade (= advisory severity critical/high) gives severity
+     `critical`, any other advisory `security`. `candidate` is the pending package candidate of the version's
+     `packagePrefix` (below) or, for a Keel build (`layout: 'keel'`), the newest php.net release of that minor when it is
+     newer than `version`; without either the item stays with `candidate: null, action: null` ("no fix available yet").
+  2. **Pending package updates** from the cached OS update check (setting `software.updates.last_check`, written by the
+     `os-update-check` schedule, System Update runs and these jobs): matched by `packagePrefix` to PHP versions, by
+     `packagesFor(entry, family)` to the catalog runtimes (PHP excluded, Node.js never packaged) and tools, and by prefix to
+     the web stack (`apache2`/`httpd`, `nginx`, `exim4`, `dovecot-*`, `mariadb-*`, `mysql-server`, `postgresql-*`,
+     `pure-ftpd`, `proftpd`, `openssl` — `kind: 'package'`, action `POST /software/update/run { packages, dist: false,
+     refreshIndex: false }`). `security: true` on any hit → `security`, else `update`. Nothing is simulated on a page load:
+     without a recorded check there are no package items (`packagesCheckedAt: null`).
+  3. **Keel Node builds** — every major from `pkg.node.list` whose nodejs.org latest (`pkg.node.release`) is newer →
+     `kind: 'runtime', id: 'nodejs:<major>'`, severity `update`.
+  Release lookups are cached six hours in the settings `software.php.releases` / `software.node.releases`
+  (`{ [minor|major]: { version, sha256, file, at } }`); a failed lookup serves the stale entry.
+  `updates.rowUpdate(list, kind, id)` → `{ candidate, severity, reasons } | null` is what the catalogs attach:
+  `GET /api/software/php/catalog` rows and `GET /api/software/runtimes` runtime/tool rows gain `update` (null when nothing
+  is pending or the row is not installed).
+- **Routes:** `GET /api/software/updates/critical` (requireRoot) → the list; `POST …/updates/critical/refresh` recomputes
+  it. `POST /api/software/php/update { version }` (requireRoot, `phpVersionId`) → `202 { job, version, candidate, method:
+  'package'|'source' }`, job `software.php.update`; `422` when the version is not installed, has nothing pending, or is
+  affected with no candidate. `POST /api/software/runtimes/update { runtime, version? } | { tool }` (requireRoot, catalog
+  enum, no `method`) → `202 { job, target, packages, method: 'package'|'node' }`, job `software.runtime.update`; `422` for
+  `runtime: 'php'` (PHP goes through `/php/update`), a Node.js major not under `/opt/keel/node`, or packages none of which
+  is installed. Audit `software.php.update { from, to, method, packages, jobId }` and `software.runtime.update`.
+- **Job `software.php.update`** (params `{ version, layout, candidate, current, packages, unit, method }`), in order:
+  `method: 'package'` → `pkg.upgrade { packages, dist: false }` through `runLongOp` (apt `install --only-upgrade` / dnf
+  `upgrade` of exactly those names), `svc.reload { unit }` of the version's FPM unit (a failure is logged, not fatal),
+  `pkg.upgradable` recorded as the new cached check (so the banner drops the packages at once); `method: 'source'` →
+  `pkg.php.build { minor }` (the build dir is separate; `make install` over the existing prefix) then
+  `pkg.php.build.finish { minor }`, which **restarts** the already registered unit (`restarted: true`) instead of
+  `enable --now`, failing the job when the unit does not come back. Then `capabilities.refresh()`, `pkg.php.versions` to
+  log the new `PHP_VERSION`, `updates.invalidate()`. Result `{ version, layout, method, from, to, candidate, packages,
+  restarted, updated: true }`.
+- **Job `software.runtime.update`** (params `{ kind, key, version, family, packages, major }`): `nodejs` →
+  `pkg.node.install { major }` (atomic tree swap, the panel's own node untouched); packages → `pkg.upgrade { packages,
+  dist: false }` + recorded `pkg.upgradable`; then `capabilities.refresh()`, `pkg.runtime.detect` for a runtime,
+  `updates.invalidate()`. Result `{ kind, runtime|tool, version, packages, updated: true, detected, method }`.
+- **Agent:** `pkg.php.release { minor }` → `{ minor, version, filename, sha256 }` (php.net JSON index over https,
+  `parsePhpRelease`); `pkg.node.release { major }` → `{ major, arch, version, file, sha256 }` (SHASUMS256 of
+  `latest-v<major>.x`, `pickNodeTarball`); both read-only, 2-minute budget, same schemas as the installers.
+  `pkg.php.build.finish` decides from the unit's state, not its file: a `keel-php<minor>-fpm` that is active before the
+  op is `systemctl restart`ed (`restarted: true`); one that is not running — the file exists but its first `enable --now`
+  failed, or the admin stopped or disabled it — gets `enable --now` as on a first install. The result carries `enabled`
+  (from `systemctl is-enabled`) beside `active`. A rebuild over a live prefix (`php-build.sh`) keeps `.keel-build-ok`, so
+  the running version stays listed by `pkg.php.versions` / `phpLayout` for the whole build and after a failed one (only a
+  prefix the run created is removed), and it never rewrites `lib/php.ini` or `lib/conf.d/10-opcache.ini` once they exist
+  — the operator's INI edits survive an update; `etc/php-fpm.conf` and `keel-idle.conf` stay panel-owned and are
+  regenerated.
+- **Security Advisor:** the PHP probe calls `critical({ versions, fresh: true })` after `markDistroBackports`; an open hit
+  with a candidate gets `candidate` on its `versions[]` entry and the finding gains `actions: [{ label: 'Update PHP x.y to
+  <candidate>', path: '/software/php/update', body: { version } }]`. `FindingRow` renders `actions` generically (one button
+  per entry, confirm, job panel), so other findings may carry actions later.
+- **Client:** `pages/home/UpdatesBanner.jsx` (`UpdatesBanner({ kinds?, title?, subtitle? })`, root only, hidden while
+  empty) on the admin Home and, narrowed by kind, above the Runtimes (`php`, `runtime`) and Tools (`tool`) tabs of Install
+  Software; `updateRequest(item)` → `[path, body]` is exactly the server's `action`. PHP Version Manager rows render
+  **Update to <candidate>** / *no fix available yet* from `row.update`.
+- Tests: `server/test/software.test.js` ("Critical updates and direct Update buttons"), `server/test/security-center.test.js`
+  (advisory actions), `agent/test/pkg-runtime.test.js` (release ops, finish restart), `client/test/home-updates.test.jsx`,
+  `client/test/install-software.test.jsx`, `client/test/security-advisor.test.jsx`.

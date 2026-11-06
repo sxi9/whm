@@ -1149,3 +1149,26 @@ describe('helpers', () => {
     for (const bad of ['', 'abc', 'deadbeef', '1.2.3', '1.2.3.4/33', '::1/129', '1.2.3.4/8/8', '1.2.3.4/x', 'example.com', '1.2.3.4 -j ACCEPT', null]) expect(normalizeIpOrCidr(bad), String(bad)).toBeNull();
   });
 });
+
+describe('PHP advisory findings carry a direct Update action (contract §63)', () => {
+  const PHP = (id, version, extra = {}) => ({ id, label: `PHP ${id}`, binary: `/usr/bin/php${id}`, layout: 'debian', version, iniPath: `/etc/php/${id}/fpm/php.ini`, poolDir: `/etc/php/${id}/fpm/pool.d`, fpmUnit: `php${id}-fpm`, packagePrefix: `php${id}-`, isDefault: false, fpmInstalled: true, fpmActive: true, ...extra });
+
+  it('adds actions for the affected versions a newer package exists for and marks their candidate', async () => {
+    app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(BIN_FULL[n]) || n === 'php'])));
+    app.agent.set('pkg.php.versions', () => ({ versions: [PHP('8.3', '8.3.35', { isDefault: true }), PHP('8.1', '8.1.31')], defaultId: '8.3', defaultBinary: '/usr/bin/php8.3' }));
+    await app.ctx.capabilities.refresh();
+    // The scan's own package probe records a fresh pkg.upgradable before the PHP probe reads it.
+    let pending = [{ name: 'php8.3-fpm', current: '8.3.35-1', candidate: '8.3.36-1', repo: 'ondrej', security: true }];
+    app.agent.set('pkg.upgradable', () => ({ manager: 'apt', count: pending.length, security: pending.filter((p) => p.security).length, packages: pending, rebootRequired: false }));
+    try {
+      const byId = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+      const finding = byId['php.advisory.CVE-2026-109619'];
+      expect(finding.actions).toEqual([{ label: 'Update PHP 8.3 to 8.3.36-1', path: '/software/php/update', body: { version: '8.3' } }]);
+      expect(finding.versions.map((v) => [v.id, v.candidate ?? null])).toEqual([['8.3', '8.3.36-1'], ['8.1', null]]);
+      expect(finding.fix).toEqual({ label: 'MultiPHP Manager', path: '/software/multiphp-manager' });
+      pending = [];
+      const none = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+      expect(none['php.advisory.CVE-2026-109619'].actions).toBeUndefined();
+    } finally { app.agent.reset('pkg.php.versions'); app.agent.reset('pkg.upgradable'); app.ctx.settings.set('software.updates.last_check', null); }
+  });
+});

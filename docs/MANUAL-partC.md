@@ -333,6 +333,14 @@ under the home before anything runs.
   addon domains); **Quick links**: the application shortcuts an administrator published for the
   cPanel audience in *Development › Application Manager*, the active news items of *Panel ›
   Modify Panel News* and the webmail link when one is configured; the favourite functions tiles.
+- **Collapsing:** every group of the *Tools* card is a disclosure. Its header (chevron, icon tile,
+  group name, function count) collapses or expands the tiles; *Collapse all* / *Expand all* next to
+  the filter box set every group at once, and the *Favorites* card has the same chevron. The filter
+  keeps every matching group open while you type. The choice is remembered in this browser only
+  (`localStorage` key `keel.panel.home.sections`, `{ "<group>": false }` for a collapsed group; a group
+  without an entry is open). Headers are buttons with `aria-expanded` and `aria-controls`, so they work
+  from the keyboard and announce their state. The sidebar's group list has the same *Expand all* /
+  *Collapse all*; opening a page opens its group once, and you can close it again.
 - **Server:** `GET /me`, `GET /usage`, `GET /overview/quick-links`.
 - **Gotchas:** the usage card ignores a `501` from `/usage` (quota tools missing) and falls back
   to the figures of the account record; *Details* opens [14. Usage](#14-usage).

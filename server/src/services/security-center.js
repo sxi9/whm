@@ -1190,15 +1190,24 @@ export function createSecurityCenterService(ctx) {
         if (!versions.length) { add({ id: 'php.advisories', grade: 'info', title: 'No PHP installation found', detail: 'MultiPHP Manager detected no PHP version; the advisory list was not applied.' }); return; }
         const { matches, unversioned } = matchPhpAdvisories(advisories, versions);
         await markDistroBackports(matches, versions);
+        // Software's critical-update list (contract §63) knows whether a newer
+        // package or php.net build exists; an open hit with a candidate gets a
+        // direct Update action. A failed lookup only costs the button.
+        let candidates = new Map();
+        if (typeof ctx.software?.updates?.critical === 'function') {
+          try { candidates = new Map((await ctx.software.updates.critical({ versions, fresh: true })).items.filter((i) => i.kind === 'php' && i.candidate).map((i) => [i.id, i])); } catch (err) { logger.warn({ err }, 'advisor: php update candidates unavailable'); }
+        }
         const fix = { label: 'MultiPHP Manager', path: '/software/multiphp-manager' };
         for (const { advisory, versions: hits } of matches) {
           const fixed = hits.filter((h) => h.backported);
           const open = hits.filter((h) => !h.backported);
+          for (const h of open) if (candidates.has(h.id)) h.candidate = candidates.get(h.id).candidate;
+          const actions = open.filter((h) => h.candidate).map((h) => ({ label: `Update PHP ${h.id}${h.candidate ? ` to ${h.candidate}` : ''}`, path: '/software/php/update', body: { version: h.id } }));
           if (fixed.length) add({ id: `php.advisory.${advisory.id}.backported`, grade: 'ok', title: `PHP ${fixed.map((h) => `${h.version}${h.isDefault ? ' (default)' : ''}`).join(', ')} carr${fixed.length === 1 ? 'ies' : 'y'} the distribution fix for ${advisory.id}`, detail: [advisory.title, ...fixed.map((h) => `${h.backported.package} ${h.backported.installed || ''}: the package changelog records ${h.backported.mentioned.join(', ')} (upstream ${h.fixedIn || 'fix'} backported, PHP_VERSION stays ${h.version})`)].filter(Boolean).join('\n'), url: advisory.url, advisory: advisory.id, versions: fixed });
           if (!open.length) continue;
           const names = open.map((h) => `${h.version || `${h.minor}.x`}${h.isDefault ? ' (default)' : ''}`);
           const lines = open.map((h) => `PHP ${h.version || `${h.minor} (patch level unknown)`}: ${h.fixedIn ? `update to ${h.fixedIn}` : 'no packaged fix for this branch; move its sites to a supported version'}`);
-          add({ id: `php.advisory.${advisory.id}`, grade: advisoryGrade(advisory.severity), title: `PHP ${names.join(', ')} ${open.length === 1 ? 'is' : 'are'} affected by ${advisory.id}`, detail: [advisory.title, ...lines, advisory.note].filter(Boolean).join('\n'), url: advisory.url, advisory: advisory.id, versions: open, fix });
+          add({ id: `php.advisory.${advisory.id}`, grade: advisoryGrade(advisory.severity), title: `PHP ${names.join(', ')} ${open.length === 1 ? 'is' : 'are'} affected by ${advisory.id}`, detail: [advisory.title, ...lines, advisory.note].filter(Boolean).join('\n'), url: advisory.url, advisory: advisory.id, versions: open, fix, ...(actions.length ? { actions } : {}) });
         }
         for (const advisory of unversioned) add({ id: `php.advisory.${advisory.id}`, grade: 'info', title: `${advisory.id} has no fixed release yet`, detail: [advisory.title, advisory.note].filter(Boolean).join('\n'), url: advisory.url, advisory: advisory.id, versions: [] });
         if (!matches.some((m) => m.versions.some((h) => !h.backported))) add({ id: 'php.advisories', grade: 'ok', title: `Installed PHP ${versions.map((v) => v.version || v.id).join(', ')} not affected by ${advisories.length - unversioned.length} listed advisor${advisories.length - unversioned.length === 1 ? 'y' : 'ies'}` });

@@ -4,30 +4,31 @@ import { ChevronDown, ChevronRight, Search, Star, Home, ChevronsDownUp, Chevrons
 import { FUNCTION_BY_KEY } from '../nav.js';
 import { useMergedCategories, useSearch } from '../hooks/usePluginNav.js';
 import { useFavorites } from '../hooks/useFavorites.js';
+import { useCollapsedSections } from '../hooks/useCollapsedSections.js';
 import { iconFor, colorFor } from '../icons.js';
 import { Brand } from './Brand.jsx';
+
+const FAVORITES_KEY = '__favorites';
 
 export function Sidebar({ collapsed, onToggle }) {
   const location = useLocation();
   const [filter, setFilter] = useState('');
-  const [open, setOpen] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('whm.sidebar.open') || '{}'); } catch { return {}; }
-  });
+  const sections = useCollapsedSections('whm.sidebar.open', { defaultOpen: false });
   const { favorites } = useFavorites();
   const CATEGORIES = useMergedCategories();
   const searchFunctions = useSearch();
 
-  useEffect(() => { try { localStorage.setItem('whm.sidebar.open', JSON.stringify(open)); } catch { /* ignore */ } }, [open]);
-
-  // Expand the category of the current page so the active item is visible.
+  // Open the category of the current page once per navigation so the active item is
+  // visible; the user may close it again afterwards.
   useEffect(() => {
     const cat = CATEGORIES.find((c) => location.pathname.startsWith(`/${c.slug}/`));
-    if (cat && !open[cat.slug]) setOpen((o) => ({ ...o, [cat.slug]: true }));
+    if (cat) sections.setOpen(cat.slug, true);
   }, [location.pathname]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const matches = useMemo(() => (filter.trim() ? new Set(searchFunctions(filter).map((f) => f.key)) : null), [filter, searchFunctions]);
-  const setAll = (value) => setOpen(Object.fromEntries(CATEGORIES.map((c) => [c.slug, value])));
+  const slugs = CATEGORIES.map((c) => c.slug);
   const favoriteFns = favorites.map((k) => FUNCTION_BY_KEY[k]).filter(Boolean);
+  const favoritesOpen = sections.sections[FAVORITES_KEY] !== false;
 
   return (
     <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
@@ -38,19 +39,19 @@ export function Sidebar({ collapsed, onToggle }) {
         {filter && <button className="icon-button" onClick={() => setFilter('')} aria-label="Clear search"><X size={14} /></button>}
       </div>
       <div className="sidebar-tools">
-        <button className="link-button" onClick={() => setAll(true)} title="Expand all"><ChevronsUpDown size={14} /> Expand all</button>
-        <button className="link-button" onClick={() => setAll(false)} title="Collapse all"><ChevronsDownUp size={14} /> Collapse all</button>
+        <button className="link-button" onClick={() => sections.expandAll(slugs)} title="Expand all"><ChevronsUpDown size={14} /> Expand all</button>
+        <button className="link-button" onClick={() => sections.collapseAll(slugs)} title="Collapse all"><ChevronsDownUp size={14} /> Collapse all</button>
       </div>
       <nav className="sidebar-nav" aria-label="Functions">
         <NavLink to="/" end className={({ isActive }) => `nav-home ${isActive ? 'active' : ''}`}><Home size={16} /> <span>Home</span></NavLink>
 
         {!matches && favoriteFns.length > 0 && (
           <div className="nav-category">
-            <button className="nav-category-head" onClick={() => setOpen((o) => ({ ...o, __favorites: !o.__favorites }))}>
-              {open.__favorites === false ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+            <button className="nav-category-head" onClick={() => sections.setOpen(FAVORITES_KEY, !favoritesOpen)} aria-expanded={favoritesOpen}>
+              {favoritesOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
               <span className="nav-tile" style={{ '--tile': '#ff9f0a' }}><Star size={14} strokeWidth={2.25} /></span> <span>Favorites</span><span className="count">{favoriteFns.length}</span>
             </button>
-            {open.__favorites !== false && (
+            {favoritesOpen && (
               <ul>{favoriteFns.map((f) => <li key={f.key}><NavLink to={f.path} className={({ isActive }) => (isActive ? 'active' : '')}>{f.label}</NavLink></li>)}</ul>
             )}
           </div>
@@ -60,10 +61,10 @@ export function Sidebar({ collapsed, onToggle }) {
           const Icon = iconFor(cat.icon);
           const fns = matches ? cat.functions.filter((f) => matches.has(f.key)) : cat.functions;
           if (matches && fns.length === 0) return null;
-          const isOpen = matches ? true : Boolean(open[cat.slug]);
+          const isOpen = matches ? true : sections.isOpen(cat.slug);
           return (
             <div key={cat.slug} className={`nav-category ${isOpen ? 'open' : ''}`}>
-              <button className="nav-category-head" onClick={() => setOpen((o) => ({ ...o, [cat.slug]: !o[cat.slug] }))} aria-expanded={isOpen}>
+              <button className="nav-category-head" onClick={() => sections.toggle(cat.slug)} aria-expanded={isOpen}>
                 {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                 <span className="nav-tile" style={{ '--tile': colorFor(cat.slug) }}><Icon size={14} strokeWidth={2.25} /></span>
                 <span>{cat.label}</span>

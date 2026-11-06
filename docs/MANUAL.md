@@ -149,13 +149,18 @@ Support links set in branding, and *Log out*.
 count. The filter box narrows the tree to matching functions (categories with no match
 disappear), *Expand all* / *Collapse all* set every category, and the bottom button collapses
 the sidebar to icons. Open/closed state and the collapsed flag are remembered in the browser
-(`localStorage`). Opening a page expands its category. Categories hidden by the active
+(`localStorage`). Opening a page expands its category once; you can close it again until the
+next navigation. Categories hidden by the active
 *Server Profile* are left out of the sidebar, the Tools grid and search, but their URLs still
 work.
 
 **Home.** The dashboard shows the news banner (*Panel › Customization*), a marketplace
-updates notice, a **Favorites** card, the **Tools** grid (every category with a filter box),
-a **Statistics** card (user, hostname, main IP, load, uptime, OS, kernel, CPU, memory, disk `/`,
+updates notice, a **Favorites** card, the **Tools** grid (every category with a filter box;
+each category header is a disclosure that collapses or expands its tiles, *Collapse all* /
+*Expand all* set them all, the Favorites card has the same chevron, and the filter keeps every
+matching category open; the choice is remembered in the browser under `whm.home.sections`,
+`{ "<slug>": false }` = collapsed, open by default; headers carry `aria-expanded` /
+`aria-controls` and work from the keyboard), a **Statistics** card (user, hostname, main IP, load, uptime, OS, kernel, CPU, memory, disk `/`,
 account and reseller counts, panel version and mode, license status; refreshed every 30 s)
 and a **Service status** card with a coloured dot per monitored service.
 

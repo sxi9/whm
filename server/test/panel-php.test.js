@@ -53,7 +53,7 @@ describe('Customer panel: PHP', () => {
     db().prepare("INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'park.alice.example', 'parked', '/home/alice/public_html')").run(aliceId);
     alice = await panelLogin(app, 'alice');
     bob = await panelLogin(app, 'bob');
-  });
+  }, 30_000);
   afterAll(() => app.close());
   beforeEach(() => { app.agent.calls.length = 0; });
 

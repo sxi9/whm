@@ -9,6 +9,7 @@ import { TextInput, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, Tabs, ManagerBadge, RebootBanner, useJobRunner, JobPanel, JobHistory, RuntimeInstaller, CodeList } from '../../software/Shared.jsx';
+import { UpdatesBanner } from '../../home/UpdatesBanner.jsx';
 
 export const TABS = ['runtimes', 'tools', 'search', 'installed', 'history'];
 
@@ -76,7 +77,9 @@ export default function InstallSoftware({ fn }) {
       <RebootBanner required={detect.data?.rebootRequired} />
       <Card title="Software" subtitle="PHP, Node.js and Python versions and common tools install with one click (a PHP version no repository carries for this OS is built from the php.net source); anything else is in the repository search." actions={<Button onClick={() => runner.start(() => api.post('/software/pkg/update-index'), 'Refresh package index')} loading={runner.busy}>Refresh package index</Button>}>
         <Tabs value={tab} onChange={setTab} tabs={[{ value: 'runtimes', label: 'Runtimes' }, { value: 'tools', label: 'Tools' }, { value: 'search', label: 'Search repositories' }, { value: 'installed', label: 'Installed packages', count: installed.meta?.installedTotal }, { value: 'history', label: 'History', count: historyJobs.length || undefined }]} />
+        {tab === 'runtimes' && <UpdatesBanner kinds={['php', 'runtime']} title="Installed runtimes with updates" subtitle="Pending package updates and newer builds of the runtimes installed here; each Update runs as a job." />}
         {tab === 'runtimes' && <RuntimeInstaller tools={false} onFinished={() => { installed.refetch(); runtimeJobs.refetch(); }} />}
+        {tab === 'tools' && <UpdatesBanner kinds={['tool']} title="Installed tools with updates" subtitle="Pending package updates of the tools installed here; each Update runs as a job." />}
         {tab === 'tools' && <ToolsTab onFinished={() => { installed.refetch(); runtimeJobs.refetch(); }} />}
         {tab === 'search' && (
           <>

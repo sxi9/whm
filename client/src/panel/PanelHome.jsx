@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Star, Search, ExternalLink, RefreshCw } from 'lucide-react';
+import { Star, Search, ExternalLink, RefreshCw, ChevronDown, ChevronsDownUp, ChevronsUpDown } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext.jsx';
+import { useCollapsedSections } from '../hooks/useCollapsedSections.js';
 import { Card, StatusPill, Loading, formatMb, formatDate } from '../components/Common.jsx';
 import { ErrorBanner } from '../components/Form.jsx';
 import { useT } from '../i18n/useT.js';
@@ -11,6 +12,9 @@ import { panelIconFor, panelColorFor } from './icons.js';
 import { percentOf, usePanelApi, usePanelFavorites, usePanelMe } from './hooks/usePanel.js';
 import { usePanelPlugins, withPluginEntries, searchPluginEntries } from './hooks/usePanelPlugins.js';
 import { Meter, siteUrl } from './Meter.jsx';
+
+const SECTIONS_KEY = 'keel.panel.home.sections';
+const FAVORITES_KEY = '__favorites';
 
 const GREETINGS = { good_night: 'Good night', good_morning: 'Good morning', good_afternoon: 'Good afternoon', good_evening: 'Good evening' };
 
@@ -134,6 +138,7 @@ export function PanelHome({ header = null }) {
   const domainsReq = usePanelApi('/domains');
   const sslByDomain = useMemo(() => Object.fromEntries((Array.isArray(domainsReq.data) ? domainsReq.data : []).map((d) => [d.domain, d.ssl || null])), [domainsReq.data]);
   const { favorites, toggle } = usePanelFavorites();
+  const sections = useCollapsedSections(SECTIONS_KEY);
   const [q, setQ] = useState('');
   const features = me?.account?.features;
   const { entries: pluginEntries } = usePanelPlugins();
@@ -145,6 +150,8 @@ export function PanelHome({ header = null }) {
   const description = (fn) => t(`panel.${panelId(fn)}.description`, fn.description);
   const greetingKey = greetingKeyFor(new Date().getHours());
   const greeting = t(`panel.home.${greetingKey}`, GREETINGS[greetingKey]);
+  const favoritesOpen = sections.isOpen(FAVORITES_KEY);
+  const slugs = categories.map((c) => c.slug);
 
   return (
     <div className="panel-home">
@@ -171,28 +178,46 @@ export function PanelHome({ header = null }) {
           </Card>
 
           {favoriteFns.length > 0 && !matches && (
-            <Card title={t('panel.shell.favorites', 'Favorites')} subtitle={t('panel.home.pinned', 'Your pinned tools')}>
-              <div className="tool-grid">
-                {favoriteFns.map((f) => <ToolCard key={f.key} fn={f} favorite onToggle={() => toggle(f.key)} label={label(f)} description={description(f)} />)}
+            <Card title={t('panel.shell.favorites', 'Favorites')} subtitle={t('panel.home.pinned', 'Your pinned tools')} className={favoritesOpen ? '' : 'collapsed'} actions={(
+              <button type="button" className="icon-button section-toggle" onClick={() => sections.toggle(FAVORITES_KEY)} aria-expanded={favoritesOpen} aria-controls="panel-tools-favorites" aria-label={favoritesOpen ? t('panel.home.collapse_section', 'Collapse section') : t('panel.home.expand_section', 'Expand section')}>
+                <ChevronDown size={16} />
+              </button>
+            )}>
+              <div id="panel-tools-favorites" className="tool-grid" hidden={!favoritesOpen}>
+                {favoritesOpen && favoriteFns.map((f) => <ToolCard key={f.key} fn={f} favorite onToggle={() => toggle(f.key)} label={label(f)} description={description(f)} />)}
               </div>
             </Card>
           )}
 
           <Card title={t('panel.shell.tools', 'Tools')} actions={(
-            <div className="search inline">
-              <Search size={16} />
-              <input className="input" placeholder={t('panel.home.filter_tools', 'Filter tools…')} value={q} onChange={(e) => setQ(e.target.value)} aria-label={t('panel.home.filter_tools', 'Filter tools…')} />
-            </div>
+            <>
+              <button type="button" className="link-button" onClick={() => sections.expandAll(slugs)}><ChevronsUpDown size={14} /> {t('panel.home.expand_all', 'Expand all')}</button>
+              <button type="button" className="link-button" onClick={() => sections.collapseAll(slugs)}><ChevronsDownUp size={14} /> {t('panel.home.collapse_all', 'Collapse all')}</button>
+              <div className="search inline">
+                <Search size={16} />
+                <input className="input" placeholder={t('panel.home.filter_tools', 'Filter tools…')} value={q} onChange={(e) => setQ(e.target.value)} aria-label={t('panel.home.filter_tools', 'Filter tools…')} />
+              </div>
+            </>
           )}>
             {categories.map((cat) => {
               const fns = matches ? cat.functions.filter((f) => matches.has(f.key)) : cat.functions;
               if (!fns.length) return null;
               const Icon = panelIconFor(cat.icon);
+              // A filter keeps every matching group open so hits are never hidden.
+              const open = matches ? true : sections.isOpen(cat.slug);
+              const gridId = `panel-tools-${cat.slug}`;
               return (
-                <section key={cat.slug} className="tool-section" data-group={cat.slug}>
-                  <h3><span className="nav-tile" style={{ '--tile': panelColorFor(cat.slug) }}><Icon size={14} strokeWidth={2.25} /></span> {t(`panel-category.${cat.slug}`, cat.label)} <span className="count">{fns.length}</span></h3>
-                  <div className="tool-grid">
-                    {fns.map((f) => <ToolCard key={f.key} fn={f} favorite={favorites.includes(f.key)} onToggle={() => toggle(f.key)} label={label(f)} description={description(f)} />)}
+                <section key={cat.slug} className={`tool-section ${open ? '' : 'collapsed'}`} data-group={cat.slug}>
+                  <h3>
+                    <button type="button" className="tool-section-head" onClick={() => sections.toggle(cat.slug)} aria-expanded={open} aria-controls={gridId} disabled={Boolean(matches)}>
+                      <ChevronDown size={16} aria-hidden="true" />
+                      <span className="nav-tile" style={{ '--tile': panelColorFor(cat.slug) }}><Icon size={14} strokeWidth={2.25} /></span>
+                      <span>{t(`panel-category.${cat.slug}`, cat.label)}</span>
+                      <span className="count">{fns.length}</span>
+                    </button>
+                  </h3>
+                  <div id={gridId} className="tool-grid" hidden={!open}>
+                    {open && fns.map((f) => <ToolCard key={f.key} fn={f} favorite={favorites.includes(f.key)} onToggle={() => toggle(f.key)} label={label(f)} description={description(f)} />)}
                   </div>
                 </section>
               );

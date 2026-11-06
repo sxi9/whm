@@ -624,6 +624,13 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   *Installed* lists and removes packages (option *purge*); *History* shows package and runtime jobs with their logs.
   Other pages that find a tool missing (transfers, access grants, DNS cluster, Module Installers, PHP Version Manager,
   statistics software, quotas, phpMyAdmin, locales, IP functions) now show an **Install** button in place.
+  **Updates:** above the *Runtimes* tab an *Installed runtimes with updates* card lists the installed PHP versions and
+  Node.js builds that have something newer (an advisory-affected PHP with a pending package, a Keel build behind php.net,
+  a Node.js major behind nodejs.org), above *Tools* the installed tools with pending package updates; each row shows the
+  current and candidate version, the reasons and an **Update to x.y.z** button that runs the update as a job after a
+  confirm. The same list drives the Home banner (*Updates that need attention*) and the PHP Version Manager rows; it
+  comes from the cached OS update check, so *System Update › Check now* (or the nightly check) is what makes a new
+  package update appear.
 - **Server:** `GET /software/runtimes` (catalog with installed state; PHP rows carry `method: 'package' | 'source'`
   and installed Keel builds `source: true`), `POST /software/runtimes/install` `{ runtime, version, method? }` or
   `{ tool }` → `202` job `software.runtime.install` (adds the repository when needed, refreshes the index only when
@@ -635,7 +642,11 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   build script, then registers the `keel-php<minor>-fpm` unit and the `/usr/local/bin/php<minor>` link (agent
   `pkg.php.build` / `pkg.php.build.finish`, contract §51). `POST /software/runtimes/remove { runtime: 'nodejs', version }` → `202`;
   `GET /software/runtimes/recent`. `POST /pkg/install` / `/pkg/remove` / `/pkg/update-index` answer `202` with jobs
-  as before.
+  as before. `GET /software/updates/critical` is the update list (`POST …/refresh` recomputes it);
+  `POST /software/runtimes/update { runtime, version }` or `{ tool }` → `202` job `software.runtime.update` (packages
+  through `pkg.upgrade` of exactly those names, a Node.js major through a fresh nodejs.org build; `422` when it is not
+  installed; PHP versions update from PHP Version Manager). Catalog rows carry `update: { candidate, severity, reasons } |
+  null`. Contract §63.
 - **Gotchas:** a version outside the catalog is refused (`422`); Python versions beyond the distro's are Ubuntu only
   (deadsnakes) — on Debian the job fails with that message before installing anything; PHP and Python are removed
   from the *Installed* tab, only Node.js builds have their own *Remove* (a PHP source build is removed from PHP
@@ -685,6 +696,13 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   pill and `/opt/keel/php/<minor>/bin/php` as the binary, selectable per domain, editable in the INI editor,
   usable as the CLI default (`/usr/local/bin/php<minor>`), and *Remove* stops the service and deletes the whole
   prefix. *Not available for this OS* remains only on a host without a package manager.
+  **Update:** an installed row with something newer shows **Update to x.y.z** (red when a critical advisory from the
+  Security Advisor's list hits it; the reasons are in the button's tooltip and the advisory badge): a package version
+  upgrades its pending `php<ver>-*` packages and reloads its PHP-FPM, a Keel build is rebuilt from the newer php.net
+  release over its prefix and `keel-php<minor>-fpm` restarted (about 15 minutes); both run as a job in the panel below
+  after a confirm. A version hit by an advisory with nothing newer to install shows *no fix available yet* instead —
+  move its sites to a supported version. The Security Advisor's PHP finding carries the same button, and the Home
+  banner lists every version that needs attention.
 - **Server:** `GET /php/catalog` merges the runtime catalog with the detected versions and asks the agent
   `pkg.repo.status` once for the PHP repository — on Ubuntu the `ondrej/php` PPA is probed for the host's
   series before anything is added, so a release the PPA does not carry yet (26.04 "resolute") is offered as
@@ -696,7 +714,10 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   `pkg.php.remove` (refused for the system default, the only installed version or a version domains use;
   `/etc/php/<ver>` is kept for a package version; a Keel build loses its unit, link and prefix); `PUT /php/domains` calls `ctx.web.setPhpVersion` per domain (a job when
   more than one domain); `PUT /php/default` updates the default and FPM. Audit `software.php.offered`,
-  `software.php.remove`. Contract §52.
+  `software.php.remove`. Contract §52. `POST /php/update { version }` → `202` job `software.php.update`
+  (`pkg.upgrade` of the version's pending packages + `svc.reload` of its FPM unit, or `pkg.php.build` +
+  `pkg.php.build.finish` with a restart for a Keel build; `422` without a candidate); catalog rows carry
+  `update: { candidate, severity, reasons } | null`. Audit `software.php.update`. Contract §63.
 
 #### 22.6 NGINX Manager
 

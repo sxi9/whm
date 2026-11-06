@@ -1,17 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Search, Bell, ChevronDown, LogOut, KeyRound, ShieldCheck, ScrollText, Menu, LifeBuoy } from 'lucide-react';
+import { Search, Bell, ChevronDown, LogOut, KeyRound, ShieldCheck, ScrollText, Menu as MenuIcon, LifeBuoy } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext.jsx';
 import { useSearch } from '../hooks/usePluginNav.js';
 import { useBranding } from '../pages/cpanel/branding.js';
 import { Brand } from './Brand.jsx';
+import { Menu } from './Menu.jsx';
 
 export function TopBar({ onMenu }) {
   const { user, hostname, logout } = useAuth();
   const branding = useBranding();
   const navigate = useNavigate();
   const [q, setQ] = useState('');
-  const [openMenu, setOpenMenu] = useState(false);
   const [highlight, setHighlight] = useState(0);
   const inputRef = useRef(null);
   const searchFunctions = useSearch();
@@ -29,7 +29,7 @@ export function TopBar({ onMenu }) {
 
   return (
     <header className="topbar">
-      <button className="icon-button topbar-menu" onClick={onMenu} aria-label="Toggle navigation"><Menu size={20} /></button>
+      <button className="icon-button topbar-menu" onClick={onMenu} aria-label="Toggle navigation"><MenuIcon size={20} /></button>
       <Brand withText={false} />
       <div className="topbar-search" role="search">
         <Search size={16} />
@@ -55,24 +55,20 @@ export function TopBar({ onMenu }) {
         <span className="topbar-host" title="Server hostname">{hostname}</span>
         <Link to="/audit-log" className="icon-button" title="Audit log" aria-label="Audit log"><ScrollText size={18} /></Link>
         <button className="icon-button" title="Notifications" aria-label="Notifications"><Bell size={18} /></button>
-        <div className="menu" onMouseLeave={() => setOpenMenu(false)}>
-          <button className="user-menu" onClick={() => setOpenMenu((o) => !o)} aria-haspopup="menu" aria-expanded={openMenu}>
-            <span className="avatar">{user?.username?.[0]?.toUpperCase()}</span>
-            <span className="user-name">{user?.username}</span>
-            <ChevronDown size={14} />
-          </button>
-          {openMenu && (
-            <div className="menu-items right" role="menu">
-              <div className="menu-meta"><strong>{user?.username}</strong><small>{user?.role}</small></div>
-              <Link className="menu-item" to="/change-password" onClick={() => setOpenMenu(false)}><KeyRound size={14} /> Change password</Link>
-              <Link className="menu-item" to="/security-center/two-factor-authentication" onClick={() => setOpenMenu(false)}><ShieldCheck size={14} /> Two-factor authentication</Link>
-              {[['Help', branding.helpUrl], ['Documentation', branding.docsUrl], ['Support', branding.supportUrl]].filter(([, url]) => url).map(([label, url]) => (
-                <a key={label} className="menu-item" href={url} target="_blank" rel="noopener noreferrer"><LifeBuoy size={14} /> {label}</a>
-              ))}
-              <button className="menu-item" onClick={() => logout().then(() => navigate('/login'))}><LogOut size={14} /> Log out</button>
-            </div>
-          )}
-        </div>
+        <Menu align="right" header={<><strong>{user?.username}</strong><small>{user?.role}</small></>}
+          items={[
+            { label: 'Change password', icon: KeyRound, to: '/change-password' },
+            { label: 'Two-factor authentication', icon: ShieldCheck, to: '/security-center/two-factor-authentication' },
+            ...[['Help', branding.helpUrl], ['Documentation', branding.docsUrl], ['Support', branding.supportUrl]].filter(([, url]) => url).map(([label, url]) => ({ label, icon: LifeBuoy, href: url })),
+            { label: 'Log out', icon: LogOut, onClick: () => logout().then(() => navigate('/login')) },
+          ]}
+          trigger={(props) => (
+            <button {...props} className="user-menu" aria-label={`Account menu, ${user?.username ?? ''}`}>
+              <span className="avatar" aria-hidden="true">{user?.username?.[0]?.toUpperCase()}</span>
+              <span className="user-name">{user?.username}</span>
+              <ChevronDown size={14} aria-hidden="true" />
+            </button>
+          )} />
       </div>
     </header>
   );

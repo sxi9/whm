@@ -115,7 +115,7 @@ const digitsOf = (v) => String(v).replace(/\D/g, '');
 export function detectedVersion(key, version, detected = {}) {
   if (key === 'php') {
     const hit = (detected.php || []).find((p) => p.id === version || /php(\d+)$/.exec(String(p.id))?.[1] === digitsOf(version) || String(p.version || '').startsWith(version + '.'));
-    return hit ? { installed: true, version: hit.version ?? hit.id, source: Boolean(hit.source || hit.layout === 'keel'), layout: hit.layout ?? null } : { installed: false, version: null };
+    return hit ? { installed: true, id: hit.id, version: hit.version ?? hit.id, source: Boolean(hit.source || hit.layout === 'keel'), layout: hit.layout ?? null } : { installed: false, version: null };
   }
   if (key === 'nodejs') {
     const hit = (detected.node?.versions || []).find((n) => String(n.major) === String(version));

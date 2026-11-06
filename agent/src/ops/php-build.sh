@@ -18,10 +18,13 @@ case "$KEEL_PHP_JOBS" in ''|*[!0-9]*) echo "php-build: KEEL_PHP_JOBS must be a n
 
 # A make install that dies half-way must not leave a prefix the panel would
 # list as an installed version: a prefix this run created is removed on any
-# failure, and .keel-build-ok (written last) is what discovery looks for.
+# failure, and .keel-build-ok (written last) is what discovery looks for. A
+# rebuild over a live prefix keeps the marker: the running php-fpm stays a
+# listed version while make install replaces files (copy-and-rename), and a
+# failed rebuild leaves the version that still serves.
 fresh=0
 [ -e "$KEEL_PHP_PREFIX/bin/php" ] || fresh=1
-rm -f "$KEEL_PHP_PREFIX/.keel-build-ok"
+if [ $fresh = 1 ]; then rm -f "$KEEL_PHP_PREFIX/.keel-build-ok"; fi
 trap 'rc=$?; if [ $rc -ne 0 ] && [ $fresh = 1 ]; then rm -rf -- "$KEEL_PHP_PREFIX"; fi; exit $rc' EXIT
 
 cd "$KEEL_PHP_SRC"
@@ -69,9 +72,11 @@ echo "== make install"
 make install
 
 echo "== configuration under $KEEL_PHP_PREFIX"
-install -m 0644 php.ini-production "$KEEL_PHP_PREFIX/lib/php.ini"
+# php.ini and the opcache snippet are seeded once: the panel's INI editor and
+# the operator own them afterwards, so a rebuild must not reset them.
 mkdir -p "$KEEL_PHP_PREFIX/lib/conf.d" "$KEEL_PHP_PREFIX/etc/php-fpm.d" "$KEEL_PHP_PREFIX/var/log" "$KEEL_PHP_PREFIX/var/run"
-printf 'zend_extension=opcache\n' > "$KEEL_PHP_PREFIX/lib/conf.d/10-opcache.ini"
+[ -e "$KEEL_PHP_PREFIX/lib/php.ini" ] || install -m 0644 php.ini-production "$KEEL_PHP_PREFIX/lib/php.ini"
+[ -e "$KEEL_PHP_PREFIX/lib/conf.d/10-opcache.ini" ] || printf 'zend_extension=opcache\n' > "$KEEL_PHP_PREFIX/lib/conf.d/10-opcache.ini"
 
 # php-fpm refuses to start without a pool; the idle pool keeps the unit up
 # until the panel writes the first whm-<user>.conf. Pools are per account, so
