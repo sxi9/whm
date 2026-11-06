@@ -289,6 +289,21 @@ describe('cross-category helpers on ctx.web', () => {
     await app.ctx.web.setListenPorts({ http: 80, https: 443 }, null);
   });
 
+  it('rewrites an applied pool whose file is gone from the host (a rebuilt Keel tree) instead of trusting the row', async () => {
+    const row = app.ctx.db.prepare("SELECT status, path FROM web_php_pools WHERE username = 'alice' AND version = '8.1'").get();
+    expect(row.status).toBe('applied');
+    expect(row.path).toBeTruthy();
+    app.agent.set('fs.stat', ({ path }) => ({ path, exists: path !== row.path }));
+    const before = app.agent.callsTo('web.phpfpm.pool.write').length;
+    await app.ctx.web.setPhpVersion('example.com', '8.1', null, { reload: false });
+    expect(app.agent.callsTo('web.phpfpm.pool.write')).toHaveLength(before + 1);
+    expect(app.agent.callsTo('web.phpfpm.pool.write').pop().args).toMatchObject({ user: 'alice', version: '8.1' });
+    app.agent.set('fs.stat', ({ path }) => ({ path, exists: true }));
+    await app.ctx.web.setPhpVersion('example.com', '8.1', null, { reload: false });
+    expect(app.agent.callsTo('web.phpfpm.pool.write')).toHaveLength(before + 1);
+    app.agent.reset('fs.stat');
+  });
+
   it('setPhpVersion with repool rewrites a pool whose row is already applied (the resync onto a Keel build); without it the applied row short-circuits', async () => {
     expect(app.ctx.db.prepare("SELECT status FROM web_php_pools WHERE username = 'alice' AND version = '8.1'").get().status).toBe('applied');
     const before = app.agent.callsTo('web.phpfpm.pool.write').length;

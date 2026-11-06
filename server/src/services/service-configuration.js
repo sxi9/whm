@@ -790,7 +790,14 @@ export function createServiceConfigService(ctx) {
   // vhost's socket now points.
   async function ensurePool(account, version, req, { repool = false } = {}) {
     const current = stmts.poolByUserVersion.get(account.username, version);
-    if (current && current.status === 'applied' && !repool) return { username: account.username, version, socket: current.socket, applied: true, unchanged: true };
+    if (current && current.status === 'applied' && !repool) {
+      // A rebuilt Keel tree (or a pool file removed by hand) leaves the row applied while the
+      // file is gone, and the vhost then proxies to a socket nothing listens on: trust the row
+      // only while its file is still there.
+      const present = current.path ? await op('fs.stat', { path: current.path }).then((st) => st.exists !== false).catch(() => true) : true;
+      if (present) return { username: account.username, version, socket: current.socket, applied: true, unchanged: true };
+      logger.warn({ username: account.username, version, path: current.path }, 'PHP-FPM pool file missing although applied; rewriting it');
+    }
     return writePhpPool(account.username, version, current ? json.parse(current.settings_json, {}) : poolSettingsFor(account.username), req);
   }
 
