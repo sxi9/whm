@@ -174,6 +174,7 @@ describe('configuration rendering, parsing and the Joomla CLI', () => {
     expect(text).toContain("'namespace' => 'Drupal\\\\mysql\\\\Driver\\\\Database\\\\mysql',");
     expect(text).toContain("$settings['hash_salt'] = 'salt-value';");
     expect(text).toContain("$settings['config_sync_directory'] = 'sites/default/files/config_abc/sync';");
+    // phpString escapes the backslash of the regex dot, so PHP reads '^alice\.com$' back.
     expect(text).toContain("$settings['trusted_host_patterns'] = ['^alice\\.com$', '^www\\.alice\\.com$'];");
     expect(text).toContain("$settings['update_free_access'] = FALSE;");
     expect(parseDrupalSettings(text)).toEqual({ dbName: 'alice_drupal', dbUser: 'alice_drupal', dbHost: 'localhost', dbPrefix: '' });

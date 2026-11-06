@@ -74,10 +74,12 @@ describe('unit template', () => {
     expect(renderUnit({ ...APP, env: { TPL: '%d of %h' } })).toContain('Environment="TPL=%%d of %%h"');
   });
   it('keeps the unit and its directory readable by root only', () => {
-    const src = fs.readFileSync(new URL('../src/ops/apps.js', import.meta.url), 'utf8');
+    // The file/link machinery lives in unit-helpers.js (shared with webdisk.js); apps.js must not loosen it.
+    const src = fs.readFileSync(new URL('../src/ops/unit-helpers.js', import.meta.url), 'utf8');
     expect(src).toMatch(/function writeAtomic\(file, content, mode = 0o600\)/);
     expect(src).toMatch(/mkdirSync\(path\.dirname\(file\), \{ recursive: true, mode: 0o700 \}\)/);
     expect(src).not.toMatch(/0o644|0o755/);
+    expect(fs.readFileSync(new URL('../src/ops/apps.js', import.meta.url), 'utf8')).not.toMatch(/0o644|0o755/);
   });
   it('parses systemctl show and ss output', () => {
     const s = parseShow('LoadState=loaded\nActiveState=active\nSubState=running\nUnitFileState=linked\nMainPID=4242\nMemoryCurrent=1048576\nNRestarts=2\nResult=success\n');
