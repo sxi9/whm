@@ -740,7 +740,8 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       const write = app.agent.callsTo('web.host.app.write');
       expect(write).toHaveLength(1);
       // Never weaker than Debian's fragment: setup/ (the wizard, htpasswd-gated there) is denied with libraries/ and templates/.
-      expect(write[0].args).toEqual({ name: 'phpmyadmin', alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', php: true, options: ['+SymLinksIfOwnerMatch'], directoryIndex: ['index.php'], denyDirs: ['libraries', 'templates', 'setup'] });
+      // The hostname site adds its pool socket (phpSocket) to every PHP app spec; the rest is exact.
+      expect(write[0].args).toMatchObject({ name: 'phpmyadmin', alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', php: true, options: ['+SymLinksIfOwnerMatch'], directoryIndex: ['index.php'], denyDirs: ['libraries', 'templates', 'setup'] });
       expect(write[0].args.denyDirs).toContain('setup');
       expect(app.agent.callsTo('web.host.ensure')).toHaveLength(1);
       expect(app.agent.callsTo('db.phpmyadmin.global_conf.disable')).toHaveLength(1);
