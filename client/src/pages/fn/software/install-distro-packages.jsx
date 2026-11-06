@@ -8,8 +8,9 @@ import { DataTable, useTableState } from '../../../components/DataTable.jsx';
 import { TextInput, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { RequestError, Tabs, ManagerBadge, RebootBanner, useJobRunner, JobPanel, JobHistory, RuntimeInstaller, CodeList } from '../../software/Shared.jsx';
+import { RequestError, Tabs, ManagerBadge, RebootBanner, useJobRunner, JobPanel, JobHistory, RuntimeInstaller, CodeList, SourceBuildPill, sourceBuildMessage, runtimeInstallBody, PHP_SOURCE_PREFIX } from '../../software/Shared.jsx';
 import { UpdatesBanner } from '../../home/UpdatesBanner.jsx';
+import { PhpUpdateCell, phpUpdateBody, phpUpdateMessage, checkForUpdates } from './multiphp-manager.jsx';
 
 export const TABS = ['runtimes', 'tools', 'search', 'installed', 'history'];
 
@@ -28,6 +29,11 @@ export default function InstallSoftware({ fn }) {
   const detect = useApi('/software/pkg/detect');
   const recent = useApi('/software/pkg/recent');
   const runtimeJobs = useApi('/software/runtimes/recent');
+  // The PHP card is rendered here (Updates column, contract §63); the shared
+  // installer gets every other runtime once the catalog says which exist.
+  const runtimes = useApi('/software/runtimes');
+  const otherRuntimes = (runtimes.data?.runtimes || []).map((r) => r.key).filter((k) => k !== 'php');
+  const [checking, setChecking] = useState(false);
   const [tab, setTabState] = useState(link.tab);
   const [q, setQ] = useState(link.q || link.install.join(' '));
   const [searched, setSearched] = useState(link.q || link.install.join(' '));
@@ -37,7 +43,11 @@ export default function InstallSoftware({ fn }) {
   const [selected, setSelected] = useState(link.install);
   const [preselected, setPreselected] = useState(link.install);
   const [info, setInfo] = useState(null);
-  const runner = useJobRunner({ onFinished: () => { search.refetch(); installed.refetch(); recent.refetch(); runtimeJobs.refetch(); detect.refetch(); } });
+  const runner = useJobRunner({ onFinished: () => { search.refetch(); installed.refetch(); recent.refetch(); runtimeJobs.refetch(); detect.refetch(); runtimes.refetch(); } });
+  const check = async () => {
+    setChecking(true);
+    try { await checkForUpdates(runtimes.refetch); toast.success('Update check finished'); } catch (err) { toast.error(err); } finally { setChecking(false); }
+  };
 
   const setTab = (next) => {
     setTabState(next);
@@ -78,7 +88,13 @@ export default function InstallSoftware({ fn }) {
       <Card title="Software" subtitle="PHP, Node.js and Python versions and common tools install with one click (a PHP version no repository carries for this OS is built from the php.net source); anything else is in the repository search." actions={<Button onClick={() => runner.start(() => api.post('/software/pkg/update-index'), 'Refresh package index')} loading={runner.busy}>Refresh package index</Button>}>
         <Tabs value={tab} onChange={setTab} tabs={[{ value: 'runtimes', label: 'Runtimes' }, { value: 'tools', label: 'Tools' }, { value: 'search', label: 'Search repositories' }, { value: 'installed', label: 'Installed packages', count: installed.meta?.installedTotal }, { value: 'history', label: 'History', count: historyJobs.length || undefined }]} />
         {tab === 'runtimes' && <UpdatesBanner kinds={['php', 'runtime']} title="Installed runtimes with updates" subtitle="Pending package updates and newer builds of the runtimes installed here; each Update runs as a job." />}
-        {tab === 'runtimes' && <RuntimeInstaller tools={false} onFinished={() => { installed.refetch(); runtimeJobs.refetch(); }} />}
+        {tab === 'runtimes' && (
+          <>
+            <RequestError error={runtimes.error} onRetry={runtimes.refetch} />
+            {runtimes.data && <PhpCard catalog={runtimes.data} runner={runner} checking={checking} onCheck={check} confirm={confirm} />}
+            <RuntimeInstaller only={otherRuntimes} tools={false} onFinished={() => { installed.refetch(); runtimeJobs.refetch(); runtimes.refetch(); }} />
+          </>
+        )}
         {tab === 'tools' && <UpdatesBanner kinds={['tool']} title="Installed tools with updates" subtitle="Pending package updates of the tools installed here; each Update runs as a job." />}
         {tab === 'tools' && <ToolsTab onFinished={() => { installed.refetch(); runtimeJobs.refetch(); }} />}
         {tab === 'search' && (
@@ -129,6 +145,57 @@ export default function InstallSoftware({ fn }) {
         )}
       </Modal>
     </>
+  );
+}
+
+const PHP_SUBTITLE = 'Each version installs side by side with PHP-FPM and the common extensions; a version no repository carries for this OS is built from the php.net source under /opt/keel/php. Updates compares every installed version with the pending packages of the last OS update check and, for a Keel build, with php.net\'s latest release.';
+
+// The PHP rows with their update state (contract §63): the shared installer's
+// row plus an Updates column and a per-row Update that goes through
+// POST /software/php/update like the PHP Version Manager.
+export function PhpCard({ catalog, runner, checking, onCheck, confirm }) {
+  const php = (catalog?.runtimes || []).find((r) => r.key === 'php');
+  if (!php) return null;
+  const noManager = !catalog.manager;
+  const install = async (row) => {
+    const source = row.method === 'source';
+    if (source && !(await confirm({ title: `Install ${row.label}?`, message: sourceBuildMessage(row.id), confirmLabel: 'Build and install' }))) return;
+    runner.start(() => api.post('/software/runtimes/install', runtimeInstallBody('php', row.id, source ? 'source' : undefined)), `Install ${row.label}`);
+  };
+  const update = async (row) => {
+    const u = row.update;
+    if (!u?.candidate) return;
+    if (!(await confirm({ title: `Update ${row.label} to ${u.candidate}?`, message: phpUpdateMessage(row), confirmLabel: 'Update', danger: u.severity === 'critical' }))) return;
+    runner.start(() => api.post('/software/php/update', phpUpdateBody(row)), `Update ${row.label}`);
+  };
+  return (
+    <Card title="PHP" subtitle={PHP_SUBTITLE} actions={<Button loading={checking} onClick={onCheck}>Check for updates</Button>} padded={false}>
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th className="shrink-col">Version</th><th className="shrink-col">State</th><th>Updates</th><th>Packages / note</th><th /></tr></thead>
+          <tbody>
+            {php.versions.map((row) => {
+              const unsupported = row.state === 'unsupported';
+              const source = row.source || row.method === 'source';
+              return (
+                <tr key={row.id}>
+                  <td className="nowrap"><strong>{row.label || `PHP ${row.id}`}</strong> <SourceBuildPill row={row} />
+                    {source && <><br /><code className="small nowrap">{PHP_SOURCE_PREFIX}/{row.id}</code></>}
+                  </td>
+                  <td>{row.installed ? <StatusPill status="installed">{row.version ? `installed · ${row.version}` : 'installed'}</StatusPill> : <StatusPill status="not-installed">not installed</StatusPill>}</td>
+                  <td><PhpUpdateCell row={row} stamp={catalog.updates} checking={checking} busy={runner.busy} onUpdate={update} /></td>
+                  <td className="muted small">{noManager && unsupported ? <span title={row.note}>Needs a package manager</span> : row.note || (row.packages?.length ? <CodeList names={row.packages.slice(0, 4).concat(row.packages.length > 4 ? [`+${row.packages.length - 4} more`] : [])} /> : '—')}</td>
+                  <td className="actions-col">
+                    {!row.installed && <Button size="sm" variant="primary" loading={runner.busy} disabled={unsupported} title={unsupported ? row.note || 'Not available for this OS' : undefined} onClick={() => install(row)}>Install</Button>}
+                    {row.installed && <StatusPill status="installed">Installed</StatusPill>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </Card>
   );
 }
 

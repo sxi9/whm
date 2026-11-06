@@ -83,7 +83,7 @@ export const KNOWN_TUNABLES = [
 ];
 
 const SYSTEM_DATABASES = new Set(['mysql', 'information_schema', 'performance_schema', 'sys', 'postgres', 'template0', 'template1']);
-const SYSTEM_USERS = new Set(['root', 'postgres', 'mysql.sys', 'mysql.session', 'mysql.infoschema', 'mariadb.sys', 'debian-sys-maint', 'mysqlxsys', 'phpmyadmin', 'pma']);
+const SYSTEM_USERS = new Set(['root', 'postgres', 'mysql.sys', 'mysql.session', 'mysql.infoschema', 'mariadb.sys', 'debian-sys-maint', 'mysqlxsys', 'phpmyadmin', 'pma', 'keel_pma_admin']);
 
 // phpMyAdmin single sign-on from the account panel (contract §44, phpMyAdmin
 // kind): a hidden per-account MySQL user `<account>_pma` at localhost,
@@ -103,6 +103,13 @@ export const PHPMYADMIN_SSO = Object.freeze({
   app: Object.freeze({ name: 'keel-signon', alias: '/keel' }),
   confPath: '/etc/phpmyadmin/conf.d/keel-signon.php',
   hosts: Object.freeze(['localhost']),
+  // The administrator's sign-on user: recreated at every sign-on like the
+  // account users, with everything the panel's database root may grant, and
+  // dropped again once phpMyAdmin's login validity (its default
+  // LoginCookieValidity, 1440 s) has passed, when single sign-on goes off,
+  // when the publication goes and at service start-up.
+  adminUser: 'keel_pma_admin',
+  adminTtlMs: 1440 * 1000,
 });
 export const signonUserFor = (username) => `${username}${PHPMYADMIN_SSO.suffix}`;
 // The script ships in the deployed tree (install.sh rsyncs deploy/ into /opt/whm).
@@ -431,7 +438,7 @@ export function createDatabaseServicesService(ctx) {
       for (const u of serverUsers) { const g = grouped.get(u.user) || { name: u.user, hosts: [], system: u.system }; if (u.host) g.hosts.push(u.host); grouped.set(u.user, g); }
       for (const g of grouped.values()) {
         const row = byName.get(g.name);
-        rows.push(row ? { ...shapeUserRow(row, g.hosts), owner_id: row.owner_id, system: false, hidden: isSignonRow(row), onServer: true } : { name: g.name, account: null, owner_id: null, hosts: g.hosts, grants: [], mapped: false, system: g.system, hidden: false, onServer: true });
+        rows.push(row ? { ...shapeUserRow(row, g.hosts), owner_id: row.owner_id, system: false, hidden: isSignonRow(row), onServer: true } : { name: g.name, account: null, owner_id: null, hosts: g.hosts, grants: [], mapped: false, system: g.system || SYSTEM_USERS.has(g.name), hidden: false, onServer: true });
       }
       for (const r of mapped) if (!grouped.has(r.name)) rows.push({ ...shapeUserRow(r), owner_id: r.owner_id, system: false, hidden: isSignonRow(r), onServer: false });
     } else {
@@ -511,9 +518,11 @@ export function createDatabaseServicesService(ctx) {
     const row = stmts.userByName.get(name);
     if (row) assertVisible(row, user, 'Database user');
     else assertRoot(user, 'Dropping a database user that is not mapped to an account');
-    if (SYSTEM_USERS.has(name)) throw badRequest(`"${name}" is a system user and cannot be dropped`);
+    // The administrator's sign-on user is the panel's, not the distribution's: root may remove it by hand.
+    if (SYSTEM_USERS.has(name) && !(name === PHPMYADMIN_SSO.adminUser && isRoot(user))) throw badRequest(`"${name}" is a system user and cannot be dropped`);
     assertNotSignon(row, 'dropping it');
     const result = await run('user.drop', { user: name }, req, profile);
+    if (name === PHPMYADMIN_SSO.adminUser) disarmAdminDrop();
     stmts.deleteUser.run(name);
     req?.audit?.({ action: 'db.user.drop', target: name, args: { account: row?.account ?? null } });
     if (row?.account_id != null) await refreshPgHba(stmts.accountById.get(row.account_id), req, profile);
@@ -1212,13 +1221,53 @@ export function createDatabaseServicesService(ctx) {
     return { app: { url: app.url, path: app.path, changed: Boolean(app.changed), reloaded: Boolean(app.reloaded), warnings: app.warnings || [] }, conf: { path: conf.path, changed: Boolean(conf.changed), validated: conf.validated ?? null } };
   }
 
-  async function removeSignon(req) {
-    const out = { conf: null, app: null, errors: [] };
+  async function removeSignon(req, reason) {
+    const out = { conf: null, app: null, adminUser: null, errors: [] };
     try { const r = await agent.op('db.phpmyadmin.signon.remove', {}, { req }); out.conf = { path: r.path, removed: Boolean(r.removed) }; } catch (err) { out.errors.push(`drop-in: ${err.message}`); }
     if (typeof ctx.web?.hostApps?.unpublish === 'function') {
       try { const r = await ctx.web.hostApps.unpublish(PHPMYADMIN_SSO.app.name, req); out.app = { path: r.path, removed: Boolean(r.removed), reloaded: Boolean(r.reloaded) }; } catch (err) { out.errors.push(`script: ${err.message}`); }
     }
+    const profile = activeRow();
+    if (profile && !isPg(profile)) {
+      out.adminUser = await dropAdminUser(req, { reason });
+      if (out.adminUser.error) out.errors.push(`admin user: ${out.adminUser.error}`);
+    }
     return out;
+  }
+
+  // keel_pma_admin holds ALL PRIVILEGES ON *.*, so it lives only as long as a
+  // phpMyAdmin login can: a timer armed at every sign-on drops it after
+  // PHPMYADMIN_SSO.adminTtlMs (ctx.config.phpmyadminAdminTtlMs overrides it),
+  // and start-up drops whatever a crash left behind. Never fatal: the drop is
+  // reported, and the next sign-on recreates the user anyway.
+  let adminDropTimer = null;
+  const adminTtlMs = () => Number(ctx.config?.phpmyadminAdminTtlMs) || PHPMYADMIN_SSO.adminTtlMs;
+  function disarmAdminDrop() {
+    if (adminDropTimer) clearTimeout(adminDropTimer);
+    adminDropTimer = null;
+  }
+  function armAdminDrop() {
+    disarmAdminDrop();
+    adminDropTimer = setTimeout(() => { adminDropTimer = null; dropAdminUser(null, { reason: 'expired' }).catch(() => {}); }, adminTtlMs());
+    adminDropTimer.unref?.();
+  }
+  async function dropAdminUser(req, { reason = 'manual' } = {}) {
+    disarmAdminDrop();
+    const name = PHPMYADMIN_SSO.adminUser;
+    const hosts = [...PHPMYADMIN_SSO.hosts];
+    const profile = activeRow();
+    if (!profile || isPg(profile)) return { user: name, dropped: false, reason };
+    try {
+      const present = (await run('users.list', {}, req, profile)).some((u) => u.user === name && hosts.includes(u.host));
+      if (!present) return { user: name, dropped: false, reason };
+      await run('user.drop', { user: name, hosts }, req, profile);
+      const entry = { action: 'db.phpmyadmin.signon.admin.drop', target: name, args: { reason, hosts } };
+      if (req?.audit) req.audit(entry); else ctx.auditRecord?.(null, entry);
+      return { user: name, dropped: true, reason };
+    } catch (err) {
+      logger?.warn?.({ err, reason }, 'phpmyadmin: dropping the administrator sign-on user failed');
+      return { user: name, dropped: false, reason, error: err.message };
+    }
   }
 
   const phpmyadminSso = {
@@ -1260,7 +1309,7 @@ export function createDatabaseServicesService(ctx) {
         settings.set(PHPMYADMIN_SSO.settingEnabled, true);
       } else {
         settings.set(PHPMYADMIN_SSO.settingEnabled, false);
-        applied = await removeSignon(req);
+        applied = await removeSignon(req, 'sso_off');
       }
       req?.audit?.({ action: 'phpmyadmin.sso.set', target: PHPMYADMIN_SSO.app.alias, args: { enabled: on, applied } });
       return { enabled: on, applied, status: await phpmyadminSso.status(user) };
@@ -1297,6 +1346,48 @@ export function createDatabaseServicesService(ctx) {
       }
       req?.audit?.({ action: 'db.phpmyadmin.signon', target: name, args: { account: username, created: !existing, hosts, databases } });
       return { user: name, password, host: hosts[0] };
+    },
+    // The administrator's sign-on: keel_pma_admin is dropped and created again
+    // with a fresh password and ALL PRIVILEGES ON *.* WITH GRANT OPTION — or
+    // without the option when the profile's root cannot pass it on
+    // (grantOption: false). Never mapped to an account; SYSTEM_USERS hides it.
+    async signonAdmin(user, req) {
+      assertRoot(user, 'Opening phpMyAdmin as the administrator');
+      const profile = requireProfile();
+      if (isPg(profile)) throw new HttpError(422, 'unsupported', 'phpMyAdmin single sign-on needs a MySQL/MariaDB profile');
+      if (!ssoEnabled()) throw conflict('phpMyAdmin single sign-on is not enabled on this server');
+      const name = PHPMYADMIN_SSO.adminUser;
+      const hosts = [...PHPMYADMIN_SSO.hosts];
+      const password = crypto.randomPassword(32);
+      const existing = (await run('users.list', {}, req, profile)).some((u) => u.user === name && hosts.includes(u.host));
+      if (existing) await run('user.drop', { user: name, hosts }, req, profile);
+      await run('user.create', { user: name, password, hosts }, req, profile);
+      const granted = await run('grant.global', { user: name, hosts }, req, profile);
+      const grantOption = granted.grantOption !== false;
+      armAdminDrop();
+      req?.audit?.({ action: 'db.phpmyadmin.signon.admin', target: name, args: { actor: user.username, created: !existing, hosts, grantOption, dropAfterMs: adminTtlMs() } });
+      return { user: name, password, host: hosts[0], grantOption };
+    },
+    // Drops keel_pma_admin now (start-up, the switch, the publication, a test).
+    dropAdmin: (req, opts) => dropAdminUser(req, opts),
+    adminDropArmed: () => adminDropTimer !== null,
+    // A browser hand-off from the administration shell: without an account the
+    // administrator's user (root only); with one, exactly the token the account
+    // panel would mint for that customer (ownership through ctx.accounts.get).
+    async open({ account } = {}, user, req) {
+      const info = await phpMyAdmin(user);
+      if (!info.url || !info.installed) throw conflict('phpMyAdmin is not published; publish it under the hostname site first (Database Services › phpMyAdmin)');
+      if (!info.sso || !ctx.panelSso) throw conflict('phpMyAdmin single sign-on is switched off; turn on "phpMyAdmin single sign-on" (setting panel.phpmyadmin.sso) under Panel › Customization › Account panel');
+      let cred;
+      if (account) {
+        if (typeof ctx.accounts?.get !== 'function') throw forbidden('Account lookup is unavailable');
+        ctx.accounts.get(account, user);
+        cred = await phpmyadminSso.signon(account, req);
+      } else cred = await phpmyadminSso.signonAdmin(user, req);
+      const { token, expiresAt } = ctx.panelSso.issue({ kind: 'phpmyadmin', userId: user.id ?? null, account: account || cred.user, payload: { user: cred.user, password: cred.password, host: cred.host } });
+      const url = `${signonUrlFor(info.url)}?_keel=${token}`;
+      if (account) req?.audit?.({ action: 'db.phpmyadmin.signon.as', target: account, args: { account, user: cred.user, actor: user.username, expiresAt } });
+      return { url, user: cred.user, account: account || null, expiresAt, grantOption: cred.grantOption ?? null };
     },
   };
 
@@ -1357,8 +1448,8 @@ export function createDatabaseServicesService(ctx) {
       requireHostApps();
       const r = await ctx.web.hostApps.unpublish(PMA_APP.name, req);
       // The signon pieces only make sense for the publication; the switch itself stays as set.
-      const sso = await removeSignon(req);
-      req?.audit?.({ action: 'db.phpmyadmin.unpublish', target: PMA_APP.alias, args: { path: r.path, removed: r.removed, reloaded: r.reloaded, sso: { conf: sso.conf?.removed ?? false, app: sso.app?.removed ?? false, errors: sso.errors } } });
+      const sso = await removeSignon(req, 'unpublish');
+      req?.audit?.({ action: 'db.phpmyadmin.unpublish', target: PMA_APP.alias, args: { path: r.path, removed: r.removed, reloaded: r.reloaded, sso: { conf: sso.conf?.removed ?? false, app: sso.app?.removed ?? false, adminUser: sso.adminUser?.dropped ?? false, errors: sso.errors } } });
       return { published: false, removed: Boolean(r.removed), reloaded: Boolean(r.reloaded), path: r.path, sso };
     },
     sso: phpmyadminSso,

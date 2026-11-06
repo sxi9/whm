@@ -3,7 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
-import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
+import { PageHeader, Card, StatusPill, Loading, formatDate } from '../../../components/Common.jsx';
 import { DataTable, useTableState } from '../../../components/DataTable.jsx';
 import { Select, Toggle, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
@@ -63,6 +63,67 @@ export function toggleOffered(catalog, id, on) {
 
 const versionLabel = (v) => `${v.label || `PHP ${v.id}`}${v.version ? ` (${v.version})` : ''}`;
 
+// What the row's Update button sends (POST /software/php/update, contract §63).
+export const phpUpdateBody = (v) => ({ version: v.id });
+
+// Confirm copy for an installed row with a candidate.
+export function phpUpdateMessage(v) {
+  const u = v.update || {};
+  const reasons = u.reasons?.length ? ` ${u.reasons.join(' ')}` : '';
+  return v.source || v.layout === 'keel'
+    ? `Rebuilds PHP ${v.id} from the official php.net ${u.candidate} source over ${PHP_SOURCE_PREFIX}/${v.id} (about 15 minutes) and restarts keel-php${v.id}-fpm.${reasons}`
+    : `Upgrades the pending php${v.id}-* packages to ${u.candidate} and reloads ${v.fpmUnit || 'PHP-FPM'}.${reasons}`;
+}
+
+// "Check for updates": a fresh php.net lookup and OS update check on the
+// server, then the caller's catalog again so every row shows the new verdict.
+export async function checkForUpdates(refetch) {
+  await api.post('/software/updates/critical/refresh');
+  await refetch?.();
+}
+
+// The update state of an installed row (null for one that is not installed):
+// the row's `update` wins; without one the catalog's check times say the
+// version is current — only when the source that would know (the OS package
+// check, or php.net for a Keel build) has really been consulted; otherwise
+// nothing has been checked yet and no verdict is given.
+export function updateState(v, stamp, checking = false) {
+  if (!v?.installed) return null;
+  const u = v.update;
+  if (u?.candidate) return { kind: u.severity === 'critical' || u.severity === 'security' ? 'security' : 'update', candidate: u.candidate, reasons: u.reasons || [], checkedAt: u.checkedAt ?? stamp?.checkedAt ?? null };
+  if (u) return { kind: 'nofix', candidate: null, reasons: u.reasons || [], checkedAt: u.checkedAt ?? stamp?.checkedAt ?? null };
+  if (checking || !stamp) return { kind: 'checking', candidate: null, reasons: [], checkedAt: null };
+  const keel = Boolean(v.source || v.layout === 'keel' || v.method === 'source');
+  const at = keel ? stamp.releasesCheckedAt : stamp.packagesCheckedAt;
+  if (!at) return { kind: 'unknown', candidate: null, reasons: [], checkedAt: null };
+  return { kind: keel ? 'latest' : 'distro', candidate: null, reasons: [], checkedAt: at };
+}
+
+const checkedLine = (label, at) => `${label} · checked ${formatDate(at)}`;
+
+export function PhpUpdateCell({ row, stamp, checking, busy, onUpdate }) {
+  const s = updateState(row, stamp, checking);
+  if (!s) return <span className="muted">—</span>;
+  const title = s.reasons.length ? s.reasons.join('\n') : undefined;
+  if (s.kind === 'checking') return <span className="muted small">Checking…</span>;
+  if (s.kind === 'unknown') return <span className="muted small">Not checked yet — use Check for updates</span>;
+  if (s.kind === 'security' || s.kind === 'update') {
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }} title={title}>
+        {s.kind === 'security' ? <><StatusPill status="failed">Security update</StatusPill><span>{s.candidate}</span></> : <span>Update available: <strong>{s.candidate}</strong></span>}
+        <Button size="sm" variant={s.kind === 'security' ? 'danger' : 'primary'} loading={busy} title={title} onClick={() => onUpdate(row)}>Update</Button>
+      </span>
+    );
+  }
+  if (s.kind === 'nofix') return <span title={title}><StatusPill status="failed">Advisory</StatusPill> <span className="muted small">no fix available yet</span></span>;
+  return (
+    <span className="muted">
+      Up to date{row.version ? ` · ${row.version}` : ''}
+      <br /><span className="small">{checkedLine(s.kind === 'latest' ? 'Latest php.net release' : 'Distribution packages', s.checkedAt)}</span>
+    </span>
+  );
+}
+
 export default function MultiPhpManager({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -78,8 +139,13 @@ export default function MultiPhpManager({ fn }) {
   const [bulkVersion, setBulkVersion] = useState('');
   const [selected, setSelected] = useState([]);
   const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(false);
   const [error, setError] = useState(null);
   const refetchAll = () => { versions.refetch(); catalog.refetch(); domains.refetch(); pools.refetch(); };
+  const check = async () => {
+    setChecking(true); setError(null);
+    try { await checkForUpdates(catalog.refetch); toast.success('Update check finished'); } catch (err) { setError(err); toast.error(err); } finally { setChecking(false); }
+  };
   const runner = useJobRunner({ onFinished: refetchAll });
   const deepLinked = useRef(false);
 
@@ -145,11 +211,8 @@ export default function MultiPhpManager({ fn }) {
   const update = async (v) => {
     const u = v.update;
     if (!u?.candidate) return;
-    const message = v.source
-      ? `Rebuilds PHP ${v.id} from the official php.net ${u.candidate} source over ${PHP_SOURCE_PREFIX}/${v.id} (about 15 minutes) and restarts keel-php${v.id}-fpm. ${u.reasons?.join(' ') || ''}`
-      : `Upgrades the pending php${v.id}-* packages to ${u.candidate} and reloads ${v.fpmUnit || 'PHP-FPM'}. ${u.reasons?.join(' ') || ''}`;
-    if (!(await confirm({ title: `Update ${versionLabel(v)} to ${u.candidate}?`, message, confirmLabel: 'Update', danger: u.severity === 'critical' }))) return;
-    runner.start(() => api.post('/software/php/update', { version: v.id }), `Update ${versionLabel(v)}`);
+    if (!(await confirm({ title: `Update ${versionLabel(v)} to ${u.candidate}?`, message: phpUpdateMessage(v), confirmLabel: 'Update', danger: u.severity === 'critical' }))) return;
+    runner.start(() => api.post('/software/php/update', phpUpdateBody(v)), `Update ${versionLabel(v)}`);
   };
   const setOffered = async (v, on) => {
     setBusy(true); setError(null);
@@ -171,7 +234,7 @@ export default function MultiPhpManager({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} actions={<Link className="btn" to="/software/multiphp-ini-editor">INI editor</Link>} />
+      <PageHeader fn={fn} actions={<>{isRoot && <Button variant="primary" loading={checking} onClick={check}>Check for updates</Button>}<Link className="btn" to="/software/multiphp-ini-editor">INI editor</Link></>} />
       <RequestError error={versions.error} onRetry={versions.refetch} />
       <RequestError error={catalog.error} onRetry={catalog.refetch} />
       {(versions.loading && !versions.data) && <Loading text="Detecting PHP versions…" />}
@@ -179,11 +242,11 @@ export default function MultiPhpManager({ fn }) {
         <Card title="PHP versions" subtitle={`Every version of the catalog for ${catalog.data.os?.id || catalog.data.family || 'this host'}${catalog.data.os?.versionId ? ` ${catalog.data.os.versionId}` : ''}: install, remove, pick the system default and choose what accounts may select.`} actions={<Button onClick={refetchAll}>Re-detect</Button>} padded={false}>
           <div className="table-wrap">
             <table>
-              <thead><tr><th style={{ minWidth: 220 }}>Version</th><th>State</th><th>PHP-FPM</th><th>Default</th><th>Domains</th><th>Offered to accounts</th><th /></tr></thead>
+              <thead><tr><th style={{ minWidth: 220 }}>Version</th><th>State</th><th>PHP-FPM</th><th>Updates</th><th>Default</th><th>Domains</th><th>Offered to accounts</th><th /></tr></thead>
               <tbody>
-                {matrix.length === 0 && <tr><td colSpan={7} className="table-state">The catalog is empty for this OS. Add a version with <Link to="/software/easyapache-4">EasyApache 4</Link> or install packages by hand.</td></tr>}
-                {matrix.some((v) => !v.installed && v.method === 'source') && <tr><td colSpan={7} className="muted small" style={{ padding: '8px 16px' }}>Versions marked <em>Source build</em> have no packages for this OS yet; Install compiles them from the official php.net source into {PHP_SOURCE_PREFIX}/&lt;version&gt; with their own PHP-FPM service (about 15 minutes, the build log streams below).</td></tr>}
-                {sharedNote && <tr><td colSpan={7} className="muted small" style={{ padding: '8px 16px' }}>{sharedNote}</td></tr>}
+                {matrix.length === 0 && <tr><td colSpan={8} className="table-state">The catalog is empty for this OS. Add a version with <Link to="/software/easyapache-4">EasyApache 4</Link> or install packages by hand.</td></tr>}
+                {matrix.some((v) => !v.installed && v.method === 'source') && <tr><td colSpan={8} className="muted small" style={{ padding: '8px 16px' }}>Versions marked <em>Source build</em> have no packages for this OS yet; Install compiles them from the official php.net source into {PHP_SOURCE_PREFIX}/&lt;version&gt; with their own PHP-FPM service (about 15 minutes, the build log streams below).</td></tr>}
+                {sharedNote && <tr><td colSpan={8} className="muted small" style={{ padding: '8px 16px' }}>{sharedNote}</td></tr>}
                 {matrix.map((v) => {
                   const blocker = removeBlocker(v, matrix.filter((x) => x.installed).length);
                   return (
@@ -195,13 +258,12 @@ export default function MultiPhpManager({ fn }) {
                       </td>
                       <td><PhpStatePill state={v.state} /></td>
                       <td>{v.installed ? (v.fpmInstalled ? <StatusPill status={v.fpmActive ? 'active' : v.fpmActive === false ? 'inactive' : 'unknown'}>{v.fpmUnit || 'FPM'}{v.fpmActive === false ? ' · stopped' : ''}</StatusPill> : <StatusPill status="not-installed">no FPM</StatusPill>) : <span className="muted">—</span>}</td>
+                      <td><PhpUpdateCell row={v} stamp={catalog.data.updates} checking={checking} busy={runner.busy} onUpdate={update} /></td>
                       <td>{v.isSystemDefault && <StatusPill status="ok">system default</StatusPill>}{v.isDefault && !v.isSystemDefault && <StatusPill status="info">CLI</StatusPill>}</td>
                       <td>{v.installed ? v.domains ?? 0 : <span className="muted">—</span>}</td>
                       <td style={{ whiteSpace: 'nowrap' }}><Toggle checked={Boolean(v.offered)} disabled={!v.installed || busy} onChange={(on) => setOffered(v, on)} label={v.installed ? (v.offered ? 'Offered' : 'Hidden') : 'Install first'} /></td>
                       <td className="actions-col">
                         {!v.installed && <Button size="sm" loading={runner.busy} disabled={v.state === 'unsupported'} title={v.state === 'unsupported' ? v.note || 'Not available for this OS' : v.method === 'source' ? `Built from the php.net source into ${PHP_SOURCE_PREFIX}/${v.id}` : undefined} onClick={() => install(v)}>Install</Button>}
-                        {v.installed && v.update?.candidate && <Button size="sm" variant={v.update.severity === 'critical' ? 'danger' : 'primary'} loading={runner.busy} title={v.update.reasons?.join('\n') || undefined} onClick={() => update(v)}>Update to {v.update.candidate}</Button>}
-                        {v.installed && v.update && !v.update.candidate && <span className="muted small" title={v.update.reasons?.join('\n') || undefined}>no fix available yet</span>}
                         {v.installed && !v.isSystemDefault && <Button size="sm" loading={busy} onClick={() => setDefault(v.id)}>Set as default</Button>}
                         {v.installed && <Button size="sm" variant="danger" loading={runner.busy} disabled={Boolean(blocker)} title={blocker || undefined} onClick={() => remove(v)}>Remove</Button>}
                       </td>
@@ -213,6 +275,7 @@ export default function MultiPhpManager({ fn }) {
           </div>
           <div style={{ padding: '0 16px 12px' }}>
             <ErrorBanner error={error || runner.error} />
+            <p className="muted small"><em>Updates</em> compares every installed version with the pending packages of the last OS update check and, for a Keel build, with php.net's latest release of its branch; <em>Check for updates</em> runs both checks again. An Update runs as a job below (packages are upgraded and PHP-FPM reloaded; a Keel build is rebuilt from the newer php.net source and its service restarted, about 15 minutes).</p>
             <p className="muted small">Accounts see only the versions switched to <em>Offered</em> (all installed ones until you hide one); a version a domain already runs stays selectable for that domain. A plan's own version list narrows it further.</p>
           </div>
         </Card>

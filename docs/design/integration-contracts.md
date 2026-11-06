@@ -840,6 +840,36 @@ only** for a credential that kind's handler produces. The master credential neve
   - Client: `pages/panel/databases/phpmyadmin.jsx` `PhpMyAdminOpenButton` / `openPhpMyAdminSso` (window-open-first,
     plain link when `sso` is false); Panel › Customization › Account panel `PhpMyAdminSsoCard` (toggle, requires the
     publication first).
+  - **Administration shell (`ctx.databases.phpmyadmin.sso.open({ account? }, user, req)`, `POST
+    /api/databases/phpmyadmin/open`, requireReseller + session only → `403 session_required` for API tokens, body
+    `{ account?: username }` strict):** `409` before any op when phpMyAdmin is not published or `phpMyAdmin(user).sso`
+    is false (the message names the `panel.phpmyadmin.sso` switch). Without `account`: root only (`403` otherwise) →
+    `sso.signonAdmin(user, req)` — the hidden user `PHPMYADMIN_SSO.adminUser = 'keel_pma_admin'` at `localhost`,
+    dropped when `db.users.list` shows it and created again with a fresh `crypto.randomPassword(32)`, then agent
+    **`db.grant.global { user, hosts }`** (`GRANT ALL PRIVILEGES ON *.* TO user@host WITH GRANT OPTION; FLUSH
+    PRIVILEGES`; on errno 1044/1045/1227 — the connecting root cannot pass the option on — retried without `WITH GRANT
+    OPTION` and answered `grantOption: false`; `root` refused); never mapped in `db_users`, hidden through
+    `SYSTEM_USERS` (listed only with `?system=true`, `400` from the user functions); audit `db.phpmyadmin.signon.admin`
+    (`actor`, `created`, `hosts`, `grantOption`). With `account`: `ctx.accounts.get(account, user)` (404 / 403 for a
+    reseller's foreign account) then **the same `sso.signon(account, req)` the panel uses** — `<account>_pma` with
+    grants on that account's databases only — audit `db.phpmyadmin.signon.as` (`account`, `user`, `actor`,
+    `expiresAt`). Both mint `panelSso.issue({ kind: 'phpmyadmin', userId: user.id, account: account ?? 'keel_pma_admin',
+    payload: { user, password, host } })` and answer `{ url: '<signonUrl>?_keel=<token>', user, account|null,
+    expiresAt, grantOption|null }` through the same `signonUrl` helper; the registered handler and the single-use burn
+    are unchanged. Client: `pages/fn/database-services/phpmyadmin.jsx` `openPhpMyAdminAs({ account? })`
+    (window-open-first), **Open phpMyAdmin (all databases)** (root, `sso` on) + *Open as an account* card
+    (`AccountPicker`), and the **phpMyAdmin** row action on List Accounts (`pages/accounts/AccountsTable.jsx`).
+    The popup is opened **without the `noopener` feature** (the HTML spec makes `window.open` return `null` with it)
+    and `w.opener = null` severs it by hand, so the shell only falls back to `location.assign` when the popup was blocked.
+  - **`keel_pma_admin` lifetime:** the user holds `ALL PRIVILEGES ON *.*`, so it never outlives a phpMyAdmin login.
+    `signonAdmin` arms a drop after `PHPMYADMIN_SSO.adminTtlMs` (1440 s, phpMyAdmin's default `LoginCookieValidity`;
+    `ctx.config.phpmyadminAdminTtlMs` overrides it in tests), re-armed at every sign-on; `sso.set({ enabled: false })`
+    and `phpmyadmin.unpublish` drop it through `removeSignon` (reported as `applied.adminUser` / `sso.adminUser`
+    `{ user, dropped, reason, error? }`); the category's `register(ctx)` drops a leftover at start-up
+    (`sso.dropAdmin(null, { reason: 'startup' })`, best-effort, never fatal); audit `db.phpmyadmin.signon.admin.drop`
+    (`reason`: `expired` | `sso_off` | `unpublish` | `startup` | `manual`, no principal when no request). Root may also
+    drop it by hand through `DELETE /api/databases/users/keel_pma_admin` (`dropUser` exempts it from `SYSTEM_USERS`;
+    password and grants stay `400`). `sso.adminDropArmed()` tells whether a drop is pending.
 
 ## 45. Customer panel: Sieve mail filters (`ctx.panelEmail.filters`, `vmail.sieve.*`)
 Structured rules in the panel's own table, Sieve rendered by the panel, compiled and installed by the agent as the account.
@@ -1639,9 +1669,26 @@ findings, so every page agrees on what needs an update and what runs when the op
      `kind: 'runtime', id: 'nodejs:<major>'`, severity `update`.
   Release lookups are cached six hours in the settings `software.php.releases` / `software.node.releases`
   (`{ [minor|major]: { version, sha256, file, at } }`); a failed lookup serves the stale entry.
-  `updates.rowUpdate(list, kind, id)` → `{ candidate, severity, reasons } | null` is what the catalogs attach:
-  `GET /api/software/php/catalog` rows and `GET /api/software/runtimes` runtime/tool rows gain `update` (null when nothing
-  is pending or the row is not installed).
+  `updates.rowUpdate(list, kind, id)` → `{ candidate, severity, reasons, current, source, checkedAt } | null` is what the
+  catalogs attach: `GET /api/software/php/catalog` rows and `GET /api/software/runtimes` runtime/tool rows gain `update`
+  (null when nothing is pending or the row is not installed).
+  **Amendment (always-visible update state, 2026-11-06):** every item carries `source: 'package' | 'release' | null`
+  (pending packages / an upstream php.net or nodejs.org release / an advisory with nothing newer) and the list carries
+  `releasesCheckedAt` (the newest release-cache entry consulted this round, null when no Keel build or Node major asked
+  upstream). `rowUpdate` adds `current` and `checkedAt` (`packagesCheckedAt` for a package source, `releasesCheckedAt` for a
+  release, else `checkedAt`). Both catalogs carry a top-level `updates: { checkedAt, packagesCheckedAt, releasesCheckedAt }
+  | null` (`updates.stamp(list)`), so a row with `update: null` is rendered as *Up to date* as of those times instead of
+  showing nothing: the PHP Version Manager and Install Software PHP rows have an **Updates** column (*Checking…* until
+  the catalog has `updates`; *Up to date · <version>* + *Distribution packages · checked …* for a package row; *Latest
+  php.net release · checked …* for a Keel build whose patch equals php.net's latest — no rebuild is offered then;
+  *Update available: x.y.z* / *Security update* + **Update**; *Advisory · no fix available yet*). `updates.refresh()`
+  (`POST …/updates/critical/refresh`, the pages' **Check for updates**) now forces the php.net / nodejs.org lookups past
+  their six-hour cache (`critical({ fresh: true, releases: true })`) and re-records the OS update simulation
+  (`pkg.upgradable`, no index refresh) when `software.updates.last_check` is older than six hours; `critical({ fresh:
+  true })` alone (the Security Advisor, `php.update`) keeps the release cache. The client helpers live in
+  `pages/fn/software/multiphp-manager.jsx` (`updateState`, `PhpUpdateCell`, `phpUpdateBody`, `phpUpdateMessage`,
+  `checkForUpdates`) and Install Software renders its PHP card itself (`PhpCard`), handing the other runtimes to
+  `RuntimeInstaller({ only })`.
 - **Routes:** `GET /api/software/updates/critical` (requireRoot) → the list; `POST …/updates/critical/refresh` recomputes
   it. `POST /api/software/php/update { version }` (requireRoot, `phpVersionId`) → `202 { job, version, candidate, method:
   'package'|'source' }`, job `software.php.update`; `422` when the version is not installed, has nothing pending, or is

@@ -9,6 +9,16 @@ not for the commit log.
 ## [Unreleased]
 
 ### Added
+- **phpMyAdmin for administrators, per account.** Database Services › phpMyAdmin opens phpMyAdmin signed in as the
+  administrator (**Open phpMyAdmin (all databases)**: the hidden `keel_pma_admin@localhost` user, recreated at every
+  sign-on with a fresh password and `ALL PRIVILEGES ON *.* WITH GRANT OPTION`, or without the option when the profile's
+  root cannot pass it on — reported as `grantOption: false`) or **as an account** (picker, and a **phpMyAdmin** row
+  action on List Accounts): exactly the customer's own sign-on user with grants on that account's databases only, so an
+  administrator or reseller sees what that customer sees and never another account's data. `POST
+  /api/databases/phpmyadmin/open { account? }` (browser session only; root without an account, resellers only for
+  accounts they own; `409` naming the `panel.phpmyadmin.sso` switch while single sign-on is off or phpMyAdmin is not
+  published) → `{ url, user, account, expiresAt, grantOption }`; audit `db.phpmyadmin.signon.admin` /
+  `db.phpmyadmin.signon.as` with the actor; agent op `db.grant.global`. Manual §20.9, contract §44.
 - **Direct Update buttons for critical issues (PHP and other software).** The admin Home opens with an *Updates that
   need attention* card whenever something needs one: installed PHP versions hit by an advisory from the Security
   Advisor's list (critical when the advisory is critical/high), pending security or regular package updates of the
@@ -25,6 +35,17 @@ not for the commit log.
   /api/software/runtimes/update { runtime, version | tool }` → job `software.runtime.update` (packages or a fresh
   nodejs.org build); read-only agent ops `pkg.php.release` / `pkg.node.release` (cached 6 h in settings). Contract §63,
   manual §22.2/§22.5.
+- **Review fixes (phpMyAdmin for administrators, update state).** The administrator's sign-on user `keel_pma_admin`
+  (`ALL PRIVILEGES ON *.*`) no longer outlives a phpMyAdmin login: it is dropped 1440 s after the sign-on (phpMyAdmin's
+  login validity), when single sign-on is switched off, when phpMyAdmin is unpublished and at panel start-up (audit
+  `db.phpmyadmin.signon.admin.drop`), and root may drop it by hand from Manage Database Users. The **Open phpMyAdmin** /
+  **Open as account** / List Accounts row action open a real new tab again (the popup was opened with `noopener`, which
+  makes `window.open` return `null`, so the administration shell itself navigated to the sign-on URL and a blank tab
+  was left behind); the opener is severed by hand instead. *Check for updates* coalesces concurrent runs into one OS
+  simulation and asks php.net / nodejs.org at most once a minute per entry. The Updates column shows *Not checked yet —
+  use Check for updates* instead of *Up to date · checked <now>* when no package check or php.net lookup has ever
+  succeeded. Contract §44.
+- **PHP update state always visible.** PHP Version Manager and the PHP card of Install Software gain an *Updates* column on every installed row — *Up to date · 8.4.27* with the check time (distribution packages, or *Latest php.net release* for a Keel build), *Update available: x.y.z* / *Security update* with an **Update** button, *no fix available yet*, or *Checking…* — and a **Check for updates** action that asks php.net / nodejs.org again, re-runs the OS update check when the recorded one is older than 6 h and reloads the rows (`POST /api/software/updates/critical/refresh`; catalogs carry `updates: { checkedAt, packagesCheckedAt, releasesCheckedAt }`, rows `update.source` / `update.checkedAt`). Contract §63 amendment, manual §22.5.
 - **Collapsible dashboard sections.** Every category on the admin Home *Tools* card and every group on the
   account panel home is a disclosure: its header (chevron, icon tile, name, function count) collapses or expands
   the tiles, with *Collapse all* / *Expand all* on the card and the same chevron on the *Favorites* card; a filter

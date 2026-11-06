@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
+import { HttpError } from '../../lib/errors.js';
 import { createDatabaseServicesService, PRIVILEGES, PG_PRIVILEGES } from '../../services/database-services.js';
 
 const dbName = fields.dbName;
@@ -20,6 +21,8 @@ export async function register(ctx) {
   ctx.databases = createDatabaseServicesService(ctx);
   ctx.jobs.register('db.repair', (job) => ctx.databases.runRepair(job));
   ctx.jobs.register('db.upgrade', (job) => ctx.databases.runUpgrade(job));
+  // A crash never leaves the phpMyAdmin administrator user (ALL PRIVILEGES ON *.*) behind.
+  ctx.databases.phpmyadmin.sso.dropAdmin(null, { reason: 'startup' }).catch((err) => ctx.logger?.warn?.({ err }, 'phpmyadmin: start-up drop of the administrator sign-on user failed'));
   ctx.capabilities.register('mysql', { binaries: ['mysql', 'mariadb', 'mysqld', 'mariadbd', 'mysqlcheck', 'mariadb-check', 'mysqldump', 'mariadb-dump', 'mysql_upgrade', 'mariadb-upgrade'], required: ['mysqld', 'mariadbd', 'mysql', 'mariadb'] });
   ctx.capabilities.register('postgres', { binaries: ['psql', 'pg_dump', 'runuser'], required: ['psql'] });
 
@@ -113,6 +116,11 @@ export async function register(ctx) {
   r.get('/phpmyadmin/sso', requireRoot, wrap((req) => dbs().phpmyadmin.sso.status(req.user)));
   r.put('/phpmyadmin/sso', requireRoot, validate({ body: z.object({ enabled: z.boolean() }).strict() }),
     wrap((req) => dbs().phpmyadmin.sso.set(req.body, req.user, req)));
+  // A sign-on link is a browser hand-off: never minted for an API token. Without
+  // an account the link is the administrator's (root only, checked in the service).
+  const sessionOnly = (req, _res, next) => (req.auth?.via === 'token' ? next(new HttpError(403, 'session_required', 'phpMyAdmin single sign-on is only available from a browser session')) : next());
+  r.post('/phpmyadmin/open', requireReseller, sessionOnly, validate({ body: z.object({ account: fields.username.optional() }).strict() }),
+    wrap((req) => dbs().phpmyadmin.sso.open(req.body, req.user, req)));
 
   return { path: '/databases', router: r };
 }

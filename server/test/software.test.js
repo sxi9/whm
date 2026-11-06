@@ -1628,7 +1628,8 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
   const PHP82P = { ...PHP82, packagePrefix: 'php8.2-' };
   const KEEL84 = keelVersion('8.4');
   const stock = () => ({ versions: [PHP, PHP82], defaultId: phpCliDefault, defaultBinary: `/usr/bin/php${phpCliDefault}` });
-  const pendingCheck = (packages) => app.ctx.settings.set('software.updates.last_check', { at: '2026-11-06T05:41:00.000Z', manager: 'apt', count: packages.length, security: packages.filter((p) => p.security).length, rebootRequired: false, packages, truncated: false });
+  // A recent check by default: the refresh endpoint re-runs the simulation when the recorded one is older than six hours.
+  const pendingCheck = (packages, at = new Date().toISOString()) => app.ctx.settings.set('software.updates.last_check', { at, manager: 'apt', count: packages.length, security: packages.filter((p) => p.security).length, rebootRequired: false, packages, truncated: false });
   const PENDING = [
     { name: 'php8.3-fpm', current: '8.3.6-1', candidate: '8.3.36-1', repo: 'ondrej', security: true },
     { name: 'php8.3-cli', current: '8.3.6-1', candidate: '8.3.36-1', repo: 'ondrej', security: true },
@@ -1662,8 +1663,12 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
     try {
       const res = await post('/api/software/updates/critical/refresh');
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      const { items, packagesCheckedAt } = res.body.data;
-      expect(packagesCheckedAt).toBe('2026-11-06T05:41:00.000Z');
+      const { items, packagesCheckedAt, releasesCheckedAt, checkedAt } = res.body.data;
+      expect(packagesCheckedAt).toBe(app.ctx.settings.get('software.updates.last_check').at);
+      expect(typeof checkedAt).toBe('string');
+      expect([app.ctx.settings.get('software.php.releases')['8.4'].at, app.ctx.settings.get('software.node.releases')['22'].at]).toContain(releasesCheckedAt);
+      // The recorded check is fresh, so the refresh did not simulate again.
+      expect(app.agent.callsTo('pkg.upgradable')).toHaveLength(0);
       expect(items.map((i) => [i.kind, i.id, i.severity])).toEqual([
         ['php', '8.2', 'critical'], ['php', '8.3', 'critical'], ['package', 'openssl', 'security'], ['tool', 'git', 'update'], ['runtime', 'nodejs:22', 'update'], ['php', '8.4', 'update'],
       ]);
@@ -1677,25 +1682,44 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
       expect(items[2]).toMatchObject({ label: 'OpenSSL', current: '3.0.13-0ubuntu3.4', candidate: '3.0.13-0ubuntu3.5', packages: ['openssl'], action: { path: '/software/update/run', body: { packages: ['openssl'], dist: false, refreshIndex: false } } });
       expect(items[3]).toMatchObject({ label: 'Git', current: '2.43.0-1', candidate: '2.43.0-2', packages: ['git'], action: { path: '/software/runtimes/update', body: { tool: 'git' } } });
       expect(items[4]).toMatchObject({ label: 'Node.js 22', current: 'v22.11.0', candidate: 'v22.14.0', action: { path: '/software/runtimes/update', body: { runtime: 'nodejs', version: '22' } } });
-      expect(items[5]).toMatchObject({ label: 'PHP 8.4 (Keel build)', current: '8.4.33', candidate: '8.4.35', layout: 'keel', packages: [], action: { body: { version: '8.4' } }, reasons: ['php.net released 8.4.35'] });
+      expect(items[5]).toMatchObject({ label: 'PHP 8.4 (Keel build)', current: '8.4.33', candidate: '8.4.35', layout: 'keel', packages: [], source: 'release', action: { body: { version: '8.4' } }, reasons: ['php.net released 8.4.35'] });
+      expect(items.map((i) => i.source)).toEqual([null, 'package', 'package', 'package', 'release', 'release']);
       expect(items.some((i) => i.packages.includes('vim') || i.packages.includes('libssl3'))).toBe(false);
       expect(app.agent.callsTo('pkg.php.release').map((c) => c.args)).toEqual([{ minor: '8.4' }]);
       expect(app.agent.callsTo('pkg.node.release').map((c) => c.args)).toEqual([{ major: 22 }]);
       expect(app.ctx.settings.get('software.php.releases')['8.4']).toMatchObject({ version: '8.4.35', sha256: SHA_A });
       expect(app.ctx.settings.get('software.node.releases')['22']).toMatchObject({ version: 'v22.14.0' });
-      // Served from the cache: no agent call at all for a plain GET; the release lookups are cached six hours even on a refresh.
+      // Served from the cache: no agent call at all for a plain GET. A fresh
+      // recompute keeps the six-hour release cache; only "Check for updates"
+      // (the refresh endpoint) asks php.net / nodejs.org again.
       app.agent.calls.length = 0;
       expect((await get('/api/software/updates/critical')).body.data.items).toHaveLength(6);
       expect(app.agent.calls).toHaveLength(0);
+      await app.ctx.software.updates.critical({ fresh: true });
+      expect(app.agent.callsTo('pkg.php.release')).toHaveLength(0);
+      expect(app.agent.callsTo('pkg.node.release')).toHaveLength(0);
+      // A forced lookup within a minute of the last one is served from the cache too (no hammering php.net).
       await post('/api/software/updates/critical/refresh');
       expect(app.agent.callsTo('pkg.php.release')).toHaveLength(0);
       expect(app.agent.callsTo('pkg.node.release')).toHaveLength(0);
-      // Catalog rows carry the same verdict.
-      const cat = (await get('/api/software/php/catalog')).body.data.versions;
-      expect(cat.find((v) => v.id === '8.3').update).toEqual({ candidate: '8.3.36-1', severity: 'critical', reasons: php83.reasons });
-      expect(cat.find((v) => v.id === '8.2').update).toMatchObject({ candidate: null, severity: 'critical' });
+      const age = (setting) => app.ctx.settings.set(setting, Object.fromEntries(Object.entries(app.ctx.settings.get(setting)).map(([k, e]) => [k, { ...e, at: new Date(Date.now() - 2 * 60_000).toISOString() }])));
+      age('software.php.releases');
+      age('software.node.releases');
+      await post('/api/software/updates/critical/refresh');
+      expect(app.agent.callsTo('pkg.php.release').map((c) => c.args)).toEqual([{ minor: '8.4' }]);
+      expect(app.agent.callsTo('pkg.node.release').map((c) => c.args)).toEqual([{ major: 22 }]);
+      // Catalog rows carry the same verdict with its source and check time; the catalog itself carries the check times.
+      const catalog = (await get('/api/software/php/catalog')).body.data;
+      const cat = catalog.versions;
+      const list = (await get('/api/software/updates/critical')).body.data;
+      expect(catalog.updates).toEqual({ checkedAt: list.checkedAt, packagesCheckedAt: list.packagesCheckedAt, releasesCheckedAt: list.releasesCheckedAt });
+      expect(cat.find((v) => v.id === '8.3').update).toEqual({ candidate: '8.3.36-1', severity: 'critical', reasons: php83.reasons, current: '8.3.6', source: 'package', checkedAt: list.packagesCheckedAt });
+      expect(cat.find((v) => v.id === '8.4').update).toEqual({ candidate: '8.4.35', severity: 'update', reasons: ['php.net released 8.4.35'], current: '8.4.33', source: 'release', checkedAt: list.releasesCheckedAt });
+      expect(cat.find((v) => v.id === '8.2').update).toMatchObject({ candidate: null, severity: 'critical', source: null, checkedAt: list.packagesCheckedAt });
       expect(cat.find((v) => v.id === '8.5').update).toBeNull();
       const rt = (await get('/api/software/runtimes')).body.data;
+      expect(rt.updates).toEqual(catalog.updates);
+      expect(rt.runtimes.find((r) => r.key === 'php').versions.find((v) => v.id === '8.3').update).toMatchObject({ candidate: '8.3.36-1', source: 'package' });
       expect(rt.tools.find((t) => t.key === 'git').update).toMatchObject({ candidate: '2.43.0-2', severity: 'update' });
       expect(rt.runtimes.find((r) => r.key === 'nodejs').versions.find((v) => v.id === '22').update).toMatchObject({ candidate: 'v22.14.0' });
       expect(rt.tools.find((t) => t.key === 'imagemagick').update).toBeNull();
@@ -1715,6 +1739,50 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
       expect(res.status).toBe(200);
       expect(res.body.data.items).toEqual([]);
     } finally { app.agent.set('pkg.node.list', () => ({ system: { version: 'v22.11.0', path: '/usr/bin/node' }, versions: nodeVersions })); app.agent.set('pkg.php.versions', stock); }
+  });
+
+  it('Check for updates re-runs the OS update simulation when the recorded check is older than six hours', async () => {
+    pendingCheck(PENDING, '2026-11-01T05:41:00.000Z');
+    withVersions([PHP83, PHP82P]);
+    app.agent.calls.length = 0;
+    try {
+      const res = await post('/api/software/updates/critical/refresh');
+      expect(res.status).toBe(200);
+      expect(app.agent.callsTo('pkg.upgradable')).toHaveLength(1);
+      const recorded = app.ctx.settings.get('software.updates.last_check');
+      expect(recorded.packages.map((p) => p.name)).toEqual(['libssl3', 'vim']);
+      expect(Date.now() - Date.parse(recorded.at)).toBeLessThan(60_000);
+      expect(res.body.data.packagesCheckedAt).toBe(recorded.at);
+      expect(res.body.data.items.filter((i) => i.kind === 'php').map((i) => [i.id, i.candidate])).toEqual([['8.2', null], ['8.3', null]]);
+      expect(res.body.data.items.some((i) => i.kind === 'tool' || i.kind === 'package')).toBe(false);
+      const row = (await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === '8.3');
+      expect(row.update).toMatchObject({ candidate: null, source: null, checkedAt: recorded.at });
+      // A second check within six hours serves the recorded simulation.
+      app.agent.calls.length = 0;
+      await post('/api/software/updates/critical/refresh');
+      expect(app.agent.callsTo('pkg.upgradable')).toHaveLength(0);
+    } finally { app.agent.set('pkg.php.versions', stock); app.ctx.software.updates.invalidate(); }
+  });
+
+  it('coalesces concurrent Check for updates runs: one OS simulation and one php.net lookup for both callers', async () => {
+    pendingCheck(PENDING, '2026-11-01T05:41:00.000Z');
+    withVersions([PHP83, KEEL84]);
+    nodeVersions = [];
+    app.agent.set('pkg.php.release', ({ minor }) => ({ minor, version: `${minor}.35`, filename: `php-${minor}.35.tar.xz`, sha256: SHA_A }));
+    app.ctx.settings.set('software.php.releases', null);
+    app.ctx.software.updates.invalidate();
+    app.agent.calls.length = 0;
+    try {
+      const [a, b] = await Promise.all([app.ctx.software.updates.refresh(), app.ctx.software.updates.refresh()]);
+      expect(a).toBe(b);
+      expect(app.agent.callsTo('pkg.upgradable')).toHaveLength(1);
+      expect(app.agent.callsTo('pkg.php.release').map((c) => c.args)).toEqual([{ minor: '8.4' }]);
+      expect(a.items.find((i) => i.kind === 'php' && i.id === '8.4')).toMatchObject({ candidate: '8.4.35' });
+      // Once settled, the next call is a run of its own again.
+      app.ctx.settings.set('software.updates.last_check', { ...app.ctx.settings.get('software.updates.last_check'), at: '2026-11-01T05:41:00.000Z' });
+      await app.ctx.software.updates.refresh();
+      expect(app.agent.callsTo('pkg.upgradable')).toHaveLength(2);
+    } finally { app.agent.set('pkg.php.versions', stock); app.agent.set('pkg.php.release', () => ({})); app.ctx.software.updates.invalidate(); }
   });
 
   it('attaches update to an Install Software PHP row whose installed id differs from the catalog id (ea4/remi layouts)', async () => {

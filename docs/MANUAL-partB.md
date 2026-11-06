@@ -474,6 +474,19 @@ panel's own data lives in SQLite, so these pages work even when MySQL is down.
   address as the `KEEL_SSO_ENDPOINT` constant, so a changed panel port is picked up by switching single sign-on off and
   on (or publishing phpMyAdmin again). A MySQL 8 server limits user names to 32 characters, so accounts named longer than 28 characters cannot
   sign on there (MariaDB allows 80).
+- **Opening phpMyAdmin from here** (single sign-on on; otherwise the button is a plain link to the login form and
+  the page says which switch to turn on): **Open phpMyAdmin (all databases)** (root) signs you in as the hidden
+  administrator user `keel_pma_admin@localhost`, dropped and created again at every sign-on with a fresh password and
+  `ALL PRIVILEGES ON *.* WITH GRANT OPTION` (agent `db.grant.global`; when the active profile's root cannot pass the
+  option on — a hardened remote server — the user is granted everything else and the page says so, `grantOption:
+  false`). It is a system user in *Manage Database Users* (`?system=true` only, untouchable there) and is never mapped
+  to an account. **Open as an account** (picker, root or reseller for an owned account) and the **phpMyAdmin** row
+  action on *List Accounts* mint exactly the token the account panel would: the customer's own `<account>_pma` user
+  with grants on that account's databases only, so you see what the customer sees and never another account's data.
+  `POST /phpmyadmin/open { account? }` (browser session only, `403 session_required` for API tokens; `409` naming
+  `panel.phpmyadmin.sso` while sign-on is off or phpMyAdmin is unpublished; `403` for a reseller's foreign account) →
+  `{ url, user, account, expiresAt, grantOption }`; the link is single-use and lives one minute. Audit
+  `db.phpmyadmin.signon.admin` (`actor`, `grantOption`) and `db.phpmyadmin.signon.as` (`account`, `actor`).
 - **Gotchas:** a protocol-relative `//host/...` value is refused so resellers cannot be sent to a foreign origin;
   the drop-in uses the distribution's PHP-FPM www pool (Debian's `apache.conf` only sets `open_basedir`/`upload_tmp_dir`
   for mod_php, so neither applies under FPM — phpMyAdmin's `TempDir` stays `/var/lib/phpmyadmin/tmp`); phpMyAdmin 5
@@ -728,7 +741,17 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   `software.php.remove`. Contract §52. `POST /php/update { version }` → `202` job `software.php.update`
   (`pkg.upgrade` of the version's pending packages + `svc.reload` of its FPM unit, or `pkg.php.build` +
   `pkg.php.build.finish` with a restart for a Keel build; `422` without a candidate); catalog rows carry
-  `update: { candidate, severity, reasons } | null`. Audit `software.php.update`. Contract §63.
+  `update: { candidate, severity, reasons, current, source: 'package'|'release', checkedAt } | null` and the catalog
+  `updates: { checkedAt, packagesCheckedAt, releasesCheckedAt }`. Audit `software.php.update`. Contract §63.
+  **Updates column:** every installed row always shows its update state, so "nothing to update" is visible rather
+  than silent — *Up to date · 8.4.27* with *Distribution packages · checked <time>* (a package version with nothing
+  pending) or *Latest php.net release · checked <time>* (a Keel build on php.net's newest release of its branch),
+  *Update available: x.y.z* with a primary **Update**, a red *Security update* pill + **Update** when an advisory or a
+  security package hits it, *Advisory · no fix available yet* when nothing newer exists, and *Checking…* until the
+  first check has run. **Check for updates** (page header; also on the PHP card of *Install Software*) calls
+  `POST /api/software/updates/critical/refresh`, which asks php.net / nodejs.org again, re-runs the OS update
+  simulation when the recorded one is older than six hours, and recomputes the list; the rows then reload. A Keel
+  build whose installed patch equals php.net's latest offers no rebuild — only a newer release gets **Update**.
 
 #### 22.6 NGINX Manager
 

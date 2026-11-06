@@ -557,6 +557,28 @@ defineOp('db.grant', {
   },
 });
 
+// The administrator's phpMyAdmin sign-on user: everything the connecting
+// (panel root) user may pass on. A root without GRANT OPTION (a hardened
+// remote profile) can still grant the privileges themselves, so that is
+// retried and reported rather than failing the sign-on.
+defineOp('db.grant.global', {
+  description: 'GRANT ALL PRIVILEGES ON *.* to user@host, WITH GRANT OPTION when the connecting user may pass it on',
+  schema: withCreds({ user: mysqlUser, hosts: z.array(host).min(1).max(50).default(['localhost']) }),
+  run: async ({ user, hosts, credentials: creds }, ctx) => {
+    if (user === 'root') throw new OpError('refused', 'The root user is not granted from the panel');
+    const sql = (withOption) => `${hosts.map((h) => `GRANT ALL PRIVILEGES ON *.* TO ${q.account(user, h)}${withOption ? ' WITH GRANT OPTION' : ''};`).join('\n')}\nFLUSH PRIVILEGES;`;
+    let grantOption = true;
+    try {
+      await mysql(sql(true), creds, ctx);
+    } catch (err) {
+      if (![1044, 1045, 1227].includes(err?.details?.errno)) throw err;
+      grantOption = false;
+      await mysql(sql(false), creds, ctx);
+    }
+    return { user, hosts, privileges: ['ALL PRIVILEGES'], grantOption };
+  },
+});
+
 export function revokeStatements(user, database, h) {
   return [`REVOKE ALL PRIVILEGES ON ${q.id(database)}.* FROM ${q.account(user, h)}`, `REVOKE GRANT OPTION ON ${q.id(database)}.* FROM ${q.account(user, h)}`];
 }

@@ -26,7 +26,7 @@ async function opError(promise) {
   throw new Error('expected the op to reject');
 }
 
-const MYSQL_OPS = ['db.detect', 'db.version', 'db.ping', 'db.databases.list', 'db.database.create', 'db.database.drop', 'db.users.list', 'db.user.create', 'db.user.drop', 'db.user.set_password', 'db.user.add_host', 'db.grants.list', 'db.grant', 'db.revoke', 'db.processlist', 'db.kill', 'db.check', 'db.root_password.set', 'db.variables.get', 'db.config.read', 'db.config.write', 'db.restart', 'db.unit', 'db.dump', 'db.packages', 'db.upgrade_tables', 'db.phpmyadmin.detect', 'db.phpmyadmin.global_conf.disable', 'db.phpmyadmin.signon.write', 'db.phpmyadmin.signon.remove'];
+const MYSQL_OPS = ['db.detect', 'db.version', 'db.ping', 'db.databases.list', 'db.database.create', 'db.database.drop', 'db.users.list', 'db.user.create', 'db.user.drop', 'db.user.set_password', 'db.user.add_host', 'db.grants.list', 'db.grant', 'db.grant.global', 'db.revoke', 'db.processlist', 'db.kill', 'db.check', 'db.root_password.set', 'db.variables.get', 'db.config.read', 'db.config.write', 'db.restart', 'db.unit', 'db.dump', 'db.packages', 'db.upgrade_tables', 'db.phpmyadmin.detect', 'db.phpmyadmin.global_conf.disable', 'db.phpmyadmin.signon.write', 'db.phpmyadmin.signon.remove'];
 const PG_OPS = ['pg.version', 'pg.ping', 'pg.databases.list', 'pg.database.create', 'pg.database.drop', 'pg.users.list', 'pg.user.create', 'pg.user.drop', 'pg.user.set_password', 'pg.grants.list', 'pg.grant', 'pg.revoke', 'pg.processlist', 'pg.kill', 'pg.check', 'pg.root_password.set', 'pg.variables.get', 'pg.unit', 'pg.restart'];
 
 describe('db op catalog', () => {
@@ -58,6 +58,17 @@ describe('db schemas reject injection, traversal and unknown keys before anythin
       }
     }
     for (const name of badNames) expect((await opError(runOp('db.grant', { user: 'u', database: name, privileges: ['SELECT'] }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('global grant takes a user and hosts only (no database, privileges or statement text)', async () => {
+    exec.mockClear();
+    for (const user of ['a;b', "a'b", 'a b', '', '-r', 'a'.repeat(81)]) expect((await opError(runOp('db.grant.global', { user }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('db.grant.global', { user: 'keel_pma_admin', database: '*' }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('db.grant.global', { user: 'keel_pma_admin', privileges: ['ALL PRIVILEGES'] }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('db.grant.global', { user: 'keel_pma_admin', hosts: ['a;b'] }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+    expect((await opError(runOp('db.grant.global', { user: 'root' }, ctx))).code).toBe('refused');
     expect(exec).not.toHaveBeenCalled();
   });
 

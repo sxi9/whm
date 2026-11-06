@@ -1138,7 +1138,10 @@ prefix when it is missing, regardless of the console's `db.prefixing` setting.
   → `{ url, user, expiresAt }`: the hidden user `<username>_pma` (recreated for every sign-on with
   `GRANT ALL` on each database you own at that moment — a database created afterwards shows up at the
   next sign-on — password never shown) is handed to phpMyAdmin through the signon
-  script `/keel/pma-signon.php` over loopback (contract §44). Audit `panel.db.phpmyadmin.sso`.
+  script `/keel/pma-signon.php` over loopback (contract §44). Audit `panel.db.phpmyadmin.sso`. Your provider
+  (or your reseller) can open phpMyAdmin *as your account* from the administration shell: that uses the same
+  `<username>_pma` user with the same grants, so they see exactly your databases and nothing else, and the
+  sign-on is audited with their name (MANUAL-partB §20.9).
 - **Gotchas:** without single sign-on there is no prefilled user name — phpMyAdmin's cookie
   login only reads the name from its own form; with it, the cookie login is still there as
   "Sign in with a database user" (`?server=2`) on the phpMyAdmin page. The `pma` user name is

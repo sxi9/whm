@@ -37,7 +37,7 @@ describe('apps op catalog', () => {
     expect(catalog.has('web.modules.status')).toBe(true);
     expect(catalog.has('web.modules.enable')).toBe(true);
     expect(unitName('alice', 'probe-app')).toBe('keel-app-alice.probe-app');
-    expect(unitFile('alice', 'probe-app')).toBe(`${APPS_DIR}/alice/probe-app.service`);
+    expect(unitFile('alice', 'probe-app')).toBe(`${APPS_DIR}/alice/keel-app-alice.probe-app.service`);
     expect(APPS_DIR).toBe('/etc/whm/apps');
     expect(ctx.allowedRoots).toContain('/etc/whm/apps');
     expect(ctx.allowedRoots).not.toContain('/etc/systemd/system');

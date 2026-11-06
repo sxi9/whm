@@ -20,7 +20,7 @@ const { ConfirmProvider } = await import('../src/components/Modal.jsx');
 const { FUNCTION_BY_KEY } = await import('../src/nav.js');
 const { default: InstallSoftware, readDeepLink, TABS } = await import('../src/pages/fn/software/install-distro-packages.jsx');
 const { default: ModuleInstallers, installerPackages } = await import('../src/pages/fn/software/module-installers.jsx');
-const { default: MultiPhpManager, removeBlocker, toggleOffered } = await import('../src/pages/fn/software/multiphp-manager.jsx');
+const { default: MultiPhpManager, removeBlocker, toggleOffered, updateState, phpUpdateBody, phpUpdateMessage, checkForUpdates } = await import('../src/pages/fn/software/multiphp-manager.jsx');
 const { generatorPackages } = await import('../src/pages/fn/server-configuration/statistics-software-configuration.jsx');
 const { quotaPackages } = await import('../src/pages/fn/server-configuration/initial-quota-setup.jsx');
 const { InstallPackages, installPackagesBody, normalizePackages } = await import('../src/components/InstallPackages.jsx');
@@ -79,6 +79,68 @@ describe('Install Software page', () => {
     expect(html).toContain('/usr/local/bin/node22');
     expect(html).toContain('>Remove</button>');
     expect(html).not.toContain('ImageMagick');
+    // Without check times from the catalog every installed PHP row is still being checked.
+    expect(html).toContain('<th>Updates</th>');
+    expect(html).toContain('>Check for updates</button>');
+    expect((html.match(/Checking…/g) || []).length).toBe(2);
+  });
+
+  it('shows the update state of every installed PHP row: up to date (packages / php.net), update available, security update', async () => {
+    fixtures.responses.clear();
+    fixtures.posts.length = 0;
+    set('/software/pkg/detect', { data: detect });
+    set('/software/pkg/recent', { data: [] });
+    set('/software/runtimes/recent', { data: [] });
+    const stamp = { checkedAt: '2026-11-06T06:00:00.000Z', packagesCheckedAt: '2026-11-06T05:41:00.000Z', releasesCheckedAt: '2026-11-06T05:50:00.000Z' };
+    const php = catalog.runtimes[0];
+    const versions = [
+      php.versions[0],
+      { ...php.versions[1], update: { candidate: '8.3.36-1', severity: 'critical', reasons: ['CVE-2026-109619: PHP2Shell (fixed in 8.3.36)'], current: '8.3.19', source: 'package', checkedAt: stamp.packagesCheckedAt } },
+      { id: '8.2', label: 'PHP 8.2', installed: true, version: '8.2.29', packages: ['php8.2-fpm'], repo: 'php', note: null, method: 'package', update: null },
+      { ...php.versions[3], update: { candidate: '8.1.34', severity: 'update', reasons: ['php.net released 8.1.34'], current: '8.1.33', source: 'release', checkedAt: stamp.releasesCheckedAt } },
+      { id: '8.0', label: 'PHP 8.0 (Keel build)', installed: true, version: '8.0.30', packages: [], repo: 'php', note: null, method: 'source', source: true, state: 'installed', update: null },
+    ];
+    set('/software/runtimes', { data: { ...catalog, runtimes: [{ ...php, versions }, ...catalog.runtimes.slice(1)], updates: stamp } });
+    const html = render(h(InstallSoftware, { fn }));
+    expect(html).not.toContain('Checking…');
+    expect(html).toContain('>Security update<');
+    expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*" title="CVE-2026-109619: PHP2Shell \(fixed in 8\.3\.36\)">Update<\/button>/);
+    expect(html).toContain('Update available: <strong>8.1.34</strong>');
+    expect(html).toMatch(/<button type="button" class="btn btn-primary btn-sm[^"]*" title="php.net released 8\.1\.34">Update<\/button>/);
+    expect((html.match(/>Update<\/button>/g) || []).length).toBe(2);
+    expect(html).toContain('Up to date · 8.2.29');
+    expect(html).toContain(`Distribution packages · checked ${new Date(stamp.packagesCheckedAt).toLocaleString()}`);
+    expect(html).toContain('Up to date · 8.0.30');
+    expect(html).toContain(`Latest php.net release · checked ${new Date(stamp.releasesCheckedAt).toLocaleString()}`);
+    // A row that is not installed has no update state.
+    expect(updateState({ installed: false }, stamp)).toBeNull();
+    expect(updateState(versions[2], stamp)).toMatchObject({ kind: 'distro', checkedAt: stamp.packagesCheckedAt });
+    expect(updateState(versions[4], stamp)).toMatchObject({ kind: 'latest', checkedAt: stamp.releasesCheckedAt });
+    expect(updateState(versions[4], stamp, true)).toMatchObject({ kind: 'checking' });
+    expect(updateState(versions[4], null)).toMatchObject({ kind: 'checking' });
+    expect(updateState(versions[1], stamp)).toMatchObject({ kind: 'security', candidate: '8.3.36-1' });
+    expect(updateState(versions[3], stamp)).toMatchObject({ kind: 'update', candidate: '8.1.34', checkedAt: stamp.releasesCheckedAt });
+    expect(updateState({ installed: true, update: { candidate: null, severity: 'critical', reasons: ['CVE-1'] } }, stamp)).toMatchObject({ kind: 'nofix' });
+    // No package check / php.net lookup has ever succeeded: no verdict, no fabricated time.
+    const unchecked = { checkedAt: '2026-11-06T06:00:00.000Z', packagesCheckedAt: null, releasesCheckedAt: null };
+    expect(updateState(versions[2], unchecked)).toEqual({ kind: 'unknown', candidate: null, reasons: [], checkedAt: null });
+    expect(updateState(versions[4], unchecked)).toEqual({ kind: 'unknown', candidate: null, reasons: [], checkedAt: null });
+    expect(updateState(versions[2], { ...unchecked, releasesCheckedAt: stamp.releasesCheckedAt })).toMatchObject({ kind: 'unknown' });
+    expect(updateState(versions[4], { ...unchecked, packagesCheckedAt: stamp.packagesCheckedAt })).toMatchObject({ kind: 'unknown' });
+    set('/software/runtimes', { data: { ...catalog, runtimes: [{ ...php, versions: [versions[2], versions[4]] }, ...catalog.runtimes.slice(1)], updates: unchecked } });
+    const unverified = render(h(InstallSoftware, { fn }));
+    expect(unverified).not.toContain('Up to date');
+    expect(unverified).not.toMatch(/(Distribution packages|Latest php\.net release) · checked/);
+    expect((unverified.match(/Not checked yet — use Check for updates/g) || []).length).toBe(2);
+    // The Update button posts the version alone; the confirm names the method.
+    expect(phpUpdateBody(versions[1])).toEqual({ version: '8.3' });
+    expect(phpUpdateMessage(versions[1])).toMatch(/^Upgrades the pending php8\.3-\* packages to 8\.3\.36-1 and reloads PHP-FPM\. CVE-2026-109619/);
+    expect(phpUpdateMessage(versions[3])).toMatch(/^Rebuilds PHP 8\.1 from the official php\.net 8\.1\.34 source over \/opt\/keel\/php\/8\.1 .* restarts keel-php8\.1-fpm\./);
+    // Check for updates posts the refresh, then refetches the catalog.
+    let refetched = 0;
+    await checkForUpdates(() => { refetched += 1; });
+    expect(fixtures.posts).toEqual([['/software/updates/critical/refresh', undefined]]);
+    expect(refetched).toBe(1);
   });
 
   it('opens the search tab with the term from ?tab=search&q=', () => {
@@ -277,6 +339,7 @@ describe('pages that used to link to the package search', () => {
     const row = (o) => ({ installed: false, version: null, binary: null, iniPath: null, fpmInstalled: false, fpmActive: null, fpmUnit: null, isDefault: false, isSystemDefault: false, offered: false, domains: 0, packages: [], repo: 'php', repoStatus: null, advisories: [], note: null, ...o });
     const phpCatalog = {
       family: 'debian', os: { id: 'ubuntu', versionId: '26.04' }, effectiveDefault: '8.3', configuredDefault: '8.3', offered: ['8.3'],
+      updates: { checkedAt: '2026-11-06T06:00:00.000Z', packagesCheckedAt: '2026-11-06T05:41:00.000Z', releasesCheckedAt: '2026-11-06T05:50:00.000Z' },
       versions: [
         row({ id: '8.5', label: 'PHP 8.5', state: 'unsupported', repoStatus: { present: false, supported: false, detail: 'ppa:ondrej/php has no packages for Ubuntu resolute' }, note: 'ppa:ondrej/php has no packages for Ubuntu resolute' }),
         row({ id: '8.4', label: 'PHP 8.4', state: 'available', packages: ['php8.4-fpm', 'php8.4-cli'], method: 'package' }),
@@ -315,10 +378,19 @@ describe('pages that used to link to the package search', () => {
     expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*" disabled="" title="This is the system default; set another version as default first">Remove<\/button>/);
     expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*">Remove<\/button>/);
     expect(html).toContain('>Set as default</button>');
-    // Direct update (contract §63): the row's `update` decides the button; null candidate = nothing to update to yet.
-    expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*" title="CVE-2026-109619: PHP2Shell \(fixed in 8\.3\.36\)">Update to 8\.3\.36-1<\/button>/);
-    expect((html.match(/>Update to /g) || []).length).toBe(1);
+    // Updates column (contract §63): the row's `update` decides the button; null candidate = nothing to update to yet;
+    // no `update` at all = up to date as of the catalog's check times. Check for updates is the header's primary action.
+    expect(html).toContain('<th>Updates</th>');
+    expect(html).toContain('>Check for updates</button>');
+    expect(html).toContain('>Security update<');
+    expect(html).toContain('8.3.36-1');
+    expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*" title="CVE-2026-109619: PHP2Shell \(fixed in 8\.3\.36\)">Update<\/button>/);
+    expect((html.match(/>Update<\/button>/g) || []).length).toBe(1);
     expect(html).toContain('no fix available yet');
+    expect(html).toContain('Up to date · 7.4.33');
+    expect(html).toContain('Latest php.net release · checked');
+    expect(html).not.toContain('Checking…');
+    expect(html).not.toContain('Distribution packages');
     expect(html).toContain('>System default<');
     expect(html).toContain('php8.2-fpm · stopped');
     expect(html).toContain('Offered to accounts');

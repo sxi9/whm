@@ -36,6 +36,7 @@ function mysqlAgent() {
     'db.user.add_host': ({ user, fromHost, toHost }) => { if (!state.users.has(`${user}@${fromHost}`)) throw Object.assign(new Error('missing'), { agentError: true, code: 'not_found', details: {} }); const created = !state.users.has(`${user}@${toHost}`); state.users.set(`${user}@${toHost}`, {}); state.grants.set(`${user}@${toHost}`, new Map(state.grants.get(`${user}@${fromHost}`) || [])); return { user, host: toHost, created, grants: 0 }; },
     'db.grants.list': ({ user, host }) => { if (!state.users.has(`${user}@${host}`)) throw Object.assign(new Error(`MySQL: There is no such grant defined for user '${user}' on host '${host}'`), { agentError: true, code: 'not_found', details: { errno: 1141 } }); return { user, host, raw: [], grants: [...(state.grants.get(`${user}@${host}`) || new Map())].map(([database, privileges]) => ({ database, table: '*', privileges })) }; },
     'db.grant': ({ user, database, privileges, hosts }) => { for (const h of hosts) { const g = state.grants.get(`${user}@${h}`) || new Map(); g.set(database, privileges); state.grants.set(`${user}@${h}`, g); } return { user, database, privileges, hosts }; },
+    'db.grant.global': ({ user, hosts }) => { for (const h of hosts) { const g = state.grants.get(`${user}@${h}`) || new Map(); g.set('*', ['ALL PRIVILEGES']); state.grants.set(`${user}@${h}`, g); } return { user, hosts, privileges: ['ALL PRIVILEGES'], grantOption: !state.rootLacksGrantOption }; },
     'db.revoke': ({ user, database, hosts }) => { for (const h of hosts) state.grants.get(`${user}@${h}`)?.delete(database); return { user, database, hosts, revoked: true }; },
     'db.root_password.set': ({ password, updateMyCnf }) => { state.rootPassword = password; return { hosts: ['localhost', '127.0.0.1'], myCnfUpdated: updateMyCnf, path: updateMyCnf ? '/root/.my.cnf' : null }; },
     'db.processlist': () => state.processes,
@@ -141,7 +142,7 @@ describe('Database Services API (MariaDB via mock agent)', () => {
     const res = await resellerHttp.post('/api/auth/login').send({ username: 'resell1', password: reseller.password });
     resellerCsrf = res.body.data.csrfToken;
     app.ctx.jobs.start();
-  });
+  }, 30_000);
   afterAll(() => app.close());
   beforeEach(() => { app.agent.calls.length = 0; });
 
@@ -870,6 +871,160 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       restore('db.phpmyadmin.detect');
     });
 
+    it('opens phpMyAdmin from the administration shell: the administrator user, or an owned account with exactly that account\'s grants', async () => {
+      const SIGNON_ON = { path: '/etc/phpmyadmin/conf.d/keel-signon.php', exists: true, managed: true, confDir: true };
+      const exchange = (token) => app.http.get(`/api/panel/sso/phpmyadmin/${token}`);
+      const tokenOf = (url) => new URL(url).searchParams.get('_keel');
+      const audits = (action) => app.ctx.db.prepare('SELECT target, args_redacted FROM audit_log WHERE action = ? ORDER BY id').all(action);
+      const aliceId = app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'alice'").get().id;
+      const bobId = app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'bob'").get().id;
+      await post('/databases', { name: 'ledger', account: 'bob' }).expect(201);
+      const aliceDbs = app.ctx.db.prepare('SELECT name FROM databases WHERE account_id = ? ORDER BY name').all(aliceId).map((d) => d.name);
+      const bobDbs = app.ctx.db.prepare('SELECT name FROM databases WHERE account_id = ? ORDER BY name').all(bobId).map((d) => d.name);
+      expect(aliceDbs.length).toBeGreaterThan(0);
+      expect(bobDbs).toContain('bob_ledger');
+
+      // Not published / switch off: refused with the switch named, no user touched.
+      detectWith({ published: null, signon: { ...SIGNON_ON, exists: false, managed: false } });
+      expect((await post('/phpmyadmin/open', {})).status).toBe(409);
+      detectWith({ published: PUBLISHED, signon: { ...SIGNON_ON, exists: false, managed: false } });
+      const off = await post('/phpmyadmin/open', {});
+      expect(off.status).toBe(409);
+      expect(off.body.error.message).toContain('panel.phpmyadmin.sso');
+      expect(app.agent.callsTo('db.user.create')).toEqual([]);
+      await put('/phpmyadmin/sso', { enabled: true }).expect(200);
+      detectWith({ published: PUBLISHED, signon: SIGNON_ON });
+      try {
+        expect((await post('/phpmyadmin/open', { account: 'Bad Name' })).status).toBe(422);
+        expect((await post('/phpmyadmin/open', { account: 'alice', extra: 1 })).status).toBe(422);
+
+        // The administrator: keel_pma_admin created at localhost with the global grant, never a per-database one.
+        app.agent.calls.length = 0;
+        const admin = await post('/phpmyadmin/open', {}).expect(200);
+        expect(admin.body.data).toMatchObject({ user: 'keel_pma_admin', account: null, grantOption: true });
+        expect(admin.body.data.password).toBeUndefined();
+        const adminUrl = new URL(admin.body.data.url);
+        expect(adminUrl.origin + adminUrl.pathname).toBe('https://panel.example.com/keel/pma-signon.php');
+        expect(app.agent.callsTo('db.user.drop')).toEqual([]);
+        expect(app.agent.callsTo('db.user.create')[0].args).toMatchObject({ user: 'keel_pma_admin', hosts: ['localhost'] });
+        expect(app.agent.callsTo('db.grant.global').map((c) => c.args)).toEqual([expect.objectContaining({ user: 'keel_pma_admin', hosts: ['localhost'] })]);
+        expect(app.agent.callsTo('db.grant')).toEqual([]);
+        expect([...app.agent.state.grants.get('keel_pma_admin@localhost').keys()]).toEqual(['*']);
+        expect(app.ctx.db.prepare("SELECT 1 AS x FROM db_users WHERE name = 'keel_pma_admin'").get()).toBeUndefined();
+        const adminPassword = app.agent.callsTo('db.user.create')[0].args.password;
+        expect(adminPassword).toHaveLength(32);
+        // The token answers the administrator's credentials once.
+        const adminToken = tokenOf(admin.body.data.url);
+        expect((await exchange(adminToken).expect(200)).body.data).toEqual({ user: 'keel_pma_admin', password: adminPassword, host: 'localhost' });
+        expect((await exchange(adminToken)).status).toBe(404);
+        expect(audits('db.phpmyadmin.signon.admin').pop()).toMatchObject({ target: 'keel_pma_admin' });
+        expect(JSON.parse(audits('db.phpmyadmin.signon.admin').pop().args_redacted)).toMatchObject({ actor: 'root', created: true, grantOption: true });
+        // Next sign-on: dropped and recreated with a new password; a root without GRANT OPTION is reported, not fatal.
+        app.agent.state.rootLacksGrantOption = true;
+        app.agent.calls.length = 0;
+        const again = await post('/phpmyadmin/open', {}).expect(200);
+        expect(again.body.data.grantOption).toBe(false);
+        expect(app.agent.callsTo('db.user.drop')[0].args).toMatchObject({ user: 'keel_pma_admin', hosts: ['localhost'] });
+        expect(app.agent.callsTo('db.user.create')[0].args.password).not.toBe(adminPassword);
+        app.agent.state.rootLacksGrantOption = false;
+        // Resellers never get the administrator's user; API tokens never get a link.
+        expect((await rPost('/phpmyadmin/open', {})).status).toBe(403);
+        expect(app.agent.state.users.has('keel_pma_admin@localhost')).toBe(true);
+        // Hidden like the other sign-on users; its password and grants are the panel's, but root may drop it by hand.
+        expect((await get('/users?pageSize=100').expect(200)).body.data.some((u) => u.name === 'keel_pma_admin')).toBe(false);
+        expect((await get('/users?pageSize=100&system=true').expect(200)).body.data.find((u) => u.name === 'keel_pma_admin')).toMatchObject({ system: true });
+        expect((await rDel('/users/keel_pma_admin')).status).toBe(403);
+        expect(app.ctx.databases.phpmyadmin.sso.adminDropArmed()).toBe(true);
+        await del('/users/keel_pma_admin').expect(200);
+        expect(app.agent.state.users.has('keel_pma_admin@localhost')).toBe(false);
+        expect(app.ctx.databases.phpmyadmin.sso.adminDropArmed()).toBe(false);
+        // The user lives only as long as a phpMyAdmin login can: the drop scheduled at the sign-on fires after the TTL.
+        app.ctx.config.phpmyadminAdminTtlMs = 40;
+        try {
+          await post('/phpmyadmin/open', {}).expect(200);
+          expect(app.agent.state.users.has('keel_pma_admin@localhost')).toBe(true);
+          expect(app.ctx.databases.phpmyadmin.sso.adminDropArmed()).toBe(true);
+          expect(JSON.parse(audits('db.phpmyadmin.signon.admin').pop().args_redacted)).toMatchObject({ dropAfterMs: 40 });
+          await new Promise((r) => setTimeout(r, 250));
+          expect(app.agent.state.users.has('keel_pma_admin@localhost')).toBe(false);
+          expect(app.ctx.databases.phpmyadmin.sso.adminDropArmed()).toBe(false);
+          expect(JSON.parse(audits('db.phpmyadmin.signon.admin.drop').pop().args_redacted)).toMatchObject({ reason: 'expired', hosts: ['localhost'] });
+        } finally { delete app.ctx.config.phpmyadminAdminTtlMs; }
+
+        // As an account: the account's own user with grants on that account's databases only.
+        app.agent.calls.length = 0;
+        const asAlice = await post('/phpmyadmin/open', { account: 'alice' }).expect(200);
+        expect(asAlice.body.data).toMatchObject({ user: 'alice_pma', account: 'alice' });
+        expect(app.agent.callsTo('db.grant.global')).toEqual([]);
+        const grants = app.agent.callsTo('db.grant').map((c) => c.args);
+        expect(grants.map((g) => g.database)).toEqual(aliceDbs);
+        for (const g of grants) { expect(g.user).toBe('alice_pma'); expect(g.hosts).toEqual(['localhost']); expect(bobDbs).not.toContain(g.database); }
+        expect([...app.agent.state.grants.get('alice_pma@localhost').keys()].sort()).toEqual(aliceDbs);
+        expect(JSON.stringify(app.agent.calls.filter((c) => c.name.startsWith('db.')))).not.toContain('bob_ledger');
+        const alicePassword = app.agent.callsTo('db.user.create')[0].args.password;
+        const aliceToken = tokenOf(asAlice.body.data.url);
+        expect((await exchange(aliceToken).expect(200)).body.data).toEqual({ user: 'alice_pma', password: alicePassword, host: 'localhost' });
+        expect((await exchange(aliceToken)).status).toBe(404);
+        expect(JSON.parse(audits('db.phpmyadmin.signon.as').pop().args_redacted)).toMatchObject({ account: 'alice', user: 'alice_pma', actor: 'root' });
+        // Opening again drops and recreates the account user, so a stale grant never survives.
+        app.agent.calls.length = 0;
+        await post('/phpmyadmin/open', { account: 'alice' }).expect(200);
+        expect(app.agent.callsTo('db.user.drop')[0].args).toMatchObject({ user: 'alice_pma', hosts: ['localhost'] });
+        expect(app.agent.callsTo('db.user.create')[0].args.password).not.toBe(alicePassword);
+        // Ownership: the reseller opens alice (owned) but never bob; unknown accounts are 404.
+        app.agent.calls.length = 0;
+        expect((await rPost('/phpmyadmin/open', { account: 'alice' }).expect(200)).body.data).toMatchObject({ user: 'alice_pma', account: 'alice' });
+        expect(JSON.parse(audits('db.phpmyadmin.signon.as').pop().args_redacted)).toMatchObject({ account: 'alice', actor: 'resell1' });
+        expect((await rPost('/phpmyadmin/open', { account: 'bob' })).status).toBe(403);
+        expect((await post('/phpmyadmin/open', { account: 'nobody' })).status).toBe(404);
+        expect(app.agent.state.users.has('bob_pma@localhost')).toBe(false);
+        // Switch off: the administrator user goes with the switch (the account users stay for the account cleanup),
+        // a sign-on is refused, and a token minted before is refused at the exchange.
+        const late = tokenOf((await post('/phpmyadmin/open', { account: 'alice' }).expect(200)).body.data.url);
+        await post('/phpmyadmin/open', {}).expect(200);
+        expect(app.agent.state.users.has('keel_pma_admin@localhost')).toBe(true);
+        const off = await put('/phpmyadmin/sso', { enabled: false }).expect(200);
+        expect(off.body.data.applied.adminUser).toEqual({ user: 'keel_pma_admin', dropped: true, reason: 'sso_off' });
+        expect(app.agent.state.users.has('keel_pma_admin@localhost')).toBe(false);
+        expect(app.agent.state.users.has('alice_pma@localhost')).toBe(true);
+        expect(app.ctx.databases.phpmyadmin.sso.adminDropArmed()).toBe(false);
+        expect(JSON.parse(audits('db.phpmyadmin.signon.admin.drop').pop().args_redacted)).toMatchObject({ reason: 'sso_off' });
+        expect((await post('/phpmyadmin/open', {})).status).toBe(409);
+        expect((await post('/phpmyadmin/open', { account: 'alice' })).status).toBe(409);
+        expect((await exchange(late)).status).toBe(409);
+        for (const r of app.ctx.db.prepare('SELECT args_redacted FROM audit_log').all()) for (const pw of [adminPassword, alicePassword]) expect(String(r.args_redacted || '')).not.toContain(pw);
+      } finally {
+        app.ctx.settings.set('panel.phpmyadmin.sso', false);
+        app.ctx.db.prepare("DELETE FROM db_users WHERE name = 'alice_pma'").run();
+        for (const name of ['alice_pma@localhost', 'keel_pma_admin@localhost']) { app.agent.state.users.delete(name); app.agent.state.grants.delete(name); }
+        await del('/databases/bob_ledger').expect(200);
+        restore('db.phpmyadmin.detect');
+      }
+    });
+
+    it('drops a leftover keel_pma_admin at start-up and when phpMyAdmin is unpublished', async () => {
+      const sso = app.ctx.databases.phpmyadmin.sso;
+      // Nothing there: no drop, no audit row.
+      app.agent.calls.length = 0;
+      expect(await sso.dropAdmin(null, { reason: 'startup' })).toEqual({ user: 'keel_pma_admin', dropped: false, reason: 'startup' });
+      expect(app.agent.callsTo('db.user.drop')).toEqual([]);
+      // Left behind by a crash: dropped without a request, recorded with no principal.
+      app.agent.state.users.set('keel_pma_admin@localhost', {});
+      app.agent.state.grants.set('keel_pma_admin@localhost', new Map([['*', ['ALL PRIVILEGES']]]));
+      expect(await sso.dropAdmin(null, { reason: 'startup' })).toEqual({ user: 'keel_pma_admin', dropped: true, reason: 'startup' });
+      expect(app.agent.state.users.has('keel_pma_admin@localhost')).toBe(false);
+      expect(app.ctx.db.prepare("SELECT principal, args_redacted FROM audit_log WHERE action = 'db.phpmyadmin.signon.admin.drop' ORDER BY id DESC LIMIT 1").get()).toMatchObject({ principal: null, args_redacted: expect.stringContaining('"startup"') });
+      // A drop that fails is reported, never thrown.
+      app.agent.state.users.set('keel_pma_admin@localhost', {});
+      app.agent.fail('db.user.drop', 'command_failed', 'mysql went away');
+      try { expect(await sso.dropAdmin(null, { reason: 'startup' })).toMatchObject({ dropped: false, error: expect.stringContaining('mysql went away') }); } finally { restore('db.user.drop'); }
+      // Unpublishing removes the signon pieces and the user with them.
+      await post('/phpmyadmin/publish', {}).expect(200);
+      const un = await del('/phpmyadmin/publish').expect(200);
+      expect(un.body.data.sso.adminUser).toEqual({ user: 'keel_pma_admin', dropped: true, reason: 'unpublish' });
+      expect(app.agent.state.users.has('keel_pma_admin@localhost')).toBe(false);
+    });
+
     it('Security Advisor flags the global alias and clears once only the hostname site serves phpMyAdmin', async () => {
       const findingsOf = async () => Object.fromEntries((await app.ctx.security.advisor.scan('manual')).findings.map((f) => [f.id, f]));
       let f = (await findingsOf())['phpmyadmin.global_alias'];
@@ -1024,7 +1179,7 @@ describe('Database Services API (PostgreSQL via mock agent)', () => {
     const res = await resellerHttp.post('/api/auth/login').send({ username: 'resell2', password: reseller.password });
     resellerCsrf = res.body.data.csrfToken;
     app.ctx.jobs.start();
-  });
+  }, 30_000);
   afterAll(() => app.close());
   beforeEach(() => { app.agent.calls.length = 0; });
 

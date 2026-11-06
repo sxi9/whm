@@ -218,7 +218,6 @@ export function discoverPhp() {
   if (fs.existsSync('/etc/php.ini') && fs.existsSync('/usr/bin/php')) {
     add('system', '/usr/bin/php', 'rhel', { label: 'System PHP', iniPath: '/etc/php.ini', iniPaths: { php: '/etc/php.ini' }, poolDir: '/etc/php-fpm.d', fpmUnit: 'php-fpm', packagePrefix: 'php-' });
   }
-  const packaged = found.size;
   for (const dir of safeReaddir(keelPhpDir())) {
     if (!/^\d\.\d+$/.test(dir)) continue;
     const prefix = path.join(keelPhpDir(), dir);
@@ -229,7 +228,8 @@ export function discoverPhp() {
       poolDir: path.join(prefix, 'etc', 'php-fpm.d'), fpmUnit: keelPhpUnit(dir), packagePrefix: null, source: true, prefix,
     });
   }
-  if (packaged === 0 && fs.existsSync('/usr/bin/php')) {
+  // Only when nothing else was found: with Keel builds present /usr/bin/php is one of them (update-alternatives).
+  if (found.size === 0 && fs.existsSync('/usr/bin/php')) {
     add('system', '/usr/bin/php', 'unknown', { label: 'System PHP', iniPath: null, iniPaths: {}, poolDir: null, fpmUnit: 'php-fpm', packagePrefix: 'php-' });
   }
   let defaultBinary = null;

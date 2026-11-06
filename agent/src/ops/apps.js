@@ -10,7 +10,7 @@ import { accountPath, assertManaged, asUser, failureOf, lastLine } from './as-us
 // as a systemd service under the account's own uid and is reached by Apache over
 // loopback (the vhost proxies of web.vhost.write). The unit file is rendered here
 // from a fixed template — never from text the panel sends — into
-// /etc/whm/apps/<username>/<name>.service and linked into systemd with
+// /etc/whm/apps/<username>/keel-app-<username>.<name>.service and linked into systemd with
 // `systemctl link`; nothing under /etc/systemd/system is written by this module.
 // Dependency installs (npm, pip) run as the account, never as root.
 
@@ -39,7 +39,8 @@ const nodeDir = () => process.env.WHM_NODE_DIR || NODE_DIR;
 // "." separates the two parts because neither a username nor an app name may
 // contain it ("-" is legal in both, so "a-b"/"c" and "a"/"b-c" would collide).
 export const unitName = (username, name) => `${UNIT_PREFIX}-${username}.${name}`;
-export const unitFile = (username, name) => path.join(appsDir(), username, `${name}.service`);
+// systemctl link names the unit after the file, so the file carries the full unit name.
+export const unitFile = (username, name) => path.join(appsDir(), username, `${unitName(username, name)}.service`);
 
 const appName = z.string().regex(APP_NAME_RE, '2 to 32 lowercase letters, digits or "-"');
 const appRel = z.string().regex(APP_REL_RE, 'A path relative to the home directory without "..", spaces or quotes');
