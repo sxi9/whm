@@ -2208,3 +2208,152 @@ file the panel owns; one collection tree per DAV login; the panel hashes every p
 - Tests: `agent/test/dav.test.js`, `server/test/dav.test.js`, `client/test/panel-calendars.test.jsx`. Host acceptance: Install from
   the card, `https://<hostname>/dav/` answers Radicale's page, set a DAV password for the account, `curl -u <login>:<pw> -X PROPFIND
   https://<hostname>/dav/<login>/` → 207, remove the password → 401.
+
+## 71. Customer panel: Web Disk — the home over WebDAV, one rclone daemon per account (`ctx.panelWebdisk`, agent `webdisk.*`, `unit-helpers.js`, host app `proxy.path`/`preserveHost`) (P5-1)
+cPanel's Web Disk the Keel way: no shared WebDAV listener. Each account that switches Web Disk on gets its own `rclone serve webdav`
+running **as the account**, bound to loopback, published by the hostname site at `https://<hostname>/webdisk/<username>/`; the
+htpasswd file lives in the account's home and the panel hashes the password itself.
+- **Shared unit machinery (`agent/src/ops/unit-helpers.js`):** what `apps.unit.*` used to carry inline — `APPS_DIR`
+  (`/etc/whm/apps`), `MANAGED_PREFIX` (`# Managed by Keel`), `appsDir()`, `writeAtomic` (0600 under a 0700 directory),
+  `requireSystemd`, `systemctl`, `linkedTo`, `parseShow`, `unitStatus`, `installUnit({ unit, file, content })` (refuses a file
+  or link the panel did not create, `systemctl link` once, `daemon-reload`, `enable`, `restart`, returns `{ unit, path, bytes,
+  started, startError, status }`), `removeUnit({ unit, file })` (`disable --now`, unlink, delete, `reset-failed`) and
+  `controlUnit(unit, action)`. `apps.js` imports them and re-exports `APPS_DIR`/`parseShow`; the module registers no op and never
+  imports `lib.js`.
+- **Agent ops (`agent/src/ops/webdisk.js`):** `webdisk.unit.write { username, port 1024–65535 }` → `capability_missing` without
+  `rclone` on the PATH (resolved as root, never from the account), `not_found` while `~/.keel/webdisk.htpasswd` is missing (the
+  password comes first), then renders `keel-webdisk-<username>` from `renderUnit()` (constants only: `User=<username>`,
+  `Group=<gid>`, `WorkingDirectory=<home>`, `ExecStart=<rclone> serve webdav <home> --addr 127.0.0.1:<port> --baseurl
+  /webdisk/<username> --htpasswd <home>/.keel/webdisk.htpasswd --config /dev/null --cache-dir <home>/.keel/webdisk-cache
+  --vfs-cache-mode writes --dir-cache-time 5s --umask 022 --log-level NOTICE --exclude /.ssh/** --exclude /.keel/**` (rclone
+  anchors a leading `/` to the served root: the home's own `.ssh` — the panel's `ssh_managed` policy must not be bypassed over
+  WebDAV — and `.keel`, which holds the htpasswd file the daemon authenticates against, are hidden from the share, nothing
+  deeper), `NoNewPrivileges`, `ProtectSystem=strict`,
+  `ReadWritePaths=<home>`, `PrivateTmp`, `ProtectKernelTunables`, `ProtectControlGroups`, `RestrictSUIDSGID`, marker
+  `# whm-webdisk {json}`) into `/etc/whm/apps/<username>/keel-webdisk-<username>.service` and installs it through `installUnit`
+  → `{ unit, path, bytes, started, startError, status, port, baseUrl, rclone }`. `webdisk.unit.remove { username }` (destructive)
+  → `{ unit, path, removed }`; `webdisk.unit.control { username, action: start|stop|restart }` (destructive); `webdisk.unit.status
+  { username }` → `parseShow` fields + `{ path, port, baseUrl, htpasswd: { path, exists }, rclone: { installed } }`.
+  `webdisk.htpasswd.set { username, login, hash }` — `login` matches `WEBDISK_LOGIN_RE` (`[a-z0-9][a-z0-9._-]{0,63}`, no `:`; every `arg.username` fits),
+  `hash` matches dav.js's `BCRYPT_RE` — runs **as the account** (`mkdir -p -m 700 ~/.keel`, `chmod 700`, then files.js's
+  `stagedWrite` = `dd` → `chmod 600` → `mv -T`) and writes the single line `login:hash`; `webdisk.htpasswd.remove { username }`
+  (destructive, `rm -f` as the account). Every path is pinned under the home through `accountPath` (symlinks confined); an unknown
+  or system account is refused before anything runs. The allowed roots are unchanged (`/home`, `/etc/whm/apps`).
+- **Hostname-site proxy (`web.host.app.write`, §41 addendum):** `proxy` gains `path` (an alias-shaped prefix kept on the way
+  upstream: `ProxyPass /webdisk/<u>/ → http://127.0.0.1:<port>/webdisk/<u>/`, what rclone's `--baseurl` expects and what keeps the
+  `<D:href>`s in PROPFIND answers absolute) and `preserveHost` (`ProxyPreserveHost On` inside the `<Location>`, so a WebDAV
+  MOVE/COPY `Destination` on the public name passes Go's host check). The meta line records `proxy.target` with the path; Radicale's
+  `/dav` drop-in is rendered exactly as before.
+- **Panel service `ctx.panelWebdisk` (`services/panel-webdisk.js`, routes `routes/panel/webdisk.js` at `/api/panel/webdisk`,
+  scope `panel:files`, feature `webdisk` — already in `DEFAULT_FEATURES`; capability `rclone` registered there; job
+  `panel.webdisk.install`):** table `panel_webdisk` (migration `034i`: `account_id UNIQUE, enabled, port UNIQUE, login UNIQUE,
+  has_password, password_set_at, status, error, created_at, updated_at`), one row per account created on first use with
+  `login = <username>` (unique by construction; a row of another account answers `409 login_taken`) and a port picked like the
+  Application Manager does (`portRange` of `panel.app_port_range`, rows of `panel_apps` **and** `panel_webdisk` excluded,
+  `apps.port.free` probed; `panel-apps.js`'s own picker excludes both tables too, so a disabled disk's kept port is never handed
+  to an app). A switch-on re-probes the kept port and moves the row to a fresh pick when something listens there (audit
+  `panel.webdisk.port.move { from, to }`). `GET /` → `{ enabled, login, port, hasPassword, passwordSetAt, status: disabled|active|failed, error,
+  serverUrl, hostname, fqdn, available: { rclone, apache, published }, unit: { unit, installed, active, state, pid, restarts,
+  startedAt } | null, passwordMinLength: 8, packages: ['rclone'], pending, recentJobs }`. `PUT /password { password ≥ 8 }`
+  (session only) → `ctx.crypto.hashPassword` → `webdisk.htpasswd.set` → row, and when the disk is on `webdisk.unit.control
+  restart` (rclone reads the file at start), audit `panel.webdisk.password.set { login, created, restarted }` (never the password
+  or the hash). `PUT / { enabled }` (session only): off → `hostApps.unpublish('webdisk-<u>')` + `webdisk.unit.remove` → row
+  `enabled = 0` (port and password kept), audit `panel.webdisk.disable`; on → `409 password_required` without a password, `409
+  hostname_required` without an FQDN, `501 apache` without Apache; without `rclone` → `202 { pending: true, job }` running
+  `panel.webdisk.install` (`pkg.install { packages: ['rclone'], noRecommends: true }` synchronously through the job's agent,
+  `capabilities.refresh()`, then the same enable; `409` while one is already queued); with it → `webdisk.unit.write` →
+  `web.modules.status/enable` for `proxy proxy_http headers` (reload deferred) → `hostApps.publish({ name: 'webdisk-<u>', alias:
+  '/webdisk/<u>', php: false, proxy: { port, scriptName, path: '/webdisk/<u>', preserveHost: true }, options: ['None'], reload: true
+  })` → row `enabled = 1, status = active|failed`; a failed publish removes the unit again and leaves `status = failed`. The drop-in
+  name is `appNameFor(username)` (`webdisk-<username>`, or a hashed form when `_` or the length would break the host app
+  grammar). `GET /clients` → `{ serverUrl, hostname, login, port: 443, clients: [{ id: windows, url, unc }, { id: macos, url },
+  { id: ios, url }, { id: android, url }, { id: linux, url, gvfs, davfs }] }`; `GET /jobs/:id[/stream]` for the install job (the
+  account's own jobs only). Hooks: `listAll()` feeds the admin card; `removeAccount(username, accountId, req)` runs from
+  `accounts.cleanupAccount` (`cleanup.webdisk = { login, port, enabled, unitRemoved, unpublished }`) before the home and the row go;
+  `rewrite(username, req)` → `{ enabled, rewritten, started, unit, port }` re-runs `webdisk.unit.write` with the row's port when
+  the disk is on (the unit bakes the home into its paths) and is called by account-functions' rearrange job after `usermod -d`
+  and the vhost rewrite, logged in the job (audit `panel.webdisk.rewrite`); a disabled or absent row answers `{ enabled: false,
+  rewritten: false }`.
+- **Admin:** `GET /api/service-config/webdisk` now answers `{ settings, lastUpdate, live, disks: [{ username, domain, login,
+  enabled, port, status, error, hasPassword, url, updatedAt }], hostname, apache }`; the *Web Disk Configuration* page lists the
+  accounts' Web Disks above the legacy port settings (stored only; nothing listens on 2077/2078).
+- **Client:** `pages/panel/files/webdisk.jsx` (nav `Files › Web Disk`, slug `webdisk`, feature `webdisk`; keys
+  `panel.webdisk.*`, `panel.files/webdisk.label/description`): status card with the switch (disabled until a password exists; a
+  `202` streams the install job through `ProgressLog` on `/panel/webdisk/jobs/:id/stream`), *Web Disk password* form, *Connect
+  your devices* (Windows UNC `\\<host>@SSL\webdisk\<u>`, macOS, iOS Files, Android, Linux GNOME/davfs2).
+- **Host steps:** `apt-get install rclone` is done by the first enable (job); `a2enmod proxy proxy_http headers` by the enable.
+  Nothing else.
+- Tests: `agent/test/webdisk.test.js`, `server/test/panel-webdisk.test.js`, `client/test/panel-webdisk.test.jsx`. Host
+  acceptance: set a password and switch on for `testuser`, `curl -u testuser:<pw> -X PROPFIND https://<hostname>/webdisk/testuser/`
+  → 207, `curl -u … -T probe.txt https://<hostname>/webdisk/testuser/probe-webdisk.txt` → the file in `/home/testuser` owned by
+  `testuser`, `-X DELETE` removes it, switch off → 404.
+
+## 72. Customer panel: one-click installers — Joomla and Drupal (`ctx.panelInstallers`, agent `web.app.*`, feature `installers`) (P5-2)
+The WordPress pipeline (§50) generalised to a small catalog: the release pins live in the agent, the panel process never
+names an archive, root only downloads/hashes and looks at metadata, everything inside the home runs as the account.
+- **Release pins (`agent/src/ops/app-install.js` `APP_RELEASES`, frozen):** `joomla` → `Joomla_<v>-Stable-Full_Package.zip`
+  from the GitHub release of `joomla/joomla-cms` (flat archive, `root: null`, signature `installation/joomla.php`,
+  `libraries/src/Version.php`, `administrator/index.php`), `drupal` → `https://ftp.drupal.org/files/projects/drupal-<v>.tar.gz`
+  (`root: drupal-<v>`, signature `core/lib/Drupal.php`, `index.php`, `sites/default/default.settings.php`); each with
+  `version, url (https only), sha256 (the publisher's: GitHub asset digest / release notes for Joomla, the drupal.org release
+  page for Drupal), bytes, format (zip|tar), requires: { php }, topLevel` (what a removal inside a shared docroot may delete:
+  only names the archive or the installer puts there — Joomla ships `htaccess.txt`/`robots.txt.dist`, so a site's own `.htaccess`
+  (the panel-managed rules of §47) and `robots.txt` are never listed and never removed).
+  Bumping a release = editing this table (`agent/test/app-install.test.js` pins the shape). Current: Joomla 6.2.0, Drupal 11.4.11.
+- **Agent ops:** `web.app.catalog {}` → `{ apps: { <id>: { name, version, url, sha256, bytes, format, requires } } }`;
+  `web.app.requirements {}` → `{ php, phpVersion, phpMysql, unzip, tar, asUser }`; `web.app.discover { usernames, maxDepth?, maxDirs? }`
+  → `{ installs: [{ username, home, app, path, relative, version, dbName, dbUser, dbHost, dbPrefix, configured, pendingInstaller }],
+  missing }` (Joomla = `libraries/src/Version.php` + `administrator/`, `configuration.php` parsed; Drupal = `core/lib/Drupal.php` +
+  `sites/`, `sites/default/settings.php` parsed; root reads through `readSiteFile`, lstat-guarded, 512 KiB cap);
+  `web.app.fetch { username, path, app, timeoutMs?≤180 s, maxBytes?≤128 MiB }` (destructive) → `{ path, app, bytes, sha256,
+  members, version, topLevel }`: refuses the home itself and a directory that already holds any web application (`exists`),
+  downloads the pinned URL into `/tmp/whm` (0600, `O_EXCL|O_NOFOLLOW`, https only including redirects, Content-Length and
+  byte count bound, magic bytes checked), `checksum_mismatch` when the SHA-256 differs — before anything is listed —,
+  then as the account: `unzip -Z` / `tar --list --verbose` on `/dev/fd/0`, `checkAppMembers` (files and directories only,
+  no `..`/empty/`.` components, every member under the release root when it has one, `checkArchiveMembers` for links/.ssh,
+  the signature files present, `exists` when a top-level entry is already there), unpack into `<target>/.keel-unpack-<rand>`,
+  `mv -t <target>` the top-level entries, remove the stage; a failure removes what this run created (`details.cleanup`);
+  `web.app.joomla.install { username, path, url, title, adminUser (≥2), adminEmail, adminPassword (≥12), dbName, dbUser,
+  dbPassword, dbHost?, dbPrefix? ([a-z][a-z0-9]{0,13}_) }` (destructive) runs `php -d memory_limit=512M installation/joomla.php
+  install --site-name … --admin-user … --admin-username … --admin-email … --db-type=mysqli --db-host … --db-user … --db-name …
+  --db-prefix … --db-encryption=0 --public-folder=` as the account with `adminPassword\n` + `dbPassword\n` on stdin
+  (`joomlaInstallArgv` never carries a password; Joomla asks for the two missing options in that order, `SHELL_INTERACTIVE=1`),
+  requires "Joomla has been installed" and `configuration.php` afterwards (`command_failed` with the installer's last error
+  line otherwise), `chmod 0640 configuration.php` (a failure is a `warning`), removes a leftover `installation/` →
+  `{ path, url, adminUrl, version, warning }`; `web.app.drupal.configure { username, path, dbName, dbUser, dbPassword, dbHost?,
+  dbPrefix? ('' | prefix), trustedHosts: [hostname…] }` (destructive) writes `sites/default/settings.php` through `stagedWrite`
+  (0640; `$databases['default']['default']` with the core mysql driver namespace/autoload, `hash_salt` 64 random chars,
+  `config_sync_directory = sites/default/files/config_<32 random>/sync`, anchored `trusted_host_patterns`, `update_free_access`
+  FALSE, `settings.local.php` include), creates `sites/default/files` 0755, `php -l` when php exists (the file is removed on a
+  lint failure) → `{ path, mode, linted, syncDir, installPath: 'core/install.php', version }`; `web.app.remove { username, path,
+  app, mode: tree|entries }` (destructive) → `{ path, app, mode, removed }` (`entries` = the release's `topLevel` names only).
+  All paths go through `accountPath` (managed uid ≥ 1000, home from passwd, lexical + realpath containment, allowed roots).
+- **Server `ctx.panelInstallers` (`services/panel-installers.js`, routes `routes/panel/installers.js` mounted at
+  `/api/panel/software/installers`, scope `panel:software` = session-only mutations, feature `installers`):** `APPS` holds the
+  page-facing descriptors (`id, name, description, site, dbBase (joomla|drupal), finish (cli|web), adminPath, installPath?,
+  fields, passwordMin`); the pins come from `web.app.catalog` (cached 10 min). `list(scope)` → `{ data: rows, meta: { total,
+  requirements, canInstall, hint, catalog: [{ …APPS[id], version, url, sha256, bytes, requires, available, supported
+  (`phpSatisfies(phpVersion, requires.php)`), canInstall, hint }], sites, prefix } }`, rows = `discover` filtered to the
+  account's docroots: `{ id (= installIdOf(abs), §50), app, name, path, domain, under, url, adminUrl, installUrl (Drupal with
+  `core/install.php` still present), version, database, dbUser, dbHost, dbPrefix, configured, isDocroot, databaseOwned }`.
+  `install(scope, app, body)`: `requireFields` per `APPS[app].fields` (422 `{ fields }`; Joomla password ≥ 12), `resolveSite`
+  (§50 rules: 404 foreign domain, 422 path), 409 when any app already sits there, 501 `installers` when the entry is not
+  `canInstall`, `panelDatabases.createForApp({ base: dbBase })`, Joomla `dbPrefix = randomTablePrefix()` (`[a-z][a-z0-9]{4}_`),
+  job `panel.app.install` with encrypted `adminPasswordEnc`/`dbPasswordEnc` → `202 { job, id, app, name, version, domain,
+  path, url, adminUrl, installUrl, database, dbUser, dbHost, finish, adminUser?, adminEmail?, generatedPassword?,
+  adminPassword? (once) }`. `runInstall`: `jobScope` as §50 → `web.app.fetch` → Joomla `web.app.joomla.install` | Drupal
+  `web.app.drupal.configure { trustedHosts: [domain, www.domain] }` → result `{ id, app, name, domain, path, url, adminUrl,
+  installUrl, version, database, dbUser, adminUser, finish, note }`; a failure runs `compensate` (agent cleanup note, else
+  `web.app.remove`, then drop user + database) and audits `panel.app.install.failed`. `remove(scope, id, { database })` →
+  `web.app.remove` (`entries` on a docroot) + drop of the owned database/user as §50 → `{ id, app, name, domain, path,
+  removed, files, database, dbUser, databaseKept }`. `getJob`/`streamJob` confined to `panel.app.install` jobs of the account.
+  Audit `panel.app.install` / `.done` / `.failed`, `panel.app.remove`; secrets never in params views or audit.
+- **Client:** the P5-3 catalog page (`pages/panel/software/installers.jsx` → `parts/InstallerCatalog.jsx`, `parts/catalog.js`)
+  reads this API through its `shared(id)` entries (`list: /software/installers`, `install: /software/installers/<id>`,
+  rows filtered by `app`, state from `meta.catalog[]`); nav `Software › Installers` (`?app=joomla|drupal`), feature
+  `installers` seeded true, Feature Manager label *One-click installers (Joomla, Drupal)*.
+- **Host steps:** none beyond PHP ≥ 8.3 with `php-mysql`, `unzip` and `tar` on the command line (all already on nova).
+- Tests: `agent/test/app-install.test.js` (pins, schemas, archive guard, rendering/parsing, Joomla argv without passwords, a
+  real-account run under `WHM_TEST_ACCOUNT`), `server/test/panel-installers.test.js` (12), the P5-3 `client/test/panel-installers.test.jsx`.
+  Host acceptance: Joomla into `/probe-joomla` on testuser → HTTPS 200 from Joomla, remove with database; Drupal into
+  `/probe-drupal` → `core/install.php` answers 200, remove with database.

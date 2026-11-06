@@ -45,7 +45,7 @@ describe('nav entry of the Software group', () => {
     expect(PANEL_ICONS.Package).toBeTruthy();
     expect(panelColorFor('software')).not.toBe(panelColorFor('nothing'));
     expect(PANEL_PAGE_REGISTRY['panel:software/wordpress']).toBeTruthy();
-    expect(visibleCategories({ wordpress: false, plugins: false, applicationmanager: false }).some((c) => c.slug === 'software')).toBe(false);
+    expect(visibleCategories({ wordpress: false, installers: false, plugins: false, applicationmanager: false }).some((c) => c.slug === 'software')).toBe(false);
     expect(visibleCategories({}).some((c) => c.slug === 'software')).toBe(true);
     expect(jobStreamPath(12)).toBe('/panel/software/wordpress/jobs/12/stream');
   });
@@ -110,8 +110,8 @@ describe('WordPress page', () => {
     expect(pathProblem('x'.repeat(201))).toMatch(/200/);
     expect(siteLabel(rows[0])).toBe('demo.example.com/blog');
     expect(siteLabel(rows[1])).toBe('demo.example.com');
-    expect(hostState(null)).toEqual({ canInstall: false, canUpdate: false, hint: null, method: 'web' });
-    expect(hostState(meta({ ...ready, wpcli: true }))).toMatchObject({ canInstall: true, canUpdate: true, method: 'wpcli' });
+    expect(hostState(null)).toEqual({ canInstall: false, canUpdate: false, hint: null, version: null, method: 'web' });
+    expect(hostState(meta({ ...ready, wpcli: true }))).toMatchObject({ canInstall: true, canUpdate: true, method: 'cli' });
     expect(hostState(meta({ ...ready, unzip: false, canInstall: false, hint: 'x' }))).toMatchObject({ canInstall: false, canUpdate: false, hint: 'x' });
   });
 });

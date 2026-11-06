@@ -39,7 +39,7 @@ const app = { id: 1, name: 'probe-app', type: 'node', dir: 'apps/probe-app', ent
 describe('Application manager page', () => {
   it('is in the nav under Software with its feature flag, page file, seed default and i18n keys', () => {
     expect(fn).toMatchObject({ slug: 'apps', categorySlug: 'software', feature: 'applicationmanager', path: '/panel/software/apps', phase: 3 });
-    expect(PANEL_CATEGORY_BY_SLUG.software.functions.map((f) => f.slug)).toEqual(['wordpress', 'plugins', 'apps']);
+    expect(PANEL_CATEGORY_BY_SLUG.software.functions.map((f) => f.slug)).toEqual(['wordpress', 'installers', 'plugins', 'apps']);
     expect(registryKeysFrom(['../pages/panel/software/apps.jsx'])).toEqual(['panel:software/apps']);
     expect(en['panel.software/apps.label']).toBe('Application manager');
     expect(en['panel.software/apps.description']).toBe(fn.description);

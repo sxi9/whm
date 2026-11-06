@@ -142,6 +142,7 @@ export function createAccountsService(ctx) {
     // The application units (root-level systemd services linked from
     // /etc/whm/apps) go before the vhosts that proxy to them.
     await attempt('apps', async () => (ctx.panelApps?.removeAccountApps ? ctx.panelApps.removeAccountApps(username, req) : null));
+    await attempt('webdisk', async () => (ctx.panelWebdisk?.removeAccount ? ctx.panelWebdisk.removeAccount(username, id, req) : null));
     await attempt('web', async () => (ctx.web?.removeAccount ? ctx.web.removeAccount(username, req) : null));
     await attempt('databases', async () => (ctx.databases?.removeAccountData ? ctx.databases.removeAccountData(username, req) : null));
     // Every hosted domain leaves Exim's local-domain list on termination (WHM

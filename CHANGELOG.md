@@ -9,6 +9,30 @@ not for the commit log.
 ## [Unreleased]
 
 ### Added
+- **Account panel: Web Disk.** Files › Web Disk (`/panel/files/webdisk`, feature `webdisk`) mounts the account's home
+  over WebDAV on Windows, macOS, iOS, Android and Linux. Each account that switches it on runs its own `rclone serve
+  webdav` **as the account** (hardened unit `keel-webdisk-<account>` under `/etc/whm/apps`, loopback port from the
+  application pool, `--baseurl /webdisk/<account>`, htpasswd with a panel-made bcrypt hash in `~/.keel`, 0600) and the
+  hostname site publishes `https://<hostname>/webdisk/<account>/` to it (prefix kept upstream, `ProxyPreserveHost`).
+  The first enable on a host installs `rclone` as a job the page follows. Service Configuration › Web Disk
+  Configuration lists the accounts' disks. Agent `webdisk.*` ops share the systemd link/enable/restart machinery with
+  the Application Manager (`agent/src/ops/unit-helpers.js`); migration `034i`; contract §71.
+- **One-click Joomla and Drupal installers for every account.** Software › Installers gains Joomla (`6.2.0`, the
+  GitHub release's `Joomla_<v>-Stable-Full_Package.zip`) and Drupal (`11.4.11`, `drupal-<v>.tar.gz` from `ftp.drupal.org`),
+  pinned with their published SHA-256 in the agent (`agent/src/ops/app-install.js`, read back through `web.app.catalog`),
+  downloaded by root into its scratch directory, verified before a byte is unpacked, listed and unpacked as the account
+  (plain files under the release root only), with a database and user from the plan's quota. Joomla is finished by its
+  own CLI installer with both passwords on standard input and a random table prefix; Drupal gets `sites/default/settings.php`
+  (`0640`, database, hash salt, trusted hosts, config sync directory) and the page hands over to `core/install.php`
+  (*Finish setup*). Installs are found from the trees (`web.app.discover`), removable with their database. Server
+  `ctx.panelInstallers` (`GET /api/panel/software/installers`, `POST …/installers/:app`, `GET …/installers/jobs/:id[/stream]`,
+  `DELETE …/installers/:id`), job `panel.app.install`, feature `installers`, contract §72, MANUAL-partC §16.1.
+- **Account panel: one installer catalog page.** Software › Installers (`/panel/software/installers`, feature `installers`)
+  shows WordPress, Joomla and Drupal as tabs of one page built from a shared catalog shape
+  (`client/src/pages/panel/software/parts/catalog.js`: API segment, configuration file, admin path, CLI updater, panel or
+  web-installer setup); the WordPress function keeps its address and plan feature as the pinned WordPress tab. The
+  `panel.software.*` strings are consolidated with `{app}` / `{cli}` / `{vendor}` placeholders (the `*_wpcli` keys became
+  `*_cli`), and MANUAL-partC §16.1 describes the catalog.
 - **The server hostname site runs on its own PHP-FPM pool.** `https://<hostname>/` (webmail, phpMyAdmin, the signon
   script) no longer borrows the distribution's `www` pool socket: the panel writes a `keel-host` pool
   (`keel-host.conf`, user `www-data`/`apache`, `pm = ondemand`, uploads and sessions under `/var/lib/whm/keel-host`)

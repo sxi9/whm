@@ -751,6 +751,40 @@ hand-edited lines inside the markers), `POST /files/htaccess/probe { path }` run
   shows *folder missing*; *Forget* clears it. The clone takes at most 15 minutes, a pull or a
   deployment 10. Without `git` on the server the page answers `501`.
 
+#### 5.6 Web Disk
+
+- **Purpose:** open your home folder like a drive on your computer or phone (WebDAV): what you
+  copy there lands on the server at once, what you delete there is gone from the server.
+- **Who:** feature `webdisk`; also while acting. A `panel:files` token may read the status and
+  the device recipes; switching Web Disk and setting its password are browser-session actions.
+- **Screen:** the *Web Disk* card shows the state (*Off*, *Starting*, *On*, *Not running*), the
+  address `https://<server>/webdisk/<account>/`, your login (the account name) and when the
+  password was last set, with the **Enable Web Disk** switch (greyed out until a password
+  exists; the first enable on a server installs `rclone` as a job whose log is shown). *Web Disk
+  password* sets or replaces the password (at least 8 characters; separate from the panel and
+  FTP passwords — while the disk is on, the service restarts and connected devices sign in
+  again). *Connect your devices* carries the steps for Windows (Map network drive or the
+  `\\server@SSL\webdisk\account` address), macOS (Connect to Server), iPhone/iPad (Files ›
+  Connect to Server), Android (any WebDAV-capable file manager) and Linux (GNOME Files
+  `davs://…`, davfs2).
+- **Server:** `GET /webdisk`, `PUT /webdisk { enabled }` (`200`, or `202 { job }` while `rclone`
+  is installed), `PUT /webdisk/password { password }`, `GET /webdisk/clients`,
+  `GET /webdisk/jobs/:id[/stream]`. Each account gets its own daemon (`rclone serve webdav`
+  running **as the account**, loopback port from the application pool, unit
+  `keel-webdisk-<account>`) and the server hostname site proxies `/webdisk/<account>/` to it
+  over HTTPS; the password is bcrypt-hashed by the panel and written as the account into
+  `~/.keel/webdisk.htpasswd` (0600). Audit `panel.webdisk.password.set|enable|disable|install`.
+- **Needs:** Apache and a fully qualified server hostname (otherwise the page says so);
+  `rclone` (installed by the first enable).
+- **Gotchas:** the login is always the account name and the password must be set before the
+  switch works (`409 password_required`). Switching off keeps the password and the port; the
+  files are never touched. The disk is HTTPS-only on port 443 — the legacy Web Disk ports
+  (2077/2078) do not exist on this server. Writes go through a small cache in
+  `~/.keel/webdisk-cache` (counted against your quota) and symbolic links in your home are not
+  shown. `~/.ssh` and `~/.keel` are not part of the share: SSH keys are managed from *Security ›
+  SSH Access* only, and the Web Disk password file stays private. If the state says *Not running*, switch it off and on again; the service log is in the
+  server journal (`keel-webdisk-<account>`).
+
 ## 6. Email
 
 Routes under `/email` (`services/panel-email.js`); agent ops `vmail.*` (capabilities `dovecot`
@@ -1636,47 +1670,85 @@ group, so its mutations are session-only.
 Routes under `/software` (`services/panel-software.js`). No token scope is granted for this
 group, so installs, updates and removals are session-only; the list is readable with `panel:read`.
 
-#### 16.1 WordPress
+#### 16.1 Installers (WordPress, Joomla, Drupal)
 
-- **Purpose:** install the current WordPress release on one of your domains with its own database,
-  see every WordPress site under your document roots, open its dashboard, update it, remove it.
-- **Who:** feature `wordpress`; also while acting.
-- **Screen:** *Install WordPress* — domain (main, addon or subdomain), an optional folder below its
-  document root (`blog` → `https://example.com/blog`), site title, administrator user name (avoid
-  `admin`), administrator e-mail (your contact address is prefilled) and either a generated
-  administrator password (shown **once**, with a copy button, when the install starts) or one you
-  type. *Your WordPress sites* lists every directory with a `wp-config.php` and
-  `wp-includes/version.php` under your document roots — including sites you uploaded yourself — with
-  its version and database; row actions **Open admin**, **Update** (WP-CLI hosts only) and
+- **Purpose:** one page for the one-click application catalog: install the current release of
+  WordPress, Joomla or Drupal on one of your domains with its own database, see every installation
+  of that application under your document roots, open its administration, update it (where the
+  application has a command-line updater on the server) and remove it.
+- **Who:** feature `installers` opens the page; each application is additionally gated by its own
+  plan feature when the plan names one (`wordpress` for WordPress; Joomla and Drupal follow
+  `installers`). Also while acting. The *WordPress* entry of the Software group is the WordPress tab
+  of this page under its old address (`/panel/software/wordpress`), so plans that include only
+  `wordpress` keep it.
+- **Screen:** a tab per application (`?app=wordpress|joomla|drupal`, WordPress first). Each tab has
+  *Install <application>* — domain (main, addon or subdomain), an optional folder below its document
+  root (`blog` → `https://example.com/blog`), site title, administrator user name (avoid `admin`),
+  administrator e-mail (your contact address is prefilled) and either a generated administrator
+  password (shown **once**, with a copy button, when the install starts) or one you type; the
+  subtitle names the latest release the server will fetch. *Your <application> sites* lists every
+  directory with the application's configuration file (`wp-config.php`, `configuration.php`,
+  `sites/default/settings.php`) under your document roots — including sites you uploaded yourself —
+  with its version and database; row actions **Open admin**, **Update** (WordPress on WP-CLI hosts
+  only; Joomla and Drupal update from their own administration pages, and the list says so) and
   **Remove** (with an *also delete the database* switch when the database is one of this account's).
-  A live log follows each install or update.
-- **Server:** `GET /software/wordpress` → `{ data: [{ id, path, domain, under, url, adminUrl, version,
-  database, dbUser, tablePrefix, isDocroot, databaseOwned }], meta: { requirements, canInstall, hint,
-  updates, sites, prefix } }`; `POST /software/wordpress { domain, path?, title, adminUser, adminEmail,
-  adminPassword?, locale? }` → `202 { job, id, url, adminUrl, database, dbUser, generatedPassword,
-  adminPassword? }`; `GET /software/wordpress/jobs/:id[/stream]`; `POST /software/wordpress/:id/update`
-  → `202 { job }`; `DELETE /software/wordpress/:id?confirm=true&database=true|false`. The database
-  and its user are `<user>_wp`, `<user>_wp2`, … (first free name, plan quota and prefix rules as in
-  *Databases*; the user holds all privileges on that one database). The job then runs as the
-  account user: with WP-CLI on the server one `web.wp.install` (download, `wp config create`,
-  `wp core install`, theme check); without it the panel downloads `https://wordpress.org/latest.zip`
-  itself (root, into its scratch directory, 120 s, 96 MiB limit, SHA-1 compared with the published
-  `latest.zip.sha1`), lists and unpacks it as the account (every member must sit under `wordpress/`,
-  no links, nothing may already exist with the same name), writes `wp-config.php` (`0600`, locally
-  generated salts, `WP_DEBUG` off, `php -l` checked) and posts the WordPress installer's own step
-  over loopback to the site (`Host` header, HTTPS when the domain has a certificate — the site URL
-  WordPress records follows that). A failed install removes what it unpacked and drops the user and
-  the database again, so the retry gets the same names. Audit `panel.wp.install` (+ `.done` /
-  `.failed`), `panel.wp.update` (+ `.done`), `panel.wp.remove`; passwords never appear in the audit
-  or in the job view.
-- **Gotchas:** without WP-CLI *Update* answers `501` — update from the site's own *Dashboard › Updates*
-  (the panel says so); `wp-config.php` is readable by the account only (`0600`), which is what the
-  per-account PHP-FPM pool runs as; a site whose `wp-config.php` names another account's database is
-  listed but its database is never touched; the installer refuses a folder that already holds a
-  WordPress tree (`409`) or files named like the release's (`index.php`, `wp-admin`, …); when the host
-  lacks WP-CLI and `php-mysql` + `unzip`, the page says what to ask your provider for and the API answers
-  `501`; only `en_US` is downloaded without WP-CLI (`locale` is passed to the installer, which installs
-  the language pack later from the dashboard).
+  A live log follows each install or update. **Joomla** is finished on the server by its own
+  command-line installer (administrator, tables, `configuration.php`); the *Joomla* tab therefore
+  asks for the site title, the administrator and a password of at least 12 characters. **Drupal**
+  has no non-interactive installer without Composer, so its job delivers the files with
+  `sites/default/settings.php` already holding the database, the hash salt and the trusted hosts,
+  and the page then hands you to Drupal's own web installer (`core/install.php`, row action
+  **Finish setup**, state *setup pending*), which skips its database step and only asks for the
+  language, the profile, the site name and the administrator; the *Drupal* tab asks for nothing but
+  the domain and the folder.
+- **Server:** WordPress keeps its own route family (`services/panel-software.js`); Joomla and
+  Drupal share one (`services/panel-installers.js`, routes `routes/panel/installers.js`, feature
+  `installers`): `GET /software/installers` → `{ data: [{ id, app, name, path, domain, under, url,
+  adminUrl, installUrl, version, database, dbUser, dbHost, dbPrefix, configured, isDocroot,
+  databaseOwned }], meta: { requirements: { php, phpVersion, phpMysql, unzip, tar, asUser },
+  canInstall, hint, catalog: [{ id, name, description, site, finish, fields, passwordMin, version,
+  url, sha256, bytes, requires, available, supported, canInstall, hint }], sites, prefix } }`
+  (`installUrl` is set while a Drupal tree still carries `core/install.php`);
+  `POST /software/installers/:app { domain, path?, title?, adminUser?, adminEmail?, adminPassword? }`
+  → `202 { job, id, app, name, version, url, adminUrl, installUrl, database, dbUser, dbHost, finish,
+  adminUser?, adminEmail?, generatedPassword?, adminPassword? }` (the fields the app needs are
+  checked per catalog entry — `422` names the missing one; Joomla refuses a password under 12
+  characters); `GET /software/installers/jobs/:id[/stream]`;
+  `DELETE /software/installers/:id?confirm=true&database=true|false`. WordPress stays
+  `GET|POST /software/wordpress`, `POST /software/wordpress/:id/update`, `DELETE /software/wordpress/:id`
+  (see the previous shape in the changelog; `tablePrefix`, `updates`, `locale`). The database and
+  its user are `<user>_wp`, `<user>_wp2`, … / `<user>_joomla…` / `<user>_drupal…` (first free name,
+  plan quota and prefix rules as in *Databases*; the user holds all privileges on that one database).
+  The job then runs as the account user: the panel downloads the release over HTTPS (root, into its
+  scratch directory, size-capped — WordPress `latest.zip` checked against `latest.zip.sha1`; Joomla
+  and Drupal from the release the agent pins, `Joomla_<v>-Stable-Full_Package.zip` from the GitHub
+  release of `joomla/joomla-cms` and `drupal-<v>.tar.gz` from `ftp.drupal.org`, each checked against
+  the SHA-256 published with that release before a byte is unpacked), lists and unpacks it as the
+  account (plain files and directories only, under the release's top directory, no links, no `..`,
+  nothing may already exist with the same name), then runs the application's own setup: WordPress's
+  installer over loopback (`Host` header, HTTPS when the domain has a certificate; `wp-config.php`
+  `0600`, locally generated salts, `php -l` checked; with WP-CLI on the server `web.wp.install`
+  instead), Joomla's `php installation/joomla.php install` with both passwords fed on standard input
+  (never on the command line; a random table prefix such as `k3x9a_`; `configuration.php` made
+  `0640`, `installation/` removed), Drupal's `sites/default/settings.php` (`0640`, `php -l` checked)
+  plus `sites/default/files`. A failed install removes what it unpacked and drops the user and the
+  database again, so the retry gets the same names. Audit `panel.wp.install` / `panel.app.install`
+  (+ `.done` / `.failed`), `panel.wp.update` (+ `.done`), `panel.wp.remove` / `panel.app.remove`;
+  passwords never appear in the audit or in the job view.
+- **Gotchas:** without WP-CLI *Update* answers `501` — update WordPress from its own *Dashboard ›
+  Updates* (the panel says so); configuration files are readable by the account only (`0600`/`0640`),
+  which is what the per-account PHP-FPM pool runs as; a site whose configuration names another
+  account's database is listed but its database is never touched; the installer refuses a folder
+  that already holds a web application (`409`) or files named like the release's (`index.php`,
+  `wp-admin`, `administrator`, `core`, …); when the host lacks PHP with its MySQL driver, `unzip` or
+  `tar`, the page says what to ask your provider for and the API answers `501`; Joomla and Drupal
+  need PHP 8.3 or newer on the server's command line — an older `php` marks the entry *unsupported*
+  with the reason and the install answers `501`; only `en_US` is downloaded without WP-CLI (`locale`
+  is passed to the installer, which installs the language pack later from the dashboard); a Joomla
+  site reached over `http://` while the domain has no certificate records that URL in
+  `configuration.php`; finish Drupal's web installer soon after the files land — until then
+  `core/install.php` is reachable by anyone who knows the address (it only ever creates the site
+  once).
 
 #### 16.2 Plugins
 

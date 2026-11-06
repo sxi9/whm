@@ -81,7 +81,7 @@ describe('usePanelPlugins helpers', () => {
     expect(entries[1].description).toBe('Sample Notes 1.1.0');
     expect(panelPluginPath(plugin, { route: '/' })).toBe('/panel/plugins/net.whm.sample-notes');
     const merged = withPluginEntries(visibleCategories({}), entries);
-    expect(merged.find((c) => c.slug === 'software').functions.map((f) => f.label)).toEqual(['WordPress', 'Plugins', 'Application manager', 'Notes about my account', 'Help', 'Embed']);
+    expect(merged.find((c) => c.slug === 'software').functions.map((f) => f.label)).toEqual(['WordPress', 'Installers', 'Plugins', 'Application manager', 'Notes about my account', 'Help', 'Embed']);
     expect(withPluginEntries(visibleCategories({}), [])).toEqual(visibleCategories({}));
     expect(searchPluginEntries(entries, 'notes account').map((e) => e.label)).toEqual(['Notes about my account']);
     expect(searchPluginEntries(entries, '')).toHaveLength(3);
@@ -95,7 +95,7 @@ describe('sidebar and the Plugins page', () => {
     // (WordPress, Plugins, Application manager + the three plugin pages), the entries are in the merge.
     const html = render(h(PanelSidebar, { collapsed: false }));
     const software = html.slice(html.indexOf('data-group="software"'));
-    expect(software.slice(0, software.indexOf('</button>'))).toContain('<span class="count">6</span>');
+    expect(software.slice(0, software.indexOf('</button>'))).toContain('<span class="count">7</span>');
     const entries = panelPluginEntries([plugin]);
     expect(withPluginEntries(visibleCategories({}), entries).find((c) => c.slug === 'software').functions.some((f) => f.path === '/panel/plugins/net.whm.sample-notes/my-notes')).toBe(true);
   });

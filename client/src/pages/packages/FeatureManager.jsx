@@ -14,7 +14,7 @@ const FEATURE_LABELS = {
   phpversion: 'PHP version', multiphp: 'MultiPHP manager', webdisk: 'Web disk', api: 'API access', passwordchange: 'Password and security', hotlink: 'Hotlink protection',
   leechprotect: 'Leech protection', indexmanager: 'Indexes', errpgs: 'Error pages', redirects: 'Redirects', cpanelpro_support: 'Support tickets',
   ipblocker: 'IP blocker', dirprivacy: 'Directory privacy', webstats: 'Visitors (web statistics)', wordpress: 'WordPress installer', ddns: 'Dynamic DNS', virusscan: 'Virus scanner', optimizews: 'Optimize website',
-  traceroute: 'Track DNS (lookup and traceroute)', dbwizard: 'Database wizard', plugins: 'Plugin pages',
+  traceroute: 'Track DNS (lookup and traceroute)', dbwizard: 'Database wizard', plugins: 'Plugin pages', installers: 'One-click installers (Joomla, Drupal)',
 };
 
 export default function FeatureManager({ fn }) {

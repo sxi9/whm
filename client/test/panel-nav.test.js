@@ -16,7 +16,7 @@ const GROUPS = ['overview', 'domains', 'dns', 'ssl', 'files', 'email', 'database
 describe('panel/nav.js is the single source of truth for /panel', () => {
   it('lists the v1 groups of design §1.2 in order with unique keys and paths', () => {
     expect(PANEL_CATEGORIES.map((c) => c.slug)).toEqual(GROUPS);
-    expect(PANEL_FUNCTIONS).toHaveLength(62);
+    expect(PANEL_FUNCTIONS).toHaveLength(64);
     expect(new Set(PANEL_FUNCTIONS.map((f) => f.key)).size).toBe(PANEL_FUNCTIONS.length);
     expect(new Set(PANEL_FUNCTIONS.map((f) => f.path)).size).toBe(PANEL_FUNCTIONS.length);
     for (const f of PANEL_FUNCTIONS) {
@@ -32,10 +32,10 @@ describe('panel/nav.js is the single source of truth for /panel', () => {
   it('carries every page file of design §6.1', () => {
     const expected = [
       'overview/dashboard', 'overview/account', 'overview/preferences', 'domains/domains', 'domains/addon-domains', 'domains/subdomains', 'domains/parked-domains', 'domains/redirects',
-      'dns/zone-editor', 'dns/dynamic-dns', 'dns/track', 'ssl/status', 'ssl/install', 'ssl/certificates', 'files/file-manager', 'files/disk-usage', 'files/directory-privacy', 'files/indexes', 'files/git', 'email/accounts', 'email/forwarders',
+      'dns/zone-editor', 'dns/dynamic-dns', 'dns/track', 'ssl/status', 'ssl/install', 'ssl/certificates', 'files/file-manager', 'files/disk-usage', 'files/directory-privacy', 'files/indexes', 'files/git', 'files/webdisk', 'email/accounts', 'email/forwarders',
       'email/default-address', 'email/autoresponders', 'email/filters', 'email/global-filters', 'email/spam', 'email/deliverability', 'email/routing', 'email/webmail', 'email/usage', 'email/calendars', 'databases/databases', 'databases/users',
       'databases/remote-hosts', 'databases/phpmyadmin', 'databases/wizard', 'ftp/accounts', 'cron/cron-jobs', 'backups/backups', 'backups/restore', 'logs/access-logs', 'logs/bandwidth', 'logs/visitors', 'logs/errors',
-      'php/versions', 'php/ini', 'security/password', 'security/two-factor', 'security/ssh-keys', 'security/sessions', 'security/tokens', 'security/ip-blocker', 'security/virus-scanner', 'usage/usage', 'advanced/error-pages', 'advanced/optimize-website', 'advanced/hotlink-protection', 'advanced/terminal', 'software/wordpress', 'software/plugins', 'software/apps', 'preferences/users',
+      'php/versions', 'php/ini', 'security/password', 'security/two-factor', 'security/ssh-keys', 'security/sessions', 'security/tokens', 'security/ip-blocker', 'security/virus-scanner', 'usage/usage', 'advanced/error-pages', 'advanced/optimize-website', 'advanced/hotlink-protection', 'advanced/terminal', 'software/wordpress', 'software/installers', 'software/plugins', 'software/apps', 'preferences/users',
     ];
     expect(PANEL_FUNCTIONS.map(panelId)).toEqual(expected);
     expect(PANEL_PATHS.password).toBe('/panel/security/password');
