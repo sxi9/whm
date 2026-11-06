@@ -25,7 +25,7 @@ export default function ServiceManager({ fn }) {
       <Card padded={false}>
         <DataTable
           columns={[
-            { key: 'displayName', label: 'Service', width: 220, render: (s) => <><div>{s.displayName}</div><small className="muted">{s.unit ? <code>{s.unit}</code> : `looks for: ${s.candidates.join(', ')}`}</small></> },
+            { key: 'displayName', label: 'Service', width: 220, render: (s) => <><div>{s.displayName}</div><small className="muted service-looks-for">{s.unit ? <code>{s.unit}</code> : `looks for: ${s.candidates.join(', ')}`}</small></> },
             { key: 'state', label: 'Status', render: (s) => <StatusPill status={s.active ? 'active' : s.installed ? 'down' : 'not-installed'}>{s.active ? 'Up' : s.installed ? 'Down' : 'Not installed'}</StatusPill> },
             { key: 'unitEnabled', label: 'Start at boot', render: (s) => <Toggle checked={Boolean(s.unitEnabled)} disabled={!s.installed} onChange={(v) => unit(s, v)} /> },
             { key: 'monitored', label: 'Monitor', render: (s) => <Toggle checked={s.monitored} disabled={!s.installed} onChange={(v) => configure(s, { monitored: v })} /> },

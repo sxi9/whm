@@ -135,9 +135,9 @@ export default function Usage({ fn }) {
   return (
     <PanelPage fn={fn} actions={<Button icon={RefreshCw} loading={busy} disabled={unavailable} onClick={refresh}>{t('panel.usage.refresh_figures', 'Refresh figures')}</Button>}>
       {error && error.status === 403 && error.code === 'feature_disabled' && <FeatureDisabledState fn={fn} />}
-      {unavailable && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
+      {unavailable && <PanelCapabilityState card error={error} onRetry={refetch} />}
       {error && !unavailable && !(error.status === 403 && error.code === 'feature_disabled') && <ErrorBanner error={error} onRetry={refetch} />}
-      {refreshError && <Card><PanelCapabilityState error={refreshError} onRetry={() => setRefreshError(null)} /></Card>}
+      {refreshError && <PanelCapabilityState card error={refreshError} onRetry={() => setRefreshError(null)} />}
       {job && (
         <Card title={t('panel.usage.scanning_title', 'Scanning disk usage')} actions={<button className="btn btn-sm" onClick={() => { setJob(null); refetch(); }}>{t('common.close', 'Close')}</button>}>
           <JobProgress jobId={job} onFinished={refetch} message={t('panel.usage.scan_message', 'Disk scan started; the figures update in a minute.')} />
@@ -148,7 +148,7 @@ export default function Usage({ fn }) {
         <>
           <ScanSourceNote disk={d} t={t} />
           <div className="stat-grid" style={{ marginBottom: 18 }}>
-            <Stat name="disk" label={t('panel.usage.disk_space', 'Disk space')} {...quotaParts(d.usedMb, d.quotaMb, formatMb, t)} used={d.usedMb} limit={d.quotaMb} note={d.source === 'repquota' ? t('panel.usage.source_quota', 'From the file system quota') : `${t('panel.usage.source_scan', 'From the last scan')}${scanAge(d.lastRefresh) ? `, ${ageLabel(scanAge(d.lastRefresh).ms, t)}` : ''}`} />
+            <Stat name="disk" label={t('panel.usage.disk_space', 'Disk space')} {...quotaParts(d.usedMb, d.quotaMb, formatMb, t)} used={d.usedMb} limit={d.quotaMb} note={d.source === 'repquota' ? t('panel.usage.source_quota', 'From the file system quota') : !d.lastRefresh ? t('panel.usage.source_unmeasured', 'Not measured yet') : `${t('panel.usage.source_scan', 'From the last scan')}${scanAge(d.lastRefresh) ? `, ${ageLabel(scanAge(d.lastRefresh).ms, t)}` : ''}`} />
             <Stat name="bandwidth" label={t('panel.usage.bandwidth_month', 'Bandwidth this month')} {...quotaParts(b.usedMb, b.limitMb, formatMb, t)} used={b.usedMb} limit={b.limitMb} />
             {inodes && <Stat name="inodes" label={t('panel.usage.inodes', 'Files (inodes)')} {...inodes} used={d.inodes} limit={d.inodeLimit} />}
           </div>

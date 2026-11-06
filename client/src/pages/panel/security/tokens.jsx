@@ -92,7 +92,7 @@ export default function Tokens({ fn }) {
           rows={rows} loading={loading} error={withheld ? null : error} rowKey={(tk) => tk.id} dense
           searchable={Boolean(data?.length)} q={q} onSearch={setQ} searchPlaceholder={t('panel.security.tokens_search', 'Search tokens')}
           rowActions={(tk) => [{ label: t('panel.security.token_revoke', 'Revoke'), danger: true, primary: true, disabled: Boolean(actingAs), onClick: () => revoke(tk) }]}
-          emptyText={withheld ? error.message : q ? t('panel.security.tokens_empty_search', 'No token matches the search.') : t('panel.security.tokens_empty', 'No API tokens yet. Create one to let a script or tool work with this account; it appears here with its scopes, expiry and last use.')}
+          emptyText={withheld ? t('panel.security.tokens_hidden_acting', 'Tokens are shown to the account user only.') : q ? t('panel.security.tokens_empty_search', 'No token matches the search.') : t('panel.security.tokens_empty', 'No API tokens yet. Create one to let a script or tool work with this account; it appears here with its scopes, expiry and last use.')}
         />}
       </Card>
       <Card title={t('panel.security.token_using_title', 'Using a token')}>

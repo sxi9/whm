@@ -297,6 +297,9 @@ html { scroll-padding-bottom: 72px; }
 .search .input { width: 280px; }
 .search.inline .input { width: 220px; height: 32px; }
 .table-wrap { overflow-x: auto; }
+/* A long table scrolls inside its card with the header row pinned (edit-a-locale). */
+.table-scroll { max-height: 70vh; overflow-y: auto; }
+.table-scroll thead th { position: sticky; top: 0; z-index: 1; background: var(--surface); }
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 .dense th, .dense td { padding: 7px 12px; }
@@ -397,8 +400,9 @@ td.table-state { position: sticky; left: 0; max-width: calc(100vw - 32px); box-s
   .form-actions, .modal-footer { flex-wrap: wrap; }
   .fm-actions-full { display: none; }
   .fm-actions-compact { display: contents; }
-  .fm-path-form { margin-left: 0; width: 100%; flex-wrap: wrap; }
-  .fm-path-go { width: 100%; }
+  .fm-path-form { margin-left: 0; width: 100%; flex-wrap: nowrap; }
+  .fm-path-go { flex: 1; min-width: 0; width: auto; }
+  .service-looks-for { display: none; }
 }
 
 /* Collapsible home sections (Tools groups, Favorites card) */

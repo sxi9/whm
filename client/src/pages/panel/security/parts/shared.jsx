@@ -34,7 +34,8 @@ export function ImpersonationNotice({ actingAs, what }) {
   );
 }
 
-export function RequestError({ error, onRetry }) {
+// `title` / `hint` give a plain error a heading in the panel's words and a line on what to do.
+export function RequestError({ error, onRetry, title, hint }) {
   const { t } = useT();
   if (!error || isCapabilityError(error) || isFeatureDisabled(error)) return null;
   if (isImpersonating(error)) {
@@ -49,7 +50,7 @@ export function RequestError({ error, onRetry }) {
   if (error.code === 'limit_reached' || (error.status === 409 && /at most/i.test(error.message || ''))) {
     return <div className="banner banner-warning" role="alert"><AlertTriangle size={18} /><div><strong>{t('panel.security.limit_title', 'Limit reached')}</strong><p>{error.message}</p><p className="muted">{t('panel.security.limit_help', 'Remove one you no longer use.')}</p></div></div>;
   }
-  return <ErrorBanner error={error} onRetry={onRetry} />;
+  return <ErrorBanner error={error} onRetry={onRetry} title={title} hint={hint} />;
 }
 
 export function Digits({ value, onChange, id, autoFocus, disabled }) {

@@ -200,6 +200,8 @@ export default function RebootPage({ fn, mode }) {
         buttonLabel={spec.buttonLabel}
         confirmMessage={confirmMessage}
         typeToConfirm="REBOOT"
+        disabled={Boolean(data) && !data.capability.systemd}
+        disabledReason="systemctl is not installed on this server, so the panel cannot reboot it. Reboot from the console or your provider's control panel."
         run={async () => {
           const body = { reason: reason.trim() || undefined, ignoreActiveWork: warnings.length > 0 };
           const requestedAt = new Date().toISOString();

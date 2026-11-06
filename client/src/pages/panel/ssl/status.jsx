@@ -8,7 +8,7 @@ import { useToast } from '../../../components/Toast.jsx';
 import { PanelPage, PendingPill } from '../../../panel/PanelPage.jsx';
 import { usePanelApi, usePanelMe, panelApi } from '../../../panel/hooks/usePanel.js';
 import { PANEL_FUNCTION_BY_KEY } from '../../../panel/nav.js';
-import { DelegationBanners } from '../../../panel/DelegationBanner.jsx';
+import { DelegationBanners, sslDelegationText } from '../../../panel/DelegationBanner.jsx';
 import { useT } from '../../../i18n/useT.js';
 import { fill } from '../../../i18n/fill.js';
 import { RequestError, JobProgress, ExpiryPill, StatePill, TypePill, CertificateSummary, isCapabilityError, webResult } from './parts/Shared.jsx';
@@ -147,7 +147,7 @@ export default function SslStatus({ fn }) {
             </div>
           )}
 
-          <DelegationBanners domains={delegated} recordsFor={addressRecords} title={t('panel.ssl.delegation_title', 'Certificates need the name to resolve to this server')} />
+          <DelegationBanners domains={delegated} recordsFor={addressRecords} title={t('panel.ssl.delegation_title', 'Certificates need the name to resolve to this server')} text={sslDelegationText} />
 
           {issueError && <RequestError error={issueError} onRetry={() => setIssueError(null)} />}
 

@@ -167,7 +167,9 @@ export function TransferModal({ open, activations, onClose, onTransfer, busy }) 
   );
 }
 
-export default function LicenseTab({ fn }) {
+export const LICENSE_DESCRIPTION = 'Activate, replace or check in the license for this server. The key is entered only here.';
+
+export default function LicenseTab({ fn, header = true }) {
   const toast = useToast();
   const confirm = useConfirm();
   const { refresh } = useAuth();
@@ -210,7 +212,7 @@ export default function LicenseTab({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} title="License" description="Activate, replace or check in the license for this server. The key is entered only here." />
+      {header && <PageHeader fn={fn} title="License" description={LICENSE_DESCRIPTION} />}
       {loading && !license && <Loading />}
       <ErrorBanner error={error} onRetry={refetch} />
       {license && (

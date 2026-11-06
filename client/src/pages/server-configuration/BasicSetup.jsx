@@ -1,8 +1,8 @@
 import { ConfigPage } from '../../components/ConfigPage.jsx';
 
-export default function BasicSetup({ fn }) {
+export default function BasicSetup({ fn, header = true }) {
   return (
-    <ConfigPage fn={fn} prefix="basic." groups={[
+    <ConfigPage fn={fn} header={header} prefix="basic." groups={[
       { title: 'Contact information', fields: [
         { key: 'basic.contact_email', label: 'Server contact email address', type: 'text', inputType: 'email', help: 'Receives alerts, reports and license notices.' },
       ] },

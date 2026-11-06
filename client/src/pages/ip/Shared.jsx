@@ -1,4 +1,3 @@
-import { AlertTriangle } from 'lucide-react';
 import { useApi } from '../../hooks/useApi.js';
 import { StatusPill, CapabilityNotice } from '../../components/Common.jsx';
 import { InstallPackages } from '../../components/InstallPackages.jsx';
@@ -41,16 +40,9 @@ export function Iproute2Notice({ meta, onInstalled }) {
   if (!missing) return null;
   const names = iprouteQuery(pkg.data?.family);
   const known = Boolean(pkg.data);
-  return (
-    <div className="banner banner-warning">
-      <AlertTriangle size={18} />
-      <div>
-        <strong>iproute2 is not installed</strong>
-        <p>The <code>ip</code> command was not found, so addresses cannot be bound to or removed from interfaces. The inventory below is read-only until the <code>{known ? names[0] : 'iproute2'}</code> package is installed.</p>
-        {known && <InstallPackages packages={names} onFinished={onInstalled} />}
-      </div>
-    </div>
-  );
+  // The same notice as every other missing daemon; the install button appears once
+  // the package family is known, and the kit's Install Software link covers the rest.
+  return <CapabilityNotice error={{ code: 'capability_missing', message: `iproute2 is not installed: the ip command was not found, so addresses cannot be bound to or removed from interfaces. The inventory below is read-only until the ${known ? names[0] : 'iproute2'} package is installed.` }} packages={known ? names : undefined} onRetry={onInstalled} showRetry={false} />;
 }
 
 // Interface selector fed by GET /ip/interfaces; pre-fills the suggested device.

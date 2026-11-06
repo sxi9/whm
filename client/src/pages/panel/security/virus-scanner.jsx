@@ -106,7 +106,7 @@ export default function VirusScanner({ fn }) {
 
   return (
     <PanelPage fn={fn} actions={<Button icon={RefreshCw} onClick={() => refetch()}>{t('common.refresh', 'Refresh')}</Button>}>
-      {capability && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
+      {capability && <PanelCapabilityState card error={error} onRetry={refetch} />}
 
       <form onSubmit={start}>
         <Card title={t('panel.virus.start_title', 'Start a scan')} subtitle={t('panel.virus.start_subtitle', 'ClamAV reads your files as your own account and reports anything that matches a known signature. Nothing is changed by the scan itself.')}>

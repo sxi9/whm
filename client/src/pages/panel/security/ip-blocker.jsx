@@ -102,8 +102,8 @@ export default function IpBlocker({ fn }) {
       <Card title={t('panel.security.ip_blocked_title', 'Blocked addresses')} subtitle={rows.length ? fill(t('panel.security.ip_entries', '{count} of {max} entries'), { count: rows.length, max: data?.max || 500 }) : undefined} padded={false}>
         {capability && <div className="card-body"><PanelCapabilityState error={error} onRetry={refetch} /></div>}
         {noHome && <div className="card-body"><EmptyState icon={Ban} title={t('panel.security.no_home_title', 'No home directory yet')}><p>{error.message}</p></EmptyState></div>}
-        {!capability && !noHome && <div className="card-body" style={{ paddingBottom: 0 }}><RequestError error={error} onRetry={refetch} /></div>}
-        <DataTable
+        {!capability && !noHome && <div className="card-body" style={{ paddingBottom: 0 }}><RequestError error={error} onRetry={refetch} title={t('panel.security.load_error_title', 'The block list could not be read')} hint={t('panel.security.load_error_hint', 'Try again, or ask your hosting provider if this keeps happening.')} /></div>}
+        {!(error && !capability && !noHome) && <DataTable
           columns={[
             { key: 'entry', label: t('panel.security.ip_col_entry', 'Address or range'), render: (r) => <code>{r.entry}</code> },
             { key: 'kind', label: t('panel.security.ip_col_kind', 'Kind'), render: (r) => describeEntry(r.entry, t) },
@@ -111,7 +111,7 @@ export default function IpBlocker({ fn }) {
           rows={rows} loading={loading} error={null} rowKey={(r) => r.entry} dense
           rowActions={(r) => [{ label: t('panel.security.ip_unblock', 'Unblock'), danger: true, primary: true, onClick: () => remove(r) }]}
           emptyText={capability ? t('panel.security.ip_empty_capability', 'Blocked addresses appear here once the file manager is available on this server.') : t('panel.security.ip_empty', 'Nothing is blocked. Add an address or a range above; it takes effect on the next request.')}
-        />
+        />}
       </Card>
       <p className="muted small"><Plus size={12} /> {t('panel.security.ip_cidr_note', 'Ranges use CIDR notation: /24 covers 256 IPv4 addresses, /64 one typical IPv6 subnet.')}</p>
     </PanelPage>

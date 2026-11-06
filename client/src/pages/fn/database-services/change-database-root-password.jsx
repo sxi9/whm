@@ -42,7 +42,7 @@ export default function ChangeDatabaseRootPassword({ fn }) {
           <div style={{ marginBottom: 16 }}><ProfileSummary profile={profile} /></div>
           <Field label="New password" required help="Minimum strength 65; use the generator for a random password."><PasswordInput value={password} onChange={setPassword} /></Field>
           <FormActions><Button type="submit" variant="danger" loading={busy} disabled={!password || !profile}>Change {superuser} password</Button></FormActions>
-          {result && <div style={{ marginTop: 16 }}><KeyValue items={[['Result', <StatusPill key="r" status="ok">changed</StatusPill>], ['Hosts updated', result.hosts?.join(', ')], ['/root/.my.cnf', result.myCnfUpdated ? 'rewritten (0600)' : 'not changed'], ['Stored profile credentials', result.profileUpdated ? 'updated' : 'not applicable']]} /></div>}
+          {result && <div style={{ marginTop: 16 }}><KeyValue prose items={[['Result', <StatusPill key="r" status="ok">changed</StatusPill>], ['Hosts updated', result.hosts?.join(', ')], ['/root/.my.cnf', result.myCnfUpdated ? 'rewritten (0600)' : 'not changed'], ['Stored profile credentials', result.profileUpdated ? 'updated' : 'not applicable']]} /></div>}
         </Card>
       </form>
     </>

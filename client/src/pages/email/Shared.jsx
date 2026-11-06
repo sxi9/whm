@@ -3,6 +3,7 @@ import { Info, AlertTriangle } from 'lucide-react';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, CapabilityNotice, formatBytes } from '../../components/Common.jsx';
 import { Field, Select, TextInput } from '../../components/Form.jsx';
+import { NoAccountsState, accountCountText } from '../accounts/AccountPicker.jsx';
 import { RequestError, Tabs } from '../security/Shared.jsx';
 
 export { RequestError, Tabs };
@@ -117,13 +118,15 @@ export function IncludeHint({ apply }) {
 export function Bytes({ value }) { return <span>{formatBytes(value)}</span>; }
 
 // Account chooser for mailbox pages (root-only list of hosting accounts).
+// Same wording and empty state as the shared AccountPicker in pages/accounts.
 export function AccountPicker({ value, onChange, accounts, label = 'Account' }) {
   const [filter, setFilter] = useState('');
   const options = useMemo(() => (accounts || []).filter((a) => !filter || `${a.username} ${a.domain}`.toLowerCase().includes(filter.toLowerCase())).map((a) => ({ value: a.username, label: `${a.username} — ${a.domain}${a.suspended ? ' (suspended)' : ''}` })), [accounts, filter]);
+  if (accounts && accounts.length === 0) return <NoAccountsState />;
   return (
     <div className="form-grid">
       <Field label="Filter"><TextInput value={filter} onChange={setFilter} placeholder="Type to filter by user or domain" /></Field>
-      <Field label={label} help={`${(accounts || []).length} account(s) available`}><Select value={value} onChange={onChange} options={options} placeholder={accounts?.length ? 'Select an account' : 'No accounts yet'} /></Field>
+      <Field label={label} help={accounts ? accountCountText(accounts.length) : 'Loading accounts…'}><Select value={value} onChange={onChange} options={options} placeholder="Select an account" /></Field>
     </div>
   );
 }

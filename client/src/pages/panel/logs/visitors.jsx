@@ -74,8 +74,7 @@ export default function Visitors({ fn }) {
 
   return (
     <PanelPage fn={fn} actions={<Button icon={RefreshCw} onClick={() => refetch()}>{t('common.refresh', 'Refresh')}</Button>}>
-      {capability && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
-      {!capability && <PanelCapabilityState error={error} onRetry={refetch} />}
+      <PanelCapabilityState card={capability} error={error} onRetry={refetch} />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <p className="muted">{t('common.loading', 'Loading…')}</p>}
 

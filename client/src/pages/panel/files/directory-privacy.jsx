@@ -92,8 +92,8 @@ export default function DirectoryPrivacy({ fn }) {
         )}
       </Card>
 
-      {capability && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
-      {!capability && error && <Card><RequestError error={error} onRetry={refetch} />{error.status === 422 && <p className="muted">{t('panel.files.choose_folder_inside', 'Choose a folder inside')} <code>public_html</code> {t('panel.files.or_addon_folders', 'or one of your addon or subdomain folders.')}</p>}</Card>}
+      {capability && <PanelCapabilityState card error={error} onRetry={refetch} />}
+      {!capability && error && <Card><RequestError error={error} onRetry={refetch} title={t('panel.files.load_error_title', 'This folder could not be read')} hint={error.status === 422 ? undefined : t('panel.files.load_error_hint', 'Try again, or ask your hosting provider if this keeps happening.')} />{error.status === 422 && <p className="muted">{t('panel.files.choose_folder_inside', 'Choose a folder inside')} <code>public_html</code> {t('panel.files.or_addon_folders', 'or one of your addon or subdomain folders.')}</p>}</Card>}
 
       {!error && (
         <div className="grid-2">

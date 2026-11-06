@@ -41,14 +41,12 @@ export function EngineBanner({ status, loading, error, onRetry }) {
   if (!status) return null;
   const engineOk = status.profile && status.capabilities?.[status.profile.engine === 'postgres' ? 'postgres' : 'mysql'];
   return (
-    <Card>
-      <div className="stat-grid">
+    <div className="stat-grid" style={{ marginBottom: 18 }}>
         <div className="stat"><div className="label">Active profile</div><div className="value">{status.profile ? status.profile.profile_name : '—'}</div><div className="muted">{status.profile ? `${engineLabel(status.profile.engine)}${status.profile.host ? ` · ${status.profile.host}${status.profile.port ? `:${status.profile.port}` : ''}` : status.profile.is_local ? ' · local server' : ' · remote server'}` : <Link to="/database-services/manage-database-profiles">Add a profile</Link>}</div></div>
         <div className="stat"><div className="label">Server</div><div className="value">{status.version ? status.version.version : <StatusPill status={engineOk ? 'warning' : 'not-installed'}>{engineOk ? (status.error?.message || 'unreachable') : 'not installed'}</StatusPill>}</div><div className="muted">{status.detect?.engine ? `${engineLabel(status.detect.engine)} tooling detected` : 'no MySQL/MariaDB binaries found'}{status.detect?.postgres?.installed ? ' · PostgreSQL present' : ''}</div></div>
-        <div className="stat"><div className="label">Service</div><div className="value">{status.unit ? <StatusPill status={status.unit.state === 'active' ? 'active' : status.unit.state === 'not-installed' ? 'not-installed' : 'down'}>{status.unit.unit || 'no unit'} · {status.unit.state}</StatusPill> : <span className="muted">—</span>}</div><div className="muted">{status.unit?.pid ? `PID ${status.unit.pid}` : status.profile && !status.profile.is_local ? 'remote server' : ''}</div></div>
+        <div className="stat"><div className="label">Service</div><div className="value">{status.unit ? <StatusPill status={status.unit.state === 'active' ? 'active' : status.unit.state === 'not-installed' ? 'not-installed' : 'down'}>{status.unit.unit || 'no unit'} · {status.unit.state}</StatusPill> : <StatusPill status="not-installed">{status.profile && !status.profile.is_local ? 'remote' : 'no service unit'}</StatusPill>}</div><div className="muted">{status.unit?.pid ? `PID ${status.unit.pid}` : status.profile && !status.profile.is_local ? 'remote server' : status.unit ? '' : 'install MySQL/MariaDB to start one'}</div></div>
         <div className="stat"><div className="label">Managed</div><div className="value">{status.counts?.databases ?? 0} / {status.counts?.users ?? 0}</div><div className="muted">databases / users mapped to accounts{status.prefixing ? ' · prefixing on' : ''}</div></div>
-      </div>
-    </Card>
+    </div>
   );
 }
 

@@ -38,7 +38,7 @@ export default function PasswordStrengthConfiguration({ fn }) {
       { title: 'Default', fields: [
         { key: 'security.min_password_strength', label: 'Default minimum strength', type: 'number', min: 0, max: 100, help: '65 rejects dictionary words and short passwords; 80 requires mixed case, digits and symbols.' },
       ] },
-      { title: 'Per-context overrides', description: 'Empty = use the default.', fields: CONTEXTS.map(([ctx, label]) => ({ key: `security.password.strength.${ctx}`, label, type: 'number', min: 0, max: 100, placeholder: 'default' })) },
+      { title: 'Per-context overrides', description: 'Empty = use the default.', layout: 'grid', fields: CONTEXTS.map(([ctx, label]) => ({ key: `security.password.strength.${ctx}`, label, type: 'number', min: 0, max: 100, placeholder: 'default' })) },
     ]} />
   );
 }

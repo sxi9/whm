@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { Send, RefreshCw, Eye, Info } from 'lucide-react';
 import { api, queryString } from '../../api/client.js';
 import { useApi, useMutation } from '../../hooks/useApi.js';
-import { Card, KeyValue, Loading, StatusPill, formatDate } from '../../components/Common.jsx';
+import { Card, KeyValue, Loading, StatusPill, formatDate, RefreshButton } from '../../components/Common.jsx';
 import { DataTable, useTableState } from '../../components/DataTable.jsx';
 import { Field, TextInput, Textarea, Select, Toggle, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { Modal, useConfirm } from '../../components/Modal.jsx';
@@ -139,7 +139,7 @@ export function TicketList({ refreshKey = 0, onOpen }) {
     { key: 'created_at', label: 'Opened', sortable: true, render: (r) => formatDate(r.createdAt) },
   ];
   return (
-    <Card title="Tickets" subtitle="Every ticket opened from this server, whether or not it could be emailed." actions={<Button size="sm" icon={RefreshCw} onClick={() => refetch()}>Refresh</Button>} padded={false}>
+    <Card title="Tickets" subtitle="Every ticket opened from this server, whether or not it could be emailed." actions={<RefreshButton size="sm" onClick={() => refetch()} />} padded={false}>
       {error && <div className="card-body"><RequestError error={error} onRetry={refetch} /></div>}
       <DataTable columns={columns} rows={data || []} loading={loading} total={meta?.total} page={table.state.page} pageSize={table.state.pageSize} onPageChange={table.setPage}
         sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Search subject or reference…"

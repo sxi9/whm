@@ -81,7 +81,7 @@ export default function NginxManager({ fn }) {
             <Button size="sm" loading={busy === 'restart'} onClick={() => action('restart', () => api.post('/software/nginx/restart'))}>Restart</Button>
             <Button size="sm" onClick={viewConfig}>View config</Button>
           </>}>
-            <KeyValue items={[
+            <KeyValue prose items={[
               ['NGINX', data.installed ? <span key="v">{data.version || 'installed'} <StatusPill status={data.active ? 'active' : data.active === false ? 'inactive' : 'unknown'}>{data.active ? 'running' : data.active === false ? 'stopped' : 'unknown'}</StatusPill></span> : <StatusPill key="n" status="not-installed">not installed</StatusPill>],
               ['Managed config', <span key="c"><code className="small">{data.configPath}</code> <StatusPill status={data.proxyConfigured ? 'ok' : 'disabled'}>{data.proxyConfigured ? 'present' : 'absent'}</StatusPill></span>],
               data.proxy && ['Rendered', <span key="r">{data.proxy.domains} domains · cache {data.proxy.cache ? 'on' : 'off'} · backend :{data.proxy.apachePort} · {formatDate(data.proxy.generatedAt)} {data.settings.enabled && <StatusPill status={data.stale ? 'warning' : 'ok'}>{data.stale ? 'out of date' : 'current'}</StatusPill>}</span>],

@@ -21,7 +21,7 @@ export default function ShowResellerAccounts({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Every hosting account owned by a reseller, with its package, address and usage." />
-      {user?.role === 'root' && <Card title="Reseller"><ResellerPicker value={picked} onChange={setPicked} /></Card>}
+      {user?.role === 'root' && <Card title="Select a reseller"><ResellerPicker value={picked} onChange={setPicked} /></Card>}
       {reseller && <Summary items={[['Accounts', reseller.usage.accounts], ['Suspended', reseller.usage.suspended], ['Disk used', formatMb(reseller.usage.disk_used_mb)], ['Bandwidth used', formatMb(reseller.usage.bandwidth_used_mb)], ['Account limit', reseller.limits.max_accounts ?? 'Unlimited']]} />}
       {username && (
         <Card title={`Accounts owned by ${username}`} padded={false} actions={<Field inline><Select value={suspended} onChange={setSuspended} options={[{ value: 'false', label: 'Active only' }, { value: 'true', label: 'Suspended only' }]} placeholder="All accounts" /></Field>}>

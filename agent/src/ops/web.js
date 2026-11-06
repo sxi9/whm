@@ -211,7 +211,9 @@ export function phpLayout() {
 }
 
 export function phpSocket(version, user) {
-  const tree = phpLayout().versions.find((v) => v.version === version) || phpLayout().versions[0];
+  // An unknown version falls back to a distro tree, never to a Keel build whose sockets live elsewhere.
+  const layout = phpLayout().versions;
+  const tree = layout.find((v) => v.version === version) || layout.find((v) => v.flavor !== 'keel') || layout[0];
   const dir = tree?.socketDir || '/run/php';
   return `${dir}/php${version === 'system' ? '' : version}-fpm-${user}.sock`;
 }

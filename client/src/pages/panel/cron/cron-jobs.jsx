@@ -231,7 +231,7 @@ export default function CronJobs({ fn }) {
 
   return (
     <PanelPage fn={fn} actions={<Button icon={RefreshCw} onClick={() => refetch()}>Refresh</Button>}>
-      {capability && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
+      {capability && <PanelCapabilityState card error={error} onRetry={refetch} />}
       {!capability && error && <RequestError error={error} onRetry={refetch} />}
 
       <div className="grid-2">

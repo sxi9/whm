@@ -61,7 +61,7 @@ export default function PhpMyAdmin({ fn }) {
 
   return (
     <PanelPage fn={fn} actions={<>{open}<Button icon={RefreshCw} onClick={() => refetch()}>{t('common.refresh', 'Refresh')}</Button></>}>
-      {capability && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
+      {capability && <PanelCapabilityState card error={error} onRetry={refetch} />}
       {!capability && <RequestError error={error} onRetry={refetch} />}
       {loading && !data && <Card><Loading text={t('panel.databases.pma_checking', 'Checking phpMyAdmin…')} /></Card>}
       {data && (

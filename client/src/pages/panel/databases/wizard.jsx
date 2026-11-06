@@ -135,8 +135,8 @@ export default function DatabaseWizard({ fn }) {
         <p className="muted small" style={{ marginTop: 12, marginBottom: 0 }}>{t('panel.databases.wizard_intro', 'Three steps: the database, a user that signs in to it, and what that user may do. Each step is saved as you go, so you can leave after any of them.')}</p>
       </Card>
 
-      {missing && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
-      {isCapabilityError(formError) && <Card><PanelCapabilityState error={formError} /></Card>}
+      {missing && <PanelCapabilityState card error={error} onRetry={refetch} />}
+      {isCapabilityError(formError) && <PanelCapabilityState card error={formError} />}
       <RequestError error={formError} />
 
       {step === 0 && (

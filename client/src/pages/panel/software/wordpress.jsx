@@ -114,7 +114,7 @@ export default function WordPress({ fn }) {
 
   return (
     <PanelPage fn={fn} actions={<Button icon={RefreshCw} onClick={() => refetch()}>{t('common.refresh', 'Refresh')}</Button>}>
-      {capability && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
+      {capability && <PanelCapabilityState card error={error} onRetry={refetch} />}
 
       <form onSubmit={install}>
         <Card title={t('panel.software.install_title', 'Install WordPress')} subtitle={t('panel.software.install_subtitle', 'A fresh copy of the current release, with its own database, on one of your domains.')}>

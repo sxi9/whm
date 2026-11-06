@@ -100,7 +100,7 @@ export default function EditALocale({ fn }) {
             ]} />
             <TextInput type="search" placeholder="Search keys, English text or translations…" value={q} onChange={(v) => { setQ(v); setPage(1); }} aria-label="Search strings" style={{ marginBottom: 12 }} />
           </div>
-          <div className="table-wrap">
+          <div className="table-wrap table-scroll">
             <table>
               <thead><tr><th style={{ width: '28%' }}>Key</th><th style={{ width: '32%' }}>English</th><th>{locale.data.name}</th></tr></thead>
               <tbody>

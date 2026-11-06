@@ -85,7 +85,7 @@ export default function DatabaseUsers({ fn }) {
 
   return (
     <PanelPage fn={fn} actions={<Button icon={RefreshCw} onClick={() => { refetch(); dbs.refetch(); }}>{t('common.refresh', 'Refresh')}</Button>}>
-      {blocked && <Card><PanelCapabilityState error={capability ? error : dbs.error} onRetry={() => { refetch(); dbs.refetch(); }} /></Card>}
+      {blocked && <PanelCapabilityState card error={capability ? error : dbs.error} onRetry={() => { refetch(); dbs.refetch(); }} />}
       <form onSubmit={create}>
         <Card title={t('panel.databases.user_create_title', 'Create a database user')} subtitle={t('panel.databases.user_create_subtitle', 'Sites connect with a user, not with your account password.')}>
           <PanelCapabilityState error={isCapabilityError(formError) ? formError : null} />

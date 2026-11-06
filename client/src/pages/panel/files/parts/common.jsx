@@ -4,13 +4,14 @@ import { ErrorBanner } from '../../../../components/Form.jsx';
 import { useT } from '../../../../i18n/useT.js';
 import { isCapabilityError, isFeatureDisabled, segmentsOf } from './paths.js';
 
-export function RequestError({ error, onRetry }) {
+// `title` / `hint` give a plain error a heading in the panel's words and a line on what to do.
+export function RequestError({ error, onRetry, title, hint }) {
   const { t } = useT();
   if (!error || isCapabilityError(error) || isFeatureDisabled(error)) return null;
   if (error.code === 'exists') {
     return <div className="banner banner-warning" role="alert"><AlertTriangle size={18} /><div><strong>{t('panel.files.already_exists', 'Already exists')}</strong><p>{error.message}</p></div></div>;
   }
-  return <ErrorBanner error={error} onRetry={onRetry} />;
+  return <ErrorBanner error={error} onRetry={onRetry} title={title} hint={hint} />;
 }
 
 // The folder trail: home, then one button per segment. `hrefFor` makes the

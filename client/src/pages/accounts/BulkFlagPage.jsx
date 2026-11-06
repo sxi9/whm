@@ -56,12 +56,12 @@ export function BulkFlagPage({ fn, flag, endpoint, onLabel, offLabel, descriptio
           rowActions={(r) => [r[flag] ? { label: offLabel, primary: true, onClick: () => apply(false, [r.username]) } : { label: onLabel, primary: true, onClick: () => apply(true, [r.username]) }]}
           toolbar={(
             <>
-              <Button variant="primary" disabled={!selected.length} loading={busy} onClick={() => apply(true, selected)}>{onLabel} ({selected.length})</Button>
-              <Button disabled={!selected.length} loading={busy} onClick={() => apply(false, selected)}>{offLabel} ({selected.length})</Button>
-              <Button variant="ghost" loading={busy} disabled={!data?.length} onClick={() => apply(true, [], true)}>{onLabel} for all</Button>
+              {selected.length > 0 && <Button variant="primary" loading={busy} onClick={() => apply(true, selected)}>{onLabel} ({selected.length})</Button>}
+              {selected.length > 0 && <Button loading={busy} onClick={() => apply(false, selected)}>{offLabel} ({selected.length})</Button>}
+              <Button loading={busy} disabled={!data?.length} onClick={() => apply(true, [], true)}>{onLabel} for all accounts</Button>
             </>
           )}
-          emptyText="No accounts match this filter."
+          emptyText={filter ? 'No accounts match this filter.' : 'No accounts yet. Accounts you create appear here.'}
         />
       </Card>
       {last && (

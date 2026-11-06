@@ -167,7 +167,7 @@ export default function Apps({ fn }) {
 
   return (
     <PanelPage fn={fn} actions={<Button icon={RefreshCw} onClick={() => refetch()}>{t('common.refresh', 'Refresh')}</Button>}>
-      {capability && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
+      {capability && <PanelCapabilityState card error={error} onRetry={refetch} />}
 
       <form onSubmit={create}>
         <Card title={t('panel.apps.create_title', 'Add an application')} subtitle={t('panel.apps.create_subtitle', 'Upload your program to a folder of your home directory first; the panel starts it as a service on its own port and forwards a path of your domain to it.')}>

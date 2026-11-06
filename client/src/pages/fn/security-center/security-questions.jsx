@@ -11,7 +11,7 @@ export default function SecurityQuestions({ fn }) {
           { key: 'security.questions.allow_custom', label: 'Allow users to write their own questions', type: 'toggle' },
         ] },
         { title: 'Question pool', description: 'One question per entry; users will pick from this list once enforcement lands.', fields: [
-          { key: 'security.questions.pool', label: 'Questions', type: 'list', help: 'Comma-separated. Keep answers hard to look up on social media.' },
+          { key: 'security.questions.pool', label: 'Questions', type: 'list', help: 'One per line. Keep answers hard to look up on social media.' },
         ] },
       ]} />
   );

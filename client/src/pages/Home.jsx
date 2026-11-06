@@ -59,8 +59,8 @@ export function HomePage() {
 
         <Card title="Tools" actions={(
           <>
-            <button type="button" className="link-button" onClick={() => sections.expandAll(CATEGORIES.map((c) => c.slug))}><ChevronsUpDown size={14} /> Expand all</button>
-            <button type="button" className="link-button" onClick={() => sections.collapseAll(CATEGORIES.map((c) => c.slug))}><ChevronsDownUp size={14} /> Collapse all</button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => sections.expandAll(CATEGORIES.map((c) => c.slug))}><ChevronsUpDown size={14} /> Expand all</button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => sections.collapseAll(CATEGORIES.map((c) => c.slug))}><ChevronsDownUp size={14} /> Collapse all</button>
             <div className="search inline">
               <Search size={16} />
               <input className="input" placeholder="Filter tools…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Filter tools" />

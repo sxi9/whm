@@ -73,7 +73,7 @@ export default function AccessLogs({ fn }) {
         <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>{t('panel.logs.skipped_title', 'Some log locations were skipped')}</strong><ul>{data.warnings.map((w) => <li key={w}>{w}</li>)}</ul></div></div>
       )}
       {/* The missing web server is said once, above the grid; the pickers stay so another server can be chosen. */}
-      {missing && <Card><PanelCapabilityState error={missing} onRetry={refetch} /></Card>}
+      {missing && <PanelCapabilityState card error={missing} onRetry={refetch} />}
       <div className="grid-2">
         <Card title={t('panel.logs.choose_title', 'Choose a log')} subtitle={missing ? fill(t('panel.logs.files_empty_capability', 'Log files appear here once {kind} is available on this server.'), { kind: kindLabel }) : t('panel.logs.choose_subtitle', 'Raw web server logs for the domains on this account.')}>
           <RequestError error={error} onRetry={refetch} />

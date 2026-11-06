@@ -153,7 +153,9 @@ describe('Deliverability and SSL status with public DNS elsewhere', () => {
     fixtures['/panel/domains'] = listFixture(elsewhere);
     const html = page('panel:ssl/status', SslStatus);
     expect(html).toContain('Certificates need the name to resolve to this server');
-    expect(html).toContain(BANNER);
+    // SSL status adds nothing to the zone, so its banner asks for the address record instead of the DNS wording.
+    expect(html).toContain('DNS for demo.example.com is managed at betty.ns.cloud.example, roman.ns.cloud.example; make sure its A/AAAA record points at this server before requesting a certificate');
+    expect(html).not.toContain('records you add here are not published');
     expect(html).toContain('demo.example.com A 203.0.113.10');
     expect(html).toContain('www.demo.example.com A 203.0.113.10');
     expect(html).toContain('shop.demo.example.com A 203.0.113.10');

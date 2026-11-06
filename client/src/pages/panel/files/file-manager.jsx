@@ -231,7 +231,7 @@ export default function FileManager({ fn }) {
           </form>
         </div>
         {capability && <div className="card-body"><PanelCapabilityState error={error} onRetry={refetch} /></div>}
-        {!capability && error && <div className="card-body" style={{ paddingBottom: 0 }}><RequestError error={error} onRetry={refetch} /></div>}
+        {!capability && error && <div className="card-body" style={{ paddingBottom: 0 }}><RequestError error={error} onRetry={refetch} title={t('panel.files.load_error_title', 'This folder could not be read')} hint={t('panel.files.load_error_hint', 'Try again, or ask your hosting provider if this keeps happening.')} /></div>}
         {listing?.truncated && <div className="card-body"><div className="banner banner-warning" style={{ marginBottom: 0 }}><AlertTriangle size={18} /><div><strong>{fill(t('panel.files.truncated_listing', 'Only the first {shown} of {total} entries are shown'), { shown: entries.length.toLocaleString(), total: listing.total.toLocaleString() })}</strong><p>{t('panel.files.truncated_listing_help', 'Use the search to find the rest, or split this folder up.')}</p></div></div></div>}
         <DataTable
           dense

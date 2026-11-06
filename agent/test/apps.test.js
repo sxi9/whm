@@ -175,7 +175,7 @@ describe('read-only ops', () => {
 });
 
 describe('vhost proxies (web.vhost.write)', () => {
-  const VHOST = { domain: 'example.com', aliases: [], docroot: '/home/alice/public_html', user: 'alice', redirects: [], customDirectives: '', meta: {}, port: 80, sslPort: 443, phpVersion: '8.3' };
+  const VHOST = { domain: 'example.com', aliases: [], docroot: '/home/alice/public_html', user: 'alice', redirects: [], customDirectives: '', meta: {}, port: 80, sslPort: 443, phpVersion: '8.3', ssl: { cert: '/etc/ssl/whm/example.com/cert.pem', key: '/etc/ssl/whm/example.com/key.pem' } };
   it('renders ProxyPass blocks inside proxy_http_module, longest mount first, with the WebSocket rewrite when asked', () => {
     const text = renderVhost({ ...VHOST, proxies: [{ path: '/', port: 31002, websocket: false }, { path: '/probe-app', port: 31000, websocket: true }, { path: '/probe-app/admin', port: 31001, websocket: false }] });
     expect(text).toContain('# whm-vhost ');

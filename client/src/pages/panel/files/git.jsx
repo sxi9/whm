@@ -147,7 +147,7 @@ export default function Git({ fn }) {
 
   return (
     <PanelPage fn={fn} actions={<><Button icon={RefreshCw} onClick={() => refetch()}>{t('common.refresh', 'Refresh')}</Button><Button variant="primary" icon={Plus} onClick={() => setSheet(true)} disabled={capability}>{t('panel.git.new', 'New repository')}</Button></>}>
-      {capability && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
+      {capability && <PanelCapabilityState card error={error} onRetry={refetch} />}
 
       <Card title={t('panel.git.list_title', 'Your repositories')} subtitle={meta ? fill(t('panel.git.list_count', '{count} of {max}'), { count: rows.length, max: meta.max }) : undefined} padded={false}>
         <DataTable

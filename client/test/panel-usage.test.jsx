@@ -98,7 +98,8 @@ describe('Usage page', () => {
     const html = render(<Usage fn={fn} />);
     expect(html).toContain('<div class="value">512 MB</div><div class="muted small">unlimited</div>');
     expect(html).toContain('<div class="value">0 B</div><div class="muted small">unlimited</div>');
-    expect(html).toContain('From the last scan');
+    expect(html).toContain('Not measured yet');
+    expect(html).not.toContain('From the last scan');
     expect(html).not.toContain('data-stat="inodes"');
     expect(html).toContain('No scan yet');
     expect(html).toContain('No traffic recorded yet');

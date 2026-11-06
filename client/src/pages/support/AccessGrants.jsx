@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { KeyRound, RefreshCw, ShieldOff, Clock, AlertTriangle, Info } from 'lucide-react';
 import { api, queryString } from '../../api/client.js';
 import { useApi, useMutation } from '../../hooks/useApi.js';
-import { Card, KeyValue, Loading, StatusPill, formatDate } from '../../components/Common.jsx';
+import { Card, KeyValue, Loading, StatusPill, formatDate, RefreshButton } from '../../components/Common.jsx';
 import { InstallPackages } from '../../components/InstallPackages.jsx';
 import { DataTable, useTableState } from '../../components/DataTable.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
@@ -138,7 +138,7 @@ export function GrantList({ refreshKey = 0, onChanged }) {
   ];
   return (
     <>
-      <Card title="Grants" subtitle="Active grants are checked every five minutes and ended the moment they are overdue. A grant whose key could not be removed stays in “cleanup pending” and is retried on every run." actions={<><Button size="sm" icon={Clock} loading={busy} onClick={expireDue}>Expire overdue now</Button><Button size="sm" icon={RefreshCw} onClick={() => refetch()}>Refresh</Button></>}>
+      <Card title="Grants" subtitle="Active grants are checked every five minutes and ended the moment they are overdue. A grant whose key could not be removed stays in “cleanup pending” and is retried on every run." actions={<><Button size="sm" icon={Clock} loading={busy} onClick={expireDue}>Expire overdue now</Button><RefreshButton size="sm" onClick={() => refetch()} /></>}>
         <RequestError error={error} onRetry={refetch} />
         <DataTable columns={columns} rows={data || []} loading={loading} total={meta?.total} page={table.state.page} pageSize={table.state.pageSize} onPageChange={table.setPage}
           sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Search label or fingerprint…"

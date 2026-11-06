@@ -30,7 +30,7 @@ export default function PhpMyAdmin({ fn }) {
       {data && (
         <>
           <Card title="Status" actions={data.url && <a className="btn btn-primary" href={data.url} target="_blank" rel="noreferrer noopener"><ExternalLink size={16} /> Open phpMyAdmin</a>}>
-            <KeyValue items={[
+            <KeyValue prose items={[
               ['Installed', <StatusPill key="i" status={data.installed ? 'installed' : 'not-installed'}>{data.installed ? `yes${data.version ? ` — version ${data.version}` : ''}` : 'not found'}</StatusPill>],
               ['Location', data.dir ? <code key="d">{data.dir}</code> : '—'],
               ['Configuration', data.configFile ? <code key="c">{data.configFile}</code> : '—'],

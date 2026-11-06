@@ -6,9 +6,11 @@ import { Field, TextInput, NumberInput, Select, Toggle, Textarea, FormActions, B
 import { useToast } from './Toast.jsx';
 
 // Renders a settings schema as grouped fields backed by GET/PUT /system/settings.
-// groups: [{ title, description, fields: [{ key, label, type, help, options, placeholder, parse }] }]
+// groups: [{ title, description, layout, fields: [{ key, label, type, help, options, placeholder, parse }] }]
+// layout: 'grid' lays the group's fields out two per row (.form-grid) for short numeric settings.
+// header={false} leaves the PageHeader to a wrapper that renders tabs under its own header.
 // type: text | number | toggle | select | textarea | list (comma-separated → array)
-export function ConfigPage({ fn, title, description, prefix, groups, onSaved, extra }) {
+export function ConfigPage({ fn, title, description, prefix, groups, onSaved, extra, header = true }) {
   const toast = useToast();
   const { data, loading, error, refetch } = useApi(`/system/settings?prefix=${encodeURIComponent(prefix)}`);
   const [draft, setDraft] = useState({});
@@ -39,12 +41,14 @@ export function ConfigPage({ fn, title, description, prefix, groups, onSaved, ex
 
   return (
     <>
-      <PageHeader fn={fn} title={title} description={description} />
+      {header && <PageHeader fn={fn} title={title} description={description} />}
       {loading && !data && <Loading />}
       <ErrorBanner error={error} onRetry={refetch} />
       {data && groups.map((g) => (
         <Card key={g.title} title={g.title} subtitle={g.description} className="config-fields">
-          {g.fields.map((f) => <ConfigField key={f.key} field={f} value={draft[f.key]} onChange={(v) => set(f.key, v)} />)}
+          {g.layout === 'grid'
+            ? <div className="form-grid">{g.fields.map((f) => <ConfigField key={f.key} field={f} value={draft[f.key]} onChange={(v) => set(f.key, v)} />)}</div>
+            : g.fields.map((f) => <ConfigField key={f.key} field={f} value={draft[f.key]} onChange={(v) => set(f.key, v)} />)}
         </Card>
       ))}
       {extra}

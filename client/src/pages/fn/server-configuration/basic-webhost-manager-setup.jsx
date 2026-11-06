@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import BasicSetup from '../../server-configuration/BasicSetup.jsx';
-import LicenseTab from '../../server-configuration/LicenseTab.jsx';
+import LicenseTab, { LICENSE_DESCRIPTION } from '../../server-configuration/LicenseTab.jsx';
+import { PageHeader } from '../../../components/Common.jsx';
 import { Tabs } from '../../security/Shared.jsx';
 
 export const TABS = [{ value: 'settings', label: 'Settings' }, { value: 'license', label: 'License' }];
@@ -14,8 +15,9 @@ export default function BasicWebhostManagerSetup({ fn }) {
   useEffect(() => { if (location.hash === '#license') setTab('license'); }, [location.hash]);
   return (
     <>
+      <PageHeader fn={fn} description={tab === 'license' ? LICENSE_DESCRIPTION : undefined} />
       <Tabs tabs={TABS} value={tab} onChange={setTab} />
-      {tab === 'license' ? <LicenseTab fn={fn} /> : <BasicSetup fn={fn} />}
+      {tab === 'license' ? <LicenseTab fn={fn} header={false} /> : <BasicSetup fn={fn} header={false} />}
     </>
   );
 }

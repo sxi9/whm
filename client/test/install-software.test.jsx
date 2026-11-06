@@ -299,9 +299,11 @@ describe('pages that used to link to the package search', () => {
     expect(html).toContain('>Available<');
     expect(html).toContain('>Installed<');
     expect(html).toContain('ppa:ondrej/php has no packages for Ubuntu resolute');
-    expect(html).toMatch(/<button type="button" class="btn btn-primary btn-sm[^"]*" disabled="" title="ppa:ondrej\/php has no packages for Ubuntu resolute">Install<\/button>/);
-    expect(html).toMatch(/<button type="button" class="btn btn-primary btn-sm[^"]*">Install<\/button>/);
-    expect(html).toMatch(/<button type="button" class="btn btn-primary btn-sm[^"]*" title="Built from the php.net source into \/opt\/keel\/php\/8.1">Install<\/button>/);
+    expect(html).toMatch(/<button type="button" class="btn btn-default btn-sm[^"]*" disabled="" title="ppa:ondrej\/php has no packages for Ubuntu resolute">Install<\/button>/);
+    expect(html).toMatch(/<button type="button" class="btn btn-default btn-sm[^"]*">Install<\/button>/);
+    expect(html).toMatch(/<button type="button" class="btn btn-default btn-sm[^"]*" title="Built from the php.net source into \/opt\/keel\/php\/8.1">Install<\/button>/);
+    // Rows keep the grey button: the page's one primary action lives in its header.
+    expect(html).not.toMatch(/class="btn btn-primary btn-sm[^"]*"[^>]*>Install<\/button>/);
     expect((html.match(/disabled=""[^>]*>Install<\/button>/g) || []).length).toBe(1);
     expect(html).toContain('>Source build<');
     expect(html).toContain('/opt/keel/php/8.1</code>');

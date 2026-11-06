@@ -201,16 +201,17 @@ export function ApiReference({ scope, note }) {
       {data && (
         <>
           <div className="stat-grid" style={{ marginBottom: 14 }}>
-            <Stat label="Endpoints" value={data.total} hint={`${shown} shown`} />
+            <Stat label="Endpoints" value={data.total} hint={`${shown} shown · ${data.groups.length} ${data.groups.length === 1 ? 'group' : 'groups'}`} />
             {Object.entries(data.byMethod).map(([m, n]) => <Stat key={m} label={m} value={n} />)}
-            <Stat label="Groups" value={data.groups.length} />
           </div>
           <Card title="Endpoints" subtitle="Generated live from the mounted Express routers: every path, method and the role it requires. Pick one to expand a curl example under it." padded={false}
             actions={<><Button size="sm" icon={Download} loading={downloading} onClick={downloadSpec}>openapi.json</Button><Button size="sm" onClick={() => refetch()}>Refresh</Button></>}>
             <div className="datatable-toolbar" style={{ padding: 12 }}>
-              <TextInput placeholder="Filter by path…" value={q} onChange={setQ} style={{ maxWidth: 320 }} />
-              <Select value={method} onChange={setMethod} placeholder="All methods" options={['GET', 'POST', 'PUT', 'PATCH', 'DELETE']} style={{ maxWidth: 140 }} />
-              <Select value={role} onChange={setRole} placeholder="All roles" options={[{ value: 'root', label: 'root only' }, { value: 'reseller', label: 'root + reseller' }, { value: 'any', label: 'any principal' }]} style={{ maxWidth: 180 }} />
+              <div className="datatable-actions" style={{ flexWrap: 'wrap' }}>
+                <TextInput placeholder="Filter by path…" value={q} onChange={setQ} style={{ width: 320, maxWidth: '100%' }} />
+                <Select value={method} onChange={setMethod} placeholder="All methods" options={['GET', 'POST', 'PUT', 'PATCH', 'DELETE']} style={{ width: 140 }} />
+                <Select value={role} onChange={setRole} placeholder="All roles" options={[{ value: 'root', label: 'root only' }, { value: 'reseller', label: 'root + reseller' }, { value: 'any', label: 'any principal' }]} style={{ width: 180 }} />
+              </div>
             </div>
             {groups.length === 0 && <p className="muted" style={{ padding: 14 }}>No endpoints match this filter. Clear it to see every group again.</p>}
             {groups.map((g) => (

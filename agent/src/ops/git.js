@@ -188,6 +188,7 @@ export function planTasks(tasks, { home, repo }) {
         continue;
       }
       if (spec.mode && !modeSeen) {
+        if (/^[ugoa]*[+=-][rwxXst]*[st]/.test(w) || /[+=-][^,]*[st]/.test(w)) throw new OpError('refused', `task "${line}": setuid/setgid/sticky bits are never granted`);
         if (!TASK_MODE_RE.test(w)) throw new OpError('invalid_args', `task "${line}": "${w}" is not a file mode`);
         if (/^0?[0-7]{4}$/.test(w) && (parseInt(w, 8) & 0o6000)) throw new OpError('refused', `task "${line}": setuid/setgid modes are never granted`);
         if (/[st]/.test(w)) throw new OpError('refused', `task "${line}": setuid/setgid modes are never granted`);

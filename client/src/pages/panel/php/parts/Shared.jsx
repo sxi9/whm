@@ -1,4 +1,4 @@
-import { Card, StatusPill } from '../../../../components/Common.jsx';
+import { StatusPill } from '../../../../components/Common.jsx';
 import { ErrorBanner } from '../../../../components/Form.jsx';
 import { PanelCapabilityState, FeatureDisabledState, PendingPill } from '../../../../panel/PanelPage.jsx';
 
@@ -11,8 +11,7 @@ export function RequestError({ error, fn, onRetry, inline = false }) {
   if (!error) return null;
   if (error.status === 403 && error.code === 'feature_disabled') return <FeatureDisabledState fn={fn} />;
   if (isCapabilityError(error)) {
-    const state = <PanelCapabilityState error={error} onRetry={onRetry} />;
-    return inline ? state : <Card>{state}</Card>;
+    return <PanelCapabilityState card={!inline} error={error} onRetry={onRetry} />;
   }
   return <ErrorBanner error={error} onRetry={onRetry} />;
 }

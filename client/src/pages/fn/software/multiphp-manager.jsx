@@ -199,7 +199,7 @@ export default function MultiPhpManager({ fn }) {
                       <td>{v.installed ? v.domains ?? 0 : <span className="muted">—</span>}</td>
                       <td style={{ whiteSpace: 'nowrap' }}><Toggle checked={Boolean(v.offered)} disabled={!v.installed || busy} onChange={(on) => setOffered(v, on)} label={v.installed ? (v.offered ? 'Offered' : 'Hidden') : 'Install first'} /></td>
                       <td className="actions-col">
-                        {!v.installed && <Button size="sm" variant="primary" loading={runner.busy} disabled={v.state === 'unsupported'} title={v.state === 'unsupported' ? v.note || 'Not available for this OS' : v.method === 'source' ? `Built from the php.net source into ${PHP_SOURCE_PREFIX}/${v.id}` : undefined} onClick={() => install(v)}>Install</Button>}
+                        {!v.installed && <Button size="sm" loading={runner.busy} disabled={v.state === 'unsupported'} title={v.state === 'unsupported' ? v.note || 'Not available for this OS' : v.method === 'source' ? `Built from the php.net source into ${PHP_SOURCE_PREFIX}/${v.id}` : undefined} onClick={() => install(v)}>Install</Button>}
                         {v.installed && v.update?.candidate && <Button size="sm" variant={v.update.severity === 'critical' ? 'danger' : 'primary'} loading={runner.busy} title={v.update.reasons?.join('\n') || undefined} onClick={() => update(v)}>Update to {v.update.candidate}</Button>}
                         {v.installed && v.update && !v.update.candidate && <span className="muted small" title={v.update.reasons?.join('\n') || undefined}>no fix available yet</span>}
                         {v.installed && !v.isSystemDefault && <Button size="sm" loading={busy} onClick={() => setDefault(v.id)}>Set as default</Button>}

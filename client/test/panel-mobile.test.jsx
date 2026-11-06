@@ -81,7 +81,9 @@ describe('phone layout rules (plan P1-11)', () => {
     expect(rule(phoneBlock, '.fm-actions-full')).toBe('display: none;');
     expect(rule(phoneBlock, '.fm-actions-compact')).toBe('display: contents;');
     expect(css).toContain('.fm-path-go { width: 300px;');
-    expect(rule(phoneBlock, '.fm-path-go')).toBe('width: 100%;');
+    // The Go field fills the row next to its Go button instead of pushing it onto a third line.
+    expect(rule(phoneBlock, '.fm-path-form')).toBe('margin-left: 0; width: 100%; flex-wrap: nowrap;');
+    expect(rule(phoneBlock, '.fm-path-go')).toBe('flex: 1; min-width: 0; width: auto;');
   });
 });
 

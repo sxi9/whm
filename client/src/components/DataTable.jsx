@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp, ChevronsUpDown, Search, ChevronLeft, ChevronRig
 import { Menu } from './Menu.jsx';
 
 export function DataTable({
+  collapseRow,
   columns, rows = [], loading = false, error = null, emptyText = 'No records to show yet',
   total = null, page = 1, pageSize = 50, onPageChange, sort, dir = 'asc', onSortChange,
   searchable = false, q = '', onSearch, searchPlaceholder = 'Search…',
@@ -59,7 +60,14 @@ export function DataTable({
               return (
                 <tr key={k} className={selected.includes(k) ? 'is-selected' : ''}>
                   {selectable && <td className="select-col"><input type="checkbox" checked={selected.includes(k)} onChange={() => toggleOne(k)} disabled={!canSelect(row)} aria-label={`Select ${k}`} /></td>}
-                  {columns.map((col) => <td key={col.key} className={col.align ? `align-${col.align}` : ''}>{col.render ? col.render(row) : row[col.key] ?? <span className="muted">—</span>}</td>)}
+                  {(() => {
+                    // collapseRow(row) returns the text for a row that has nothing to show in its
+                    // trailing columns: the first column stays, the rest become one muted cell.
+                    const collapsed = collapseRow ? collapseRow(row) : null;
+                    if (collapsed == null) return columns.map((col) => <td key={col.key} className={col.align ? `align-${col.align}` : ''}>{col.render ? col.render(row) : row[col.key] ?? <span className="muted">—</span>}</td>);
+                    const [first, ...rest] = columns;
+                    return <><td key={first.key}>{first.render ? first.render(row) : row[first.key]}</td><td key="collapsed" className="muted" colSpan={rest.length}>{collapsed}</td></>;
+                  })()}
                   {rowActions && <td className="actions-col"><RowActions actions={rowActions(row)} /></td>}
                 </tr>
               );

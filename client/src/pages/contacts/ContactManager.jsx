@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Plus, Send, Play, RefreshCw, AlertTriangle, Info } from 'lucide-react';
+import { Plus, Send, Play, AlertTriangle, Info } from 'lucide-react';
 import { api, queryString } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
-import { Card, StatusPill, Loading, KeyValue, CapabilityNotice, formatDate } from '../../components/Common.jsx';
+import { Card, StatusPill, Loading, KeyValue, CapabilityNotice, formatDate, RefreshButton } from '../../components/Common.jsx';
 import { DataTable, useTableState } from '../../components/DataTable.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { Modal, useConfirm } from '../../components/Modal.jsx';
@@ -284,7 +284,7 @@ function DeliveryLog({ version, events }) {
   useEffect(() => { refetch(); }, [version]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <Card title="Delivery log" subtitle="Every notification attempt, including tests and the copies mailed to root." padded={false} actions={<Button size="sm" icon={RefreshCw} onClick={() => refetch()}>Refresh</Button>}>
+    <Card title="Delivery log" subtitle="Every notification attempt, including tests and the copies mailed to root." padded={false} actions={<RefreshButton size="sm" onClick={() => refetch()} />}>
       <DataTable dense rows={data || []} loading={loading} error={error} total={meta?.total} page={table.state.page} pageSize={table.state.pageSize} onPageChange={table.setPage}
         sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Search subject, address, error…"
         toolbar={(

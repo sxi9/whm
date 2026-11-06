@@ -138,7 +138,7 @@ export function SubjectFields({ value, onChange }) {
       <Field label="Organizational unit (OU)"><TextInput value={value.OU} onChange={set('OU')} placeholder="IT" /></Field>
       <Field label="City (L)"><TextInput value={value.L} onChange={set('L')} /></Field>
       <Field label="State / province (ST)"><TextInput value={value.ST} onChange={set('ST')} /></Field>
-      <Field label="Country (C)" help="Two-letter ISO code, e.g. US, DE."><TextInput value={value.C} onChange={(v) => set('C')(v.toUpperCase())} maxLength={2} style={{ maxWidth: 80 }} /></Field>
+      <Field label="Country (C)" help="Two-letter ISO code, e.g. US, DE."><TextInput value={value.C} onChange={(v) => set('C')(v.toUpperCase())} maxLength={2} placeholder="US" /></Field>
       <Field label="Contact email"><TextInput value={value.emailAddress} onChange={set('emailAddress')} type="email" /></Field>
     </>
   );

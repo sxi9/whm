@@ -73,7 +73,7 @@ export function RedirectsTable({ rows, loading, error, onEdit, onRemove, emptyTe
     { key: 'updatedAt', label: t('panel.domains.col_updated', 'Updated'), render: (r) => (r.redirect ? formatDate(r.redirect.updatedAt) : <span className="muted">—</span>) },
   ];
   return (
-    <DataTable columns={columns} rows={rows} loading={loading} error={error} emptyText={emptyText} rowKey={(r) => r.domain}
+    <DataTable columns={columns} rows={rows} loading={loading} error={error} emptyText={emptyText} rowKey={(r) => r.domain} collapseRow={(r) => (r.redirect ? null : t('panel.domains.no_redirect_yet', 'No redirect yet'))}
       rowActions={(r) => (r.redirect
         ? [{ label: t('panel.domains.edit', 'Edit'), primary: true, onClick: () => onEdit(r) }, { label: t('panel.domains.remove', 'Remove'), primary: true, danger: true, onClick: () => onRemove(r) }]
         : single ? [] : [{ label: t('panel.domains.add_redirect', 'Add redirect'), primary: true, onClick: () => onEdit(r) }])} />
