@@ -33,6 +33,7 @@ license + marketplace service with its own React portals (`hub/ui`) · zod 4 eve
 | **Phase 7 — identity** | done: default branding "Keel" (migration `028c`, operators change it under Panel › Customization), labels renamed with **stable keys/routes** via slug overrides in `client/src/nav.js`, i18n catalog, docs (README/INSTALL/MANUAL/SDK), server/agent/hub user-visible strings (legacy managed-block markers still recognised on upgraded hosts), support links, `keel@` sender, `KEEL-` ticket refs | `22001ff`…`643e0a6` |
 | hub/ui portals | on the new kit (`18fe699`; `hub/ui/src/components/SYNC.md`) | hub-ui suite |
 | **Provisioned-host verification** (`nova.hostingsignal.in`, Ubuntu 26.04, EC2) | **done 2026-11-04/05**: 10 probe areas (mail, FTP, MySQL, web/PHP/DNS, SSL, backups/cron/quota, admin API walk, account-panel API walk, security posture, log-derived bugs), 29 confirmed findings (1 refuted), each adversarially verified; every finding with a code component fixed in three rounds under two review lenses; host-side fixes applied (AutoSSL live, ManageSieve 2000 off, fail2ban jails, PureDB auth link, Cloudflare nameservers); the code fixes are **uncommitted and not yet deployed** — §4 lists the deploy and the remaining host steps | `server/test/{http-redirect,request-log,capabilities,services}.test.js`, `agent/test/pkg-backports.test.js`, `client/test/exim-virtual-mail.test.jsx`, extended panel-*/service-configuration/ssl-tls/security-center/vmail/ftp/db/files suites; `https://testuser.hostingsignal.in` serves a Let's Encrypt certificate |
+| **2026-11-06 session 3** | **done and live at `a5d2d19`**: UI round (collapsing, menus, 332-screenshot sweep), direct updates + Updates column (§63), phpMyAdmin admin SSO (§44), Phase 8 P3 (§64–§67) and P4 (§68–§70), PHP removal guards + host-apps pool (§52/§41) | `client/test/{menu,home-collapse,home-updates,phpmyadmin-admin,panel-git,panel-apps,panel-terminal,panel-users,panel-calendars}.test.jsx`, `server/test/{panel-git,panel-apps,panel-terminal,panel-users,dav,auth-2fa-users}.test.js`, `agent/test/{git,apps,term,dav,pkg-runtime}.test.js` |
 | **2026-11-06 PHP source builds + Phase 8 P2** | **done and live on nova**: every catalog PHP version installable (source builds into `/opt/keel/php`, contracts §51/§52), and P2 — plugin pages in /panel, Database Wizard, Errors, Optimize/Hotlink, Track DNS, Dynamic DNS, Virus Scanner, raw-chunk uploads, a11y/wording, quota note, spam docs (contracts §53–§62, migration 034e); §4 "Phase 8 P2 host steps" | `agent/test/{pkg-runtime,ops-imports,dns-track,files-htaccess-web,sec-clamav-as}.test.js`, `server/test/panel-{plugins,ddns,virus,htaccess-web,logs-errors,dns-track}.test.js`, `client/test/panel-{a11y,database-wizard,ddns,dns-track,htaccess-web,logs-errors,upload-transport,usage-scan-note,virus,plugins}.test.jsx` |
 | **2026-11-06 software + ports** | **done and live on nova**: Install Software (one-click runtimes/tools, inline installs, contract §51), PHP Version Manager (§52, offered list, panel Set all domains), account panel on 2083/2082 with the admin shell on 2087/2086 (`middleware/shell.js`, `wrong_port` policy); §4 "2026-11-06" has the verification | `server/test/{software,panel-php,shell-ports}.test.js`, `agent/test/pkg-runtime.test.js`, `client/test/{install-software,panel-php,login-shell}.test.jsx` |
 | **Phase 8 — account panel on the real host** (`docs/design/phase8-account-panel.md`) | **P0 + P1 done and live on nova 2026-11-05**: hostname site with `/webmail` + `/phpmyadmin`, delegation banners, lockout paths (P0); Roundcube/phpMyAdmin SSO, Sieve filters, mail routing + relay/IPv6, `.htaccess` family, Visitors, WordPress installer, preferences/2FA/folders, phone layout, i18n (P1); three live-found fixes after the P1 deploy (§4) | `CHECKLIST.md` Phase 8 table; §4 host steps; `server/test/panel-{sso,me,email-filters,htaccess,software,logs-stats}.test.js`, `agent/test/{vmail-sieve,files-htaccess,wp-install,stats,db,webmail,mail}.test.js`, `client/test/panel-{i18n-*,mobile,preferences,visitors,wordpress,htaccess,webmail-sso}.test.jsx` |
@@ -88,6 +89,40 @@ auth_username_format = %{user | lower} }` in the fragment); Debian's 2.4 `mail_i
 makes a virtual Maildir user try to create `/var/mail/<address>` (`userdb_mail_inbox_path` on every passwd line,
 re-key adds it); Debian's `pure-ftpd-wrapper` has no `CertFile` directive and refused to start (the combined PEM
 now goes to the compiled-in `/etc/ssl/private/pure-ftpd.pem`, only `conf/TLS` is written).
+
+### 2026-11-06 (session 3): UI round, direct updates, phpMyAdmin admin SSO, Phase 8 P3 + P4, PHP removal guards (deployed `a5d2d19`)
+
+- **Live incident and guards.** The owner removed the distribution's PHP 8.5 from PHP Version Manager after making a Keel
+  build the default; apt took `roundcube-core` and `phpmyadmin` with it and the hostname-site apps ran on the distro
+  `php8.5-fpm` socket, so webmail and phpMyAdmin answered 403/404. Restored by hand (packages reinstalled, Roundcube's
+  `array_first()` guard re-applied for PHP 8.5, webmail re-published to bring the `keel_sso` plugin back). Code now simulates
+  every packaged PHP removal and refuses collateral (root can force after the list), never removes the version the host
+  apps run on, and gives the hostname site its own `keel-host` FPM pool in the effective default's tree (works with Keel
+  builds; moved on default change; stale pools removed only after the site points elsewhere).
+- **Host steps done on nova:** `a2enmod proxy proxy_http proxy_wstunnel` (by the panel on the first app publish);
+  `radicale` + `python3-bcrypt` and `a2enmod headers` by the Calendars card; nothing by hand except the restoration above.
+  Migrations 034f (git repos, apps, vhost proxies), 034g (sub-users), 034h (DAV) applied by `install.sh --upgrade`.
+- **Acceptance on nova (keel-ops → Log in as testuser):** Git: clone of a public repo, pull, `.keel.yml` dry run and deploy
+  served at `/probe-git/`, remove. Apps: `probe-app` published at `/probe-app` (unit `User=testuser`, `ProtectSystem=strict`,
+  `NoNewPrivileges`), ACME path stays Apache, stop → 503, start → 200, logs, delete removed unit/file/proxy. Updates: catalog
+  rows carry `update`/`updates` stamps; critical list empty. phpMyAdmin: admin sign-on lands on phpMyAdmin with
+  `keel_pma_admin`, open-as-testuser lands with `testuser_pma` (grants only on `testuser_wp`). P4 and guard acceptance:
+  Guards: `POST /api/software/php/remove { version: '8.5' }` → 422 "PHP 8.5 runs the hostname site's keel-signon and
+  phpMyAdmin and webmail …"; the unused Keel 8.3 build removed cleanly; a source build over the packaged 8.5 and a second
+  Keel 8.4 → 422. Host pool: after `POST /api/service-config/hostname/apply` the site renders
+  `/run/keel-php/php8.4-fpm-keel-host.sock` (pool `keel-host.conf` in the Keel 8.4 tree) and webmail / phpMyAdmin /
+  pma-signon answer 200. P4: Calendars installed and published by the card (Radicale 3.6.0 active, `/dav/` 302), DAV
+  password set for `testuser@testuser.hostingsignal.in`, PROPFIND 207 with it and 401 without, password removed;
+  sub-user `probe.sub` with mail + FTP (doveadm user found, FTP 226, FTP 530 after disabling, both gone after delete);
+  Terminal: shell granted to testuser, a session opened and `id` over the WebSocket answered `uid=1001(testuser)` in
+  `/home/testuser`, closed, shell revoked (501 `shell_disabled` afterwards). Two live-found fixes: the terminal gate now
+  also honours a per-account shell, and Radicale's users file moved to `/etc/radicale/users`.
+- **Known host-environment test cases:** agent `dns.test.js` `$INCLUDE`, `resolver.test.js`, `vmail.test.js` purge,
+  `sec-malware.test.js` (ClamAV present); server `plugins.test.js` capability case (ClamAV present). Windows-only:
+  path-separator cases in `panel-domains`, `panel-ftp`, `panel-security`, `panel-software`, `plugin-host`,
+  `database-services` backup path, SDK `pack.test.js`, and the en-IN locale case in `client/test/panel-usage.test.jsx`.
+- **Deferred to P5:** Web Disk (needs a per-user WebDAV daemon or mpm-itk), mailing lists (Mailman 3), Softaculous-style
+  installers beyond WordPress.
 
 ### Phase 8 P2 host steps + PHP source builds (done on nova 2026-11-06, deployed `a3d9b8f`)
 

@@ -187,7 +187,41 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
-- **2026-11-06 (latest): PHP source builds + Phase 8 P2 deployed to nova** (commits `0b186a4`…`a3d9b8f`, merge `c251093`).
+- **2026-11-06 (latest): dashboard/UX round, direct updates, phpMyAdmin SSO for admins, Phase 8 P3 + P4, PHP removal
+  guards — deployed to nova at `a5d2d19`.** Built as nine workflow rounds in one session (each with security + correctness
+  lenses and one fix round; large units in detached worktrees merged afterwards — see the worktree rule in "Resume notes").
+  *UI:* collapsible tool sections on Home / panel Home with Expand all / Collapse all (`hooks/useCollapsedSections.js`), the
+  same controls on both sidebars; the row ⋯ menus and the user menu no longer close on hover (shared `hooks/useMenu.js` +
+  `components/Menu.jsx`, portal-positioned, Escape / outside / keyboard / ARIA; `client/test/menu.test.jsx` under jsdom);
+  a 332-screenshot sweep of every admin and panel page (desktop, phone, dark) with 185 findings fixed in kit, theme and
+  pages (pager hidden on single pages, empty states outside scrolling tables, disabled actions explain themselves,
+  Save bars disabled until a change, wrapped cells, phone layouts, consistent pickers and notices).
+  *Updates:* Home carries "Updates that need attention" (`GET /api/software/updates/critical`, contract §63): PHP versions
+  with advisories, pending security/package updates of the web stack, catalog runtimes/tools, newer Node.js builds — each
+  with an Update button (`POST /api/software/php/update`, `POST /api/software/runtimes/update`); PHP Version Manager and
+  Install Software show an always-visible Updates column (Up to date · version / Update available / Security update) with
+  *Check for updates* (refreshes the php.net/nodejs.org release cache and the OS check). *phpMyAdmin:* administrators get
+  single sign-on — `POST /api/databases/phpmyadmin/open` opens phpMyAdmin with a temporary `keel_pma_admin` (ALL PRIVILEGES
+  WITH GRANT OPTION, dropped after 24 min / SSO off / unpublish) and `{ account }` opens it as that account's own `<account>_pma`
+  user (grants only on its databases; List Accounts row action); contract §44 amendment.
+  *Phase 8 P3 (contracts §64–§67, migration 034f):* Git Version Control (clone/pull/deploy via a pinned `.keel.yml` grammar, all
+  as the account), Application Manager (Node/Python apps as hardened `keel-app-<user>.<name>` units linked from `/etc/whm/apps`,
+  published through vhost proxies with the ACME path excluded; `a2enmod proxy proxy_http proxy_wstunnel` done by the panel),
+  core forced-2FA switch for account users, PostgreSQL access hosts (`pg_hba.conf` block). *Phase 8 P4 (§68–§70, migrations
+  034g/034h):* web Terminal as the account (static `agent/src/ops/term-bridge.py` on a pty, WebSocket relay bound to session +
+  single-use token on every listener, idle/hard caps, audited without content; only with plan shell), User Manager (sub-users
+  with one password across e-mail/FTP/DAV), Calendars/Contacts through Radicale published as `/dav` under the hostname site.
+  *Guards after a live incident:* removing the distro PHP 8.5 from the panel had taken roundcube-core and phpmyadmin with it
+  (apt dependants) and the hostname-site apps ran on that socket — now a removal is simulated first and refused when other
+  packages would go (root may force after seeing the list), the version the host apps run on cannot be removed, the hostname
+  site has its own `keel-host` PHP-FPM pool in the effective default's tree (distro or Keel build) moved on default change,
+  a source build is never offered for a packaged minor, and php-build.sh seeds the opcache ini only when built.
+  Gate on the host clone at the deploy: server 1766 / client 626 / agent 883 (+4 host-env) / hub 186 / hub-ui 105 / SDK 74 / build green. Verified on nova: ⋯ menus in a real browser; Git clone/pull/deploy served over
+  HTTPS and removed; an app published at `/probe-app` (hardened unit, stop → 503, start → 200, logs, clean removal); PHP catalog
+  update fields; admin phpMyAdmin sign-on and open-as-account with the MySQL grants showing the isolation; webmail and phpMyAdmin
+  restored and re-published; P4 acceptance in `HANDOFF.md` §4. Known host-environment test cases are now 4 agent + 1 server
+  (ClamAV present) + the Windows-only path cases listed there.
+- **2026-11-06: PHP source builds + Phase 8 P2 deployed to nova** (commits `0b186a4`…`a3d9b8f`, merge `c251093`).
   **PHP installs work on every host now:** a catalog version no repository offers (Ubuntu 26.04 "resolute" has no
   `ppa:ondrej/php` series) is `available` with `method: 'source'`; the install job installs the build dependencies
   (`PHP_BUILD_DEPS` in `software-runtimes.js`), agent `pkg.php.build` downloads the release named by php.net's JSON index
@@ -465,6 +499,10 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Resume notes
 
+- **Worktree rule (learned 2026-11-06):** a parallel build in a git worktree needs node_modules junctions; unlink them with
+  `cmd /c rmdir <junction>` before deleting the worktree — `git worktree remove --force` followed the junctions and emptied the
+  main checkout's `client/node_modules` and `agent/node_modules` (restored with `npm install`). Never `git add -A` in the main
+  checkout while a workflow is editing it: two commits in this session swept half-finished edits in.
 - Working branch: `claude/kind-meitner-dlnbas` (push with `git push -u origin <branch>`). Phase 7 complete; the
   provisioned-host verification ran on the real host (2026-11-04/05) and its fixes sit uncommitted in the working tree —
   run the full gate, commit, then deploy with `scripts/install.sh --upgrade` and finish the host steps in `HANDOFF.md` §4.
