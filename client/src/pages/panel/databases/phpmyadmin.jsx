@@ -14,7 +14,9 @@ import { RequestError, InfoNote, isCapabilityError, isFeatureDisabled } from './
 // token for the account's hidden phpMyAdmin user, then open the URL it
 // answers. The window is opened before the request so the browser treats it
 // as the click's own popup; it is closed again when no URL comes back.
-export async function openPhpMyAdminSso({ open = (url, w) => { if (w) w.location = url; else window.location.assign(url); }, win = () => window.open('about:blank', '_blank', 'noopener') } = {}) {
+// The popup is opened without the `noopener` feature (which makes window.open
+// return null and would send this tab away instead); the opener is severed by hand.
+export async function openPhpMyAdminSso({ open = (url, w) => { if (w) w.location = url; else window.open(url, '_blank', 'noopener'); }, win = () => { const w = window.open('about:blank', '_blank'); if (w) { try { w.opener = null; } catch { /* cross-origin */ } } return w; } } = {}) {
   const w = win();
   try {
     const res = await panelApi.post('/databases/phpmyadmin/sso', {});

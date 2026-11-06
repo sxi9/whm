@@ -81,9 +81,19 @@ export function runtimeNote(key, family) {
 // `family` may be null (no package manager): nodejs still resolves, everything
 // else is refused with a 422 that names the reason. `method: 'source'` (PHP
 // only) resolves to the php.net build with the family's build dependencies.
-// `installed` (a detectedVersion() answer for the same minor) refuses a source
-// build over a distribution tree and any install over an existing Keel build.
-export function resolveInstall({ runtime, version, tool }, family, { method = 'package', installed = null } = {}) {
+// `installed` (a detectedVersion() answer for the same minor) refuses any
+// install over an existing Keel build, and a source build over a distribution
+// tree unless `latest` (php.net's newest release of that minor) is newer than
+// the packaged version: that build is the update path for a packaged minor no
+// repository fixes, and discovery then lets the build win over the packages.
+export function newerVersion(a, b) {
+  const pa = String(a ?? '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b ?? '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return d > 0; }
+  return false;
+}
+
+export function resolveInstall({ runtime, version, tool }, family, { method = 'package', installed = null, latest = null } = {}) {
   if (tool) {
     const entry = TOOLS.find((t) => t.key === tool);
     if (!entry) throw unprocessable(`Unknown tool "${tool}"`, { tool: ['Pick one of the catalog tools'] });
@@ -101,7 +111,11 @@ export function resolveInstall({ runtime, version, tool }, family, { method = 'p
   if (entry.installer === 'node') return { kind: 'runtime', key: runtime, label: entry.label, version: v, packages: [], repos: [], installer: 'node', major: Number(v) };
   if (entry.source && installed?.installed) {
     if (installed.source || installed.layout === 'keel') throw unprocessable(`${entry.label} ${v} is already installed as a Keel build under ${PHP_SOURCE_PREFIX}/${v}; update it from the PHP Version Manager, or remove it first to build it again`, { version: ['Already installed as a Keel build'] });
-    if (method === 'source') throw unprocessable(`${entry.label} ${v} is installed from packages; remove those packages first if you want a Keel build`, { method: ['package'] });
+    if (method === 'source' && !(latest && installed.version && newerVersion(latest, installed.version))) {
+      throw unprocessable(latest
+        ? `${entry.label} ${v} is installed from packages (${installed.version}) and php.net's latest ${v} release (${latest}) is not newer; remove those packages first if you want a Keel build`
+        : `${entry.label} ${v} is installed from packages; remove those packages first if you want a Keel build`, { method: ['package'] });
+    }
   }
   if (method === 'source') {
     if (!entry.source) throw unprocessable(`${entry.label} has no source build; install it from packages`, { method: ['package'] });
@@ -121,7 +135,7 @@ const digitsOf = (v) => String(v).replace(/\D/g, '');
 export function detectedVersion(key, version, detected = {}) {
   if (key === 'php') {
     const hit = (detected.php || []).find((p) => p.id === version || /php(\d+)$/.exec(String(p.id))?.[1] === digitsOf(version) || String(p.version || '').startsWith(version + '.'));
-    return hit ? { installed: true, id: hit.id, version: hit.version ?? hit.id, source: Boolean(hit.source || hit.layout === 'keel'), layout: hit.layout ?? null } : { installed: false, version: null };
+    return hit ? { installed: true, id: hit.id, version: hit.version ?? hit.id, source: Boolean(hit.source || hit.layout === 'keel'), layout: hit.layout ?? null, ...(hit.packagedTwin ? { packagedTwin: hit.packagedTwin } : {}) } : { installed: false, version: null };
   }
   if (key === 'nodejs') {
     const hit = (detected.node?.versions || []).find((n) => String(n.major) === String(version));

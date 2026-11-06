@@ -760,6 +760,23 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   `POST /api/software/updates/critical/refresh`, which asks php.net / nodejs.org again, re-runs the OS update
   simulation when the recorded one is older than six hours, and recomputes the list; the rows then reload. A Keel
   build whose installed patch equals php.net's latest offers no rebuild — only a newer release gets **Update**.
+  **Updating a packaged version from php.net:** when the distribution's own PHP (Ubuntu 26.04's 8.5.4, for instance)
+  carries an advisory and no distribution package fixes it, the row no longer says *Up to date*: as soon as php.net's
+  release of that branch is newer it shows *Security update · 8.5.12 from php.net* with a red **Update**. The confirm
+  (**Build and update**) explains what happens: the release is built from the official php.net source into
+  `/opt/keel/php/8.5` with its own `keel-php8.5-fpm` service (about 15 minutes), the build then *is* PHP 8.5 on this
+  server — every domain on 8.5, the inherited ones when 8.5 is the default, and the hostname site (webmail, phpMyAdmin)
+  when it runs on it are re-rendered on the build in the same job — and the distribution packages stay installed and
+  unused. Afterwards the row reads *PHP 8.5 (Keel build) 8.5.12* with the note *Distribution packages 8.5.4 remain
+  installed and unused*; **Remove packages** drops just those packages (simulated first like any removal; refused while
+  the hostname site still renders on their socket), while **Remove** on that row removes the Keel build and the packages
+  become PHP 8.5 again. A Keel build that already matches php.net's latest but whose domains were never moved onto it
+  shows *Move domains to the Keel build x.y.z* + **Update** (no rebuild, just the re-render). *Advisory · no fix
+  available yet* now appears only when neither a package nor a newer php.net release exists. The same source build can
+  be started from *Install Software* (**Install … Build and install** on an installed packaged row) and is accepted
+  only while php.net's release is newer than the packaged one (`422` otherwise). Agent op `pkg.php.remove { packages:
+  true }`, route `POST /php/remove { version, packages: true }`, setting `software.php.keel_resynced`. Contracts §52 /
+  §63 amendments of 2026-11-06.
 
 #### 22.6 NGINX Manager
 

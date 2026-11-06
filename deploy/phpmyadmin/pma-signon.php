@@ -111,8 +111,31 @@ function keel_pma_exchange(string $token)
     return ['user' => $data['user'], 'password' => $data['password'], 'host' => $data['host']];
 }
 
+/**
+ * The session directory is the pool's own (session.save_path of the keel-host
+ * pool, else PHP's default); a path the pool user cannot write would otherwise
+ * surface as a session_start() warning and a blank redirect loop.
+ */
+function keel_pma_session_dir(): string
+{
+    $path = (string) ini_get('session.save_path');
+    if ($path === '') {
+        return sys_get_temp_dir();
+    }
+    // "N;[mode;]/path" is PHP's depth/mode prefix syntax for the files handler.
+    $sep = strrpos($path, ';');
+    return $sep === false ? $path : substr($path, $sep + 1);
+}
+
 function keel_pma_start_session(): void
 {
+    if ((string) ini_get('session.save_handler') === 'files') {
+        $dir = keel_pma_session_dir();
+        if ($dir === '' || !is_dir($dir) || !is_writable($dir)) {
+            error_log('keel pma-signon: session directory is not writable: ' . $dir);
+            keel_pma_page(500, 'phpMyAdmin is not ready', 'The web server cannot store sign-on sessions; ask your hosting provider to re-apply the hostname site from Service Configuration.');
+        }
+    }
     session_name(KEEL_PMA_SESSION);
     session_set_cookie_params([
         'lifetime' => 0,

@@ -10,7 +10,7 @@ import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, Tabs, ManagerBadge, RebootBanner, useJobRunner, JobPanel, JobHistory, RuntimeInstaller, CodeList, SourceBuildPill, sourceBuildMessage, runtimeInstallBody, PHP_SOURCE_PREFIX } from '../../software/Shared.jsx';
 import { UpdatesBanner } from '../../home/UpdatesBanner.jsx';
-import { PhpUpdateCell, phpUpdateBody, phpUpdateMessage, checkForUpdates } from './multiphp-manager.jsx';
+import { PhpUpdateCell, phpUpdateBody, phpUpdateMessage, phpUpdateDanger, checkForUpdates } from './multiphp-manager.jsx';
 
 export const TABS = ['runtimes', 'tools', 'search', 'installed', 'history'];
 
@@ -148,7 +148,7 @@ export default function InstallSoftware({ fn }) {
   );
 }
 
-const PHP_SUBTITLE = 'Each version installs side by side with PHP-FPM and the common extensions; a version no repository carries for this OS is built from the php.net source under /opt/keel/php. Updates compares every installed version with the pending packages of the last OS update check and, for a Keel build, with php.net\'s latest release.';
+const PHP_SUBTITLE = 'Each version installs side by side with PHP-FPM and the common extensions; a version no repository carries for this OS is built from the php.net source under /opt/keel/php. Updates compares every installed version with the pending packages of the last OS update check and with php.net\'s latest release: a Keel build is rebuilt from it, and a packaged version hit by an advisory no package fixes is replaced by a build of it (the packages stay installed and unused).';
 
 // The PHP rows with their update state (contract §63): the shared installer's
 // row plus an Updates column and a per-row Update that goes through
@@ -165,7 +165,7 @@ export function PhpCard({ catalog, runner, checking, onCheck, confirm }) {
   const update = async (row) => {
     const u = row.update;
     if (!u?.candidate) return;
-    if (!(await confirm({ title: `Update ${row.label} to ${u.candidate}?`, message: phpUpdateMessage(row), confirmLabel: 'Update', danger: u.severity === 'critical' }))) return;
+    if (!(await confirm({ title: `Update ${row.label} to ${u.candidate}?`, message: phpUpdateMessage(row), confirmLabel: u.method === 'source' && !(row.source || row.layout === 'keel') ? 'Build and update' : 'Update', danger: phpUpdateDanger(u) }))) return;
     runner.start(() => api.post('/software/php/update', phpUpdateBody(row)), `Update ${row.label}`);
   };
   return (

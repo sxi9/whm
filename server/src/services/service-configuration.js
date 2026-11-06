@@ -785,9 +785,12 @@ export function createServiceConfigService(ctx) {
   // tree, so an account whose domains run different versions has one of each.
   const poolSettingsFor = (username) => json.parse(stmts.poolsByUser.all(username)[0]?.settings_json, {});
 
-  async function ensurePool(account, version, req) {
+  // `repool` rewrites the pool even when its row is applied: after a Keel build
+  // took over the minor the file must exist in the build's tree, where the
+  // vhost's socket now points.
+  async function ensurePool(account, version, req, { repool = false } = {}) {
     const current = stmts.poolByUserVersion.get(account.username, version);
-    if (current && current.status === 'applied') return { username: account.username, version, socket: current.socket, applied: true, unchanged: true };
+    if (current && current.status === 'applied' && !repool) return { username: account.username, version, socket: current.socket, applied: true, unchanged: true };
     return writePhpPool(account.username, version, current ? json.parse(current.settings_json, {}) : poolSettingsFor(account.username), req);
   }
 
@@ -993,7 +996,7 @@ export function createServiceConfigService(ctx) {
 
   // `reload: false` lets a caller batching many domains (MultiPHP Manager)
   // reload Apache once itself.
-  async function setPhpVersion(domain, versionInput, req, { reload = true } = {}) {
+  async function setPhpVersion(domain, versionInput, req, { reload = true, repool = false } = {}) {
     const spec = requireSpec(domain);
     const version = versionInput == null ? null : phpVersionId(versionInput);
     if (versionInput != null && !version) throw badRequest(`"${versionInput}" is not a PHP version`);
@@ -1002,13 +1005,13 @@ export function createServiceConfigService(ctx) {
     // "Inherit" is stored as null but rendered with the resolved default: a vhost
     // without a handler would serve .php files as source.
     const effective = version ?? await resolvePhpVersion(account);
-    if (effective) await ensurePool(account, effective, req);
+    if (effective) await ensurePool(account, effective, req, { repool });
     const result = await writeSpec({ ...spec, phpVersion: effective }, req, { reload });
     // writeSpec stores what it rendered; the record keeps "inherit" (null) so the next sync re-resolves it.
     spec.phpVersion = version;
     storeSpec(spec);
     if (!effective) stmts.setVhostStatus.run('failed', 'PHP-FPM is not installed; .php files are served as static content until a PHP-FPM tree exists', result.path ?? null, domain);
-    audit(req, { action: 'web.php.set', target: domain, args: { version, effective } });
+    audit(req, { action: 'web.php.set', target: domain, args: { version, effective, ...(repool ? { repool: true } : {}) } });
     return { ...result, effective };
   }
 

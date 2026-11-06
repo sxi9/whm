@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, badRequest, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot, ownsRow } from '../middleware/rbac.js';
-import { RUNTIMES, TOOLS, RUNTIME_KEYS, PHP_SOURCE_PREFIX, PHP_SOURCE_MINORS, resolveInstall, packagesFor, runtimeNote, detectedVersion } from './software-runtimes.js';
+import { RUNTIMES, TOOLS, RUNTIME_KEYS, PHP_SOURCE_PREFIX, PHP_SOURCE_MINORS, PHP_BUILD_DEPS, resolveInstall, packagesFor, runtimeNote, detectedVersion } from './software-runtimes.js';
 
 // Software. Attached as ctx.software; other categories may call:
 //   software.pkg.detect()                                   -> { manager: 'apt'|'dnf'|'yum'|null, family, rpm, capability }
@@ -19,7 +19,8 @@ import { RUNTIMES, TOOLS, RUNTIME_KEYS, PHP_SOURCE_PREFIX, PHP_SOURCE_MINORS, re
 //   software.php.catalog()                                  -> every catalog + installed PHP version with state/offered/domains (contract §52)
 //   software.php.offeredVersions()                          -> ids the account panel may pick, or null (= all installed)
 //   software.php.usage()                                    -> { [versionId]: pinned-domain count }
-//   software.php.remove(version, user, req)                 -> { job, version } (refuses the system/CLI default, the last version, versions pinned on domains, plans, vhosts or the Apache web default)
+//   software.php.remove(version, user, req, { force, packages }) -> { job, version } (refuses the system/CLI default, the last version, versions pinned on domains, plans, vhosts or the Apache web default;
+//                                                              packages: true removes only the distribution packages a Keel build of the minor shadows)
 //   software.nginx.status()                                 -> install + proxy state (never throws CapabilityError); stale: true when the
 //                                                              rendered proxy no longer matches the current domains / certificates
 //   software.nginx.sync(req)                                -> re-render the reverse-proxy config from current domains and certificates;
@@ -33,8 +34,9 @@ import { RUNTIMES, TOOLS, RUNTIME_KEYS, PHP_SOURCE_PREFIX, PHP_SOURCE_MINORS, re
 //   software.updates.critical({ versions?, fresh?, releases? }) -> { checkedAt, packagesCheckedAt, releasesCheckedAt, items: [{ kind, id, label, current,
 //                                                              candidate, severity, reasons, source, action }] } (contract §63; cached 10 min, never throws)
 //   software.updates.refresh()                               -> the list recomputed after a fresh release lookup and, when the recorded OS check is older than 6 h, a new one
-//   software.updates.rowUpdate(list, kind, id)               -> { candidate, severity, reasons, current, source, checkedAt } | null for a catalog row
-//   software.php.update(version, user, req)                  -> { job, version, candidate, method } (job type software.php.update; 422 without a candidate)
+//   software.updates.rowUpdate(list, kind, id)               -> { candidate, severity, reasons, current, source, method, build, checkedAt } | null for a catalog row
+//   software.php.update(version, user, req)                  -> { job, version, candidate, method } (job type software.php.update; 422 without a candidate;
+//                                                              method 'source' builds php.net's release over a packaged minor with an advisory no package fixes and resyncs every domain on it)
 //   software.runtimes.update({ runtime, version } | { tool }, user, req) -> { job } (job type software.runtime.update)
 // Lazily used when present: ctx.web.setPhpVersion(domain, version, req, { reload }) (the 4th argument is advisory: the web category
 // may skip the Apache reload until the last domain of a batch), ctx.web.setListenPorts({ http, https, bind }, req),
@@ -136,6 +138,7 @@ export function createSoftwareService(ctx) {
     setDomainPhp: db.prepare('UPDATE account_domains SET php_version = ? WHERE domain = ?'),
     insertMainDomain: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot, php_version) VALUES (?, ?, ?, ?, ?)'),
     phpUsage: db.prepare("SELECT php_version AS id, COUNT(*) AS n FROM account_domains WHERE php_version IS NOT NULL AND php_version <> '' GROUP BY php_version"),
+    domainsPinnedTo: db.prepare('SELECT d.domain FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.php_version = ? AND a.suspended = 0 ORDER BY d.domain'),
     packagesUsingPhp: db.prepare('SELECT COUNT(*) AS n FROM packages WHERE php_version = ?'),
     profiles: db.prepare('SELECT * FROM ea4_profiles ORDER BY stock DESC, name'),
     profileById: db.prepare('SELECT * FROM ea4_profiles WHERE id = ?'),
@@ -317,8 +320,8 @@ export function createSoftwareService(ctx) {
           const row = { id: v ?? key, label: v ? `${entry.label} ${v}` : entry.label, installed: state.installed, version: state.version, packages, repo, note, update, ...(key === 'nodejs' && v ? { path: state.path ?? `/opt/keel/node/${v}`, bin: `/usr/local/bin/node${v}` } : {}) };
           if (!entry.source) return row;
           const rs = repo ? repos[repo] ?? null : null;
-          const avail = state.installed ? { state: 'installed', method: state.source ? 'source' : 'package', note } : availability(entry, repo, rs, d.capability ? fam : null, detected.os, v);
-          return { ...row, ...avail, note: avail.note ?? note, source: Boolean(state.source), repoStatus: rs, ...(avail.method === 'source' || state.source ? { prefix: `${PHP_SOURCE_PREFIX}/${v}` } : {}) };
+          const avail = state.installed ? { state: 'installed', method: state.source ? 'source' : 'package', note: state.packagedTwin ? `Distribution packages ${state.packagedTwin.version ?? ''} remain installed and unused.`.replace(/\s+remain/, ' remain') : note } : availability(entry, repo, rs, d.capability ? fam : null, detected.os, v);
+          return { ...row, ...avail, note: avail.note ?? note, source: Boolean(state.source), repoStatus: rs, ...(avail.method === 'source' || state.source ? { prefix: `${PHP_SOURCE_PREFIX}/${v}` } : {}), ...(state.packagedTwin ? { packagedTwin: { binary: state.packagedTwin.binary ?? null, version: state.packagedTwin.version ?? null, packagePrefix: state.packagedTwin.packagePrefix ?? null } } : {}) };
         });
         return { key, label: entry.label, single: Boolean(entry.single), installer: entry.installer ?? null, source: Boolean(entry.source), versions };
       });
@@ -331,20 +334,22 @@ export function createSoftwareService(ctx) {
       const fam = capabilities.has('pkg') ? await family().catch(() => null) : null;
       const entry = runtime ? RUNTIMES[runtime] : null;
       if (method && !entry?.source) throw unprocessable('Only PHP versions have an install method; everything else installs from packages', { method: ['Leave it out'] });
-      let installed = null;
+      let installed = null; let latest = null;
       if (entry?.source && fam) {
         // Catalog check first (422 on a bad version), then what is already on
         // the host (a distro tree is never replaced by a source build, a Keel
         // build is never built twice), then the repo decides the default method.
         resolveInstall({ runtime, version }, fam);
         try { installed = detectedVersion(runtime, version, await op('pkg.runtime.detect')); } catch (err) { logger.warn({ err }, 'runtime detection failed'); }
-        resolveInstall({ runtime, version }, fam, { installed });
+        // A source build over a packaged minor is allowed only as an update: php.net's release must be newer than the packages.
+        if (method === 'source' && installed?.installed && !installed.source) latest = (await releaseFor('php', version))?.version ?? null;
+        resolveInstall({ runtime, version }, fam, { installed, latest });
         const rs = (await probeRepos([entry.repo]))[entry.repo];
         const packagesAvailable = Boolean(rs?.present || rs?.supported === true);
         if (!method) method = packagesAvailable || installed?.installed ? 'package' : 'source';
         else if (method === 'package' && rs?.supported === false && !installed?.installed) throw unprocessable(`${entry.label} ${version} packages are not available on this OS: ${rs.detail || 'the repository has no series for it'}${PHP_SOURCE_MINORS.includes(version) ? '; install it as a source build instead' : ''}`, { method: PHP_SOURCE_MINORS.includes(version) ? ['source'] : ['No install method is available for this version on this OS'] });
       }
-      const plan = resolveInstall({ runtime, version, tool }, fam, { method, installed });
+      const plan = resolveInstall({ runtime, version, tool }, fam, { method, installed, latest });
       const job = enqueue('software.runtime.install', { kind: plan.kind, key: plan.key, version: plan.version, family: fam, ...(plan.installer === 'php-source' ? { method: 'source' } : {}) }, user);
       const target = plan.version ? `${plan.key}:${plan.version}` : plan.key;
       req?.audit?.({ action: 'software.runtime.install', target, args: { kind: plan.kind, key: plan.key, version: plan.version, method: plan.installer === 'php-source' ? 'source' : plan.installer === 'node' ? 'node' : 'package', packages: plan.packages, jobId: job.id } });
@@ -620,21 +625,30 @@ export function createSoftwareService(ctx) {
           const advisories = (v.advisories || []).filter((a) => !backported.has(`${a.id}|${v.id}`));
           const prefix = v.packagePrefix || null;
           const hits = prefix ? pending.filter((p) => String(p.name).startsWith(prefix)) : [];
-          let candidate = null; let release = null;
+          let candidate = null; let release = null; let method = hits.length ? 'package' : null; let build = hits.length ? false : null;
+          const minor = /^\d+\.\d+$/.test(String(v.id)) ? String(v.id) : null;
           if (hits.length) candidate = (hits.find((p) => p.name === `${prefix}fpm`) ?? hits.find((p) => p.name === `${prefix}cli`) ?? hits[0]).candidate ?? null;
-          else if (v.layout === 'keel' && /^\d+\.\d+$/.test(String(v.id))) {
-            release = await lookup('php', v.id);
-            if (release && v.version && compareVersions(release.version, v.version) > 0) candidate = release.version;
+          else if (v.layout === 'keel' && minor) {
+            release = await lookup('php', minor);
+            if (release && v.version && compareVersions(release.version, v.version) > 0) { candidate = release.version; method = 'source'; build = true; }
+            // A build shadowing distro packages of its minor: until the update job has re-rendered every
+            // domain of that minor onto it (recorded per minor), the "update" is that resync alone.
+            else if (v.packagedTwin && v.version && !php.keelResynced(minor, v.version)) { candidate = v.version; method = 'source'; build = false; }
+          } else if (advisories.length && minor && PHP_SOURCE_MINORS.includes(minor)) {
+            // A packaged minor with an advisory no distribution package fixes: php.net's newer release, built from source, replaces it.
+            release = await lookup('php', minor);
+            if (release && v.version && compareVersions(release.version, v.version) > 0) { candidate = release.version; method = 'source'; build = true; }
           }
           if (!advisories.length && !candidate) continue;
-          const source = hits.length ? 'package' : release && candidate ? 'release' : null;
+          const source = hits.length ? 'package' : candidate ? 'release' : null;
           const severity = advisories.some((a) => a.grade === 'critical') ? 'critical' : advisories.length || hits.some((p) => p.security) ? 'security' : 'update';
           const reasons = [
             ...advisories.map((a) => `${a.id}: ${a.title}${a.fixedIn ? ` (fixed in ${a.fixedIn})` : ''}`),
             ...(hits.length ? [`${hits.length} package update${hits.length === 1 ? '' : 's'} pending${hits.some((p) => p.security) ? ' (security)' : ''}`] : []),
-            ...(release && candidate ? [`php.net released ${release.version}`] : []),
+            ...(release && candidate && build ? [`php.net released ${release.version}${v.layout === 'keel' ? '' : '; no distribution package carries a fix, so it is built from source'}`] : []),
+            ...(candidate && method === 'source' && build === false ? [`the Keel build ${v.version} shadows the distribution packages ${v.packagedTwin?.version ?? ''}; the domains on PHP ${minor} are re-rendered onto it`.replace(/\s+;/, ';')] : []),
           ];
-          items.push({ kind: 'php', id: v.id, label: v.label || `PHP ${v.id}`, current: v.version ?? null, candidate, severity, reasons, layout: v.layout ?? null, packages: hits.map((p) => p.name), unit: v.fpmUnit ?? null, source, action: candidate ? { method: 'POST', path: '/software/php/update', body: { version: v.id } } : null });
+          items.push({ kind: 'php', id: v.id, label: v.label || `PHP ${v.id}`, current: v.version ?? null, candidate, severity, reasons, layout: v.layout ?? null, packages: hits.map((p) => p.name), unit: v.fpmUnit ?? null, source, method: candidate ? method : null, build: candidate ? build : null, action: candidate ? { method: 'POST', path: '/software/php/update', body: { version: v.id } } : null });
         }
       } catch (err) { logger.warn({ err }, 'php update check failed'); }
       let fam = null;
@@ -697,7 +711,7 @@ export function createSoftwareService(ctx) {
       const item = list?.items?.find((i) => i.kind === kind && i.id === id);
       if (!item) return null;
       const checkedAt = (item.source === 'release' ? list.releasesCheckedAt : list.packagesCheckedAt) ?? list.checkedAt ?? null;
-      return { candidate: item.candidate, severity: item.severity, reasons: item.reasons, current: item.current ?? null, source: item.source ?? null, checkedAt };
+      return { candidate: item.candidate, severity: item.severity, reasons: item.reasons, current: item.current ?? null, source: item.source ?? null, method: item.method ?? null, build: item.build ?? null, checkedAt };
     },
     // The check times a catalog carries beside its rows.
     stamp(list) {
@@ -891,13 +905,13 @@ export function createSoftwareService(ctx) {
   // Applies one PHP version to a list of domains through the web category,
   // asking it to reload Apache only after the last one. Used by the resync and
   // bulk-apply jobs; never throws for a single failing domain.
-  async function applyPhpToDomains(job, domains, version) {
+  async function applyPhpToDomains(job, domains, version, { repool = false } = {}) {
     const failed = [];
     let applied = 0;
     for (const [i, domain] of domains.entries()) {
       job.progress(10 + Math.round((i / Math.max(1, domains.length)) * 85), domain);
       try {
-        await ctx.web.setPhpVersion(domain, version, null, { reload: i === domains.length - 1 });
+        await ctx.web.setPhpVersion(domain, version, null, { reload: i === domains.length - 1, repool });
         applied++;
         job.log(`${domain}: ${version ?? 'inherit'} applied`);
       } catch (err) {
@@ -906,6 +920,15 @@ export function createSoftwareService(ctx) {
       }
     }
     return { applied, failed };
+  }
+
+  // /usr/bin/php left on the packaged twin of a Keel build would make the
+  // agent refuse the package removal (and the UI hides "Set as default" for a
+  // row that already counts as the default): point it at the build.
+  async function relinkCliToBuild(job, entry, defaultBinary) {
+    if (!entry?.isDefault || !entry.packagedTwin || entry.layout !== 'keel' || !entry.binary || defaultBinary === entry.binary) return false;
+    await job.agent.op('pkg.php.default.set', { version: entry.id });
+    return true;
   }
 
   const php = {
@@ -1077,7 +1100,8 @@ export function createSoftwareService(ctx) {
       const findInstalled = (id) => installed.versions.find((x) => x.id === id || /php(\d+)$/.exec(String(x.id))?.[1] === digits(id) || String(x.version || '').startsWith(`${id}.`)) ?? null;
       const isOffered = (id, inst) => Boolean(inst) && (offered === null || offered.includes(id));
       const isSource = (inst) => Boolean(inst.source || inst.layout === 'keel');
-      const shapeInstalled = (inst) => ({ installed: true, version: inst.version ?? null, binary: inst.binary ?? null, iniPath: inst.iniPath ?? null, fpmInstalled: inst.fpmInstalled ?? null, fpmActive: inst.fpmActive ?? null, fpmUnit: inst.fpmUnit ?? null, isDefault: Boolean(inst.isDefault), isSystemDefault: inst.id === installed.effectiveDefault, advisories: inst.advisories ?? [], source: isSource(inst), layout: inst.layout ?? null, method: isSource(inst) ? 'source' : 'package', update: updates.rowUpdate(crit, 'php', inst.id), ...(isSource(inst) ? { prefix: `${PHP_SOURCE_PREFIX}/${inst.id}` } : {}) });
+      const twinOf = (inst) => (inst.packagedTwin ? { packagedTwin: { binary: inst.packagedTwin.binary ?? null, version: inst.packagedTwin.version ?? null, packagePrefix: inst.packagedTwin.packagePrefix ?? null, fpmUnit: inst.packagedTwin.fpmUnit ?? null }, packagePrefix: inst.packagedTwin.packagePrefix ?? null, twinNote: `Distribution packages ${inst.packagedTwin.version ?? ''} remain installed and unused; Remove packages drops them without touching the Keel build.`.replace(/\s+remain/, ' remain') } : {});
+      const shapeInstalled = (inst) => ({ installed: true, version: inst.version ?? null, binary: inst.binary ?? null, iniPath: inst.iniPath ?? null, fpmInstalled: inst.fpmInstalled ?? null, fpmActive: inst.fpmActive ?? null, fpmUnit: inst.fpmUnit ?? null, isDefault: Boolean(inst.isDefault), isSystemDefault: inst.id === installed.effectiveDefault, advisories: inst.advisories ?? [], source: isSource(inst), layout: inst.layout ?? null, method: isSource(inst) ? 'source' : 'package', update: updates.rowUpdate(crit, 'php', inst.id), ...(isSource(inst) ? { prefix: `${PHP_SOURCE_PREFIX}/${inst.id}` } : {}), ...twinOf(inst) });
       const seen = new Set();
       const versions = phpRuntime.versions.map((v) => {
         const inst = findInstalled(v.id);
@@ -1089,12 +1113,12 @@ export function createSoftwareService(ctx) {
         return {
           id, catalogVersion: v.id, label: inst ? inst.label ?? v.label : v.label, state: avail.state,
           ...(inst ? shapeInstalled(inst) : { installed: false, version: null, binary: null, iniPath: null, fpmInstalled: null, fpmActive: null, fpmUnit: null, isDefault: false, isSystemDefault: false, advisories: [], source: false, layout: null, method: avail.method, update: null, ...(avail.method === 'source' ? { prefix: `${PHP_SOURCE_PREFIX}/${v.id}` } : {}) }),
-          offered: isOffered(id, inst), domains: usage[id] ?? 0, ...(inst ? dependants(id) : { webDefault: false, plans: 0, vhosts: 0 }), packages: avail.method === 'source' || (inst && isSource(inst)) ? [] : v.packages ?? [], repo: v.repo ?? null, repoStatus: rs, note: avail.note ?? runtimeNote('php', rc.family),
+          offered: isOffered(id, inst), domains: usage[id] ?? 0, ...(inst ? dependants(id) : { webDefault: false, plans: 0, vhosts: 0 }), packages: avail.method === 'source' || (inst && isSource(inst)) ? [] : v.packages ?? [], repo: v.repo ?? null, repoStatus: rs, note: inst?.packagedTwin ? twinOf(inst).twinNote : avail.note ?? runtimeNote('php', rc.family),
         };
       });
       for (const inst of installed.versions) {
         if (seen.has(inst.id)) continue;
-        versions.push({ id: inst.id, catalogVersion: null, label: inst.label ?? inst.id, state: 'installed', ...shapeInstalled(inst), offered: isOffered(inst.id, inst), domains: usage[inst.id] ?? 0, ...dependants(inst.id), packages: [], repo: null, repoStatus: null, note: null });
+        versions.push({ id: inst.id, catalogVersion: null, label: inst.label ?? inst.id, state: 'installed', ...shapeInstalled(inst), offered: isOffered(inst.id, inst), domains: usage[inst.id] ?? 0, ...dependants(inst.id), packages: [], repo: null, repoStatus: null, note: inst.packagedTwin ? twinOf(inst).twinNote : null });
       }
       return { family: rc.family, os: rc.os, manager: rc.manager, capability: rc.capability, phpCapability: capabilities.has('php'), effectiveDefault: installed.effectiveDefault ?? null, configuredDefault: installed.configuredDefault ?? null, offered, versions, updates: crit ? updates.stamp(crit) : null };
     },
@@ -1165,35 +1189,63 @@ export function createSoftwareService(ctx) {
       if (extra.some((p) => !appOf(p))) apps.push(apps.length ? 'whatever else depends on it' : 'what depends on it');
       return `Removing PHP ${version} would also remove ${extra.join(', ')} — move ${apps.join(' and ')} to another version first, or force the removal`;
     },
-    async remove(version, user, req, { force = false } = {}) {
+    // Removing only the distribution packages a Keel build shadows: the build
+    // keeps serving the minor, so the default / usage guards do not apply — only
+    // the hostname site must already render on the build's socket.
+    async packagesBlocker(version) {
+      const { versions } = await php.versions();
+      const inst = versions.find((v) => v.id === version);
+      if (!inst) return [`PHP "${version}" is not installed on this server`, 'Pick one of the installed versions'];
+      if (inst.layout !== 'keel' || !inst.packagedTwin) return [`PHP ${version} has no distribution packages beside a Keel build; remove the version itself instead`, 'Not a Keel build with packages beside it'];
+      // Pools and vhosts rendered before the build still point at the packaged
+      // unit's sockets until the resync (Update) moved them onto the build.
+      const usage = php.usage();
+      const effective = (await php.systemDefault()).effective;
+      if ((usage[version] || effective === version) && !php.keelResynced(version, inst.version)) return [`The domains on PHP ${version} still run on the distribution packages; run Update on PHP ${version} first so they move to the Keel build`, 'Update PHP first'];
+      let socket = null;
+      if (typeof ctx.web?.hostname?.status === 'function') {
+        try { socket = (await ctx.web.hostname.status())?.phpSocket ?? null; } catch (err) { logger.warn({ err }, 'hostname site status failed'); }
+      }
+      if (socket && new RegExp(`/php${version.replace(/\./g, '\\.')}-fpm(?:-[A-Za-z0-9-]+)?\\.sock$`).test(socket) && !socket.includes('/keel-php/')) return [`The hostname site (webmail, phpMyAdmin) still runs on the PHP ${version} packages' socket ${socket}; run Update on PHP ${version} first so it moves to the Keel build`, 'Update PHP first'];
+      return null;
+    },
+    async remove(version, user, req, { force = false, packages = false } = {}) {
       requirePhp();
-      const blocker = await php.removeBlocker(version);
+      const blocker = packages ? await php.packagesBlocker(version) : await php.removeBlocker(version);
       if (blocker) throw unprocessable(blocker[0], { version: [blocker[1]] });
       // The package manager's dry run first: apt removes reverse dependencies
       // (roundcube-core, phpmyadmin) with the version packages.
-      const sim = await op('pkg.php.remove', { version, dry: true }, req);
+      const sim = await op('pkg.php.remove', { version, dry: true, ...(packages ? { packages: true } : {}) }, req);
       const extra = Array.isArray(sim?.extra) ? sim.extra : [];
       if (extra.length && !force) throw unprocessable(php.collateralMessage(version, extra), { version: [`Removing it also removes ${extra.join(', ')}`], extra });
       const forced = Boolean(force && extra.length);
       // The confirmed collateral travels with the job: the agent refuses a forced
       // removal whose fresh simulation names anything beyond it.
-      const job = enqueue('software.php.remove', { version, ...(force ? { force: true, extra } : {}) }, user);
-      req?.audit?.({ action: 'software.php.remove', target: version, args: { jobId: job.id, force: Boolean(force), forced, extra } });
-      return { job, version, extra, forced };
+      const job = enqueue('software.php.remove', { version, ...(force ? { force: true, extra } : {}), ...(packages ? { packages: true } : {}) }, user);
+      req?.audit?.({ action: 'software.php.remove', target: version, args: { jobId: job.id, force: Boolean(force), forced, extra, packages: Boolean(packages) } });
+      return { job, version, extra, forced, packages: Boolean(packages) };
     },
     async removeJob(job) {
-      const { version, force = false, extra: confirmed = [] } = job.params;
-      const blocker = await php.removeBlocker(version);
-      if (blocker) throw new Error(`Removal of PHP ${version} refused: ${blocker[0]}`);
+      const { version, force = false, extra: confirmed = [], packages = false } = job.params;
+      const blocker = packages ? await php.packagesBlocker(version) : await php.removeBlocker(version);
+      if (blocker) throw new Error(`Removal of PHP ${version}${packages ? ' packages' : ''} refused: ${blocker[0]}`);
       if (force) job.log(`forced: packages outside PHP ${version}'s own prefix that depend on it are removed as well${confirmed.length ? ` (confirmed: ${confirmed.join(', ')})` : ''}`, 'warn');
-      job.progress(5, `removing PHP ${version}`);
-      const result = await runLongOp(job, 'pkg.php.remove', { version, ...(force ? { force: true, extra: confirmed } : {}) }, `PHP ${version} removal`);
+      if (packages) {
+        const { versions, defaultBinary } = await php.versions();
+        const inst = versions.find((v) => v.id === version);
+        if (await relinkCliToBuild(job, inst, defaultBinary)) job.log(`/usr/bin/php now points at the Keel build ${inst.binary}`);
+      }
+      job.progress(5, packages ? `removing the PHP ${version} distribution packages (the Keel build stays)` : `removing PHP ${version}`);
+      const result = await runLongOp(job, 'pkg.php.remove', { version, ...(force ? { force: true, extra: confirmed } : {}), ...(packages ? { packages: true } : {}) }, `PHP ${version} removal`);
       job.progress(90, 're-detecting capabilities');
       await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after PHP removal failed'); job.log(`capability re-detection failed: ${err.message}`, 'warn'); });
-      const offered = php.offeredVersions();
-      if (offered?.includes(version)) settings.set('php.offered_versions', offered.filter((id) => id !== version));
+      if (!packages) {
+        const offered = php.offeredVersions();
+        if (offered?.includes(version)) settings.set('php.offered_versions', offered.filter((id) => id !== version));
+      }
+      updates.invalidate();
       job.progress(100, 'done');
-      return { version, packages: result.packages ?? [], removed: true, ...(result.layout ? { layout: result.layout } : {}), ...(result.prefix ? { prefix: result.prefix } : {}), ...(Array.isArray(result.extra) && result.extra.length ? { extra: result.extra, forced: true } : {}) };
+      return { version, packages: result.packages ?? [], removed: true, ...(packages ? { packagesOnly: true, keelKept: true, ...(result.keelPrefix ? { prefix: result.keelPrefix } : {}) } : { ...(result.layout ? { layout: result.layout } : {}), ...(result.prefix ? { prefix: result.prefix } : {}) }), ...(Array.isArray(result.extra) && result.extra.length ? { extra: result.extra, forced: true } : {}) };
     },
     // Direct update of an installed version (contract §63): the pending
     // packages of its prefix, or a fresh php.net build over a Keel prefix.
@@ -1207,24 +1259,79 @@ export function createSoftwareService(ctx) {
         throw unprocessable(`PHP ${version} has no pending update`, { version: ['Nothing newer is available for it'] });
       }
       if (!item.candidate) throw unprocessable(`PHP ${version} is affected by ${item.reasons[0] ?? 'an advisory'}, but no newer build or package is available yet`, { version: ['No fix is available yet; check again later or move its sites to another version'] });
-      const method = item.layout === 'keel' ? 'source' : 'package';
-      const job = enqueue('software.php.update', { version, layout: item.layout, candidate: item.candidate, current: item.current, packages: item.packages, unit: item.unit, method }, user);
-      req?.audit?.({ action: 'software.php.update', target: version, args: { from: item.current, to: item.candidate, method, packages: item.packages, jobId: job.id } });
-      return { job, version, candidate: item.candidate, method };
+      const method = item.method ?? (item.layout === 'keel' ? 'source' : 'package');
+      const build = method === 'source' ? item.build !== false : false;
+      const fam = method === 'source' && build ? await family().catch(() => null) : null;
+      if (method === 'source' && build && !PHP_BUILD_DEPS[fam]) throw unprocessable(`A PHP ${version} source build needs a package manager for its build dependencies`, { version: ['No supported package manager was found on this server'] });
+      const job = enqueue('software.php.update', { version, layout: item.layout, candidate: item.candidate, current: item.current, packages: item.packages, unit: item.unit, method, build, ...(fam ? { family: fam } : {}) }, user);
+      req?.audit?.({ action: 'software.php.update', target: version, args: { from: item.current, to: item.candidate, method, build, packages: item.packages, jobId: job.id } });
+      return { job, version, candidate: item.candidate, method, build };
+    },
+    // Per minor, the build version every domain of that minor was last re-rendered onto (the source update's resync).
+    keelResynced(minor, version) {
+      const rec = S('software.php.keel_resynced', {}) || {};
+      return rec[minor]?.version === version;
+    },
+    // After a source build replaced (or shadows) the packaged tree of a minor:
+    // every domain pinned to it, the inherited ones when it is the default, and
+    // the hostname site are rendered again, now on the Keel build's tree.
+    async resyncMinor(job, version) {
+      const effective = (await php.systemDefault()).effective ?? null;
+      const pinned = stmts.domainsPinnedTo.all(version).map((d) => d.domain);
+      const inherited = effective === version ? inheritedDomains() : [];
+      const domains = [...new Set([...pinned, ...inherited])];
+      let applied = 0; let failed = [];
+      if (typeof ctx.web?.setPhpVersion !== 'function') job.log('Service Configuration is not loaded; no vhost or pool to re-render');
+      else if (!domains.length) job.log(`no domain runs PHP ${version}`);
+      else {
+        job.log(`re-rendering ${pinned.length} pinned and ${inherited.length} inherited domain(s) on the PHP ${version} Keel build`);
+        ({ applied, failed } = await applyPhpToDomains(job, domains, version, { repool: true }));
+      }
+      let host = null;
+      try {
+        const { versions, defaultId } = await php.versions();
+        const hostVersion = await php.hostAppsPhpVersion(versions, defaultId);
+        if ((hostVersion === version || effective === version) && typeof ctx.web?.hostApps?.resyncPhpDefault === 'function') {
+          host = await ctx.web.hostApps.resyncPhpDefault(effective ?? version, null);
+          job.log(`hostname site: ${host?.applied ? `rendered on ${host.socket ?? 'its pool'}` : `unchanged (${host?.reason ?? 'nothing to apply'})`}`);
+        }
+      } catch (err) { host = { applied: false, error: err.message }; job.log(`hostname site re-render failed: ${err.message}`, 'warn'); }
+      return { domains: domains.length, pinned: pinned.length, inherited: inherited.length, applied, failed, host };
     },
     async updateJob(job) {
       const { version, layout, candidate, current, packages, unit, method } = job.params;
       job.log(`PHP ${version}: ${current ?? 'unknown'} → ${candidate} (${method === 'source' ? 'php.net source build' : JSON.stringify(packages)})`);
-      let build = null; let restarted = false;
+      let build = null; let restarted = false; let resync = null;
+      const buildWanted = method === 'source' && job.params.build !== false;
       if (method === 'source') {
-        job.progress(5, `downloading and building PHP ${candidate}`);
-        await runLongOp(job, 'pkg.php.build', { minor: version }, `PHP ${version} build`);
-        job.progress(85, `restarting keel-php${version}-fpm`);
-        build = await job.agent.op('pkg.php.build.finish', { minor: version });
-        const unitName = build.unit ?? `keel-php${version}-fpm`;
-        if (build.unitError || build.active === false) throw new Error(`PHP ${build.version ?? candidate} built but ${unitName} did not come back: ${build.unitError ?? 'unit inactive'}; see journalctl -u ${unitName}`);
-        restarted = Boolean(build.restarted);
-        job.log(`${unitName} ${restarted ? 'restarted' : 'started'} with PHP ${build.version ?? candidate}`);
+        if (buildWanted) {
+          const fam = job.params.family ?? (capabilities.has('pkg') ? await job.agent.op('pkg.detect').then((d) => d.family).catch(() => null) : null);
+          const deps = PHP_BUILD_DEPS[fam];
+          if (!deps) throw new Error(`A PHP ${version} source build needs a package manager for its build dependencies`);
+          job.progress(3, 'installing build dependencies');
+          job.log(`build dependencies (${fam}): ${JSON.stringify(deps)}`);
+          await runLongOp(job, 'pkg.install', { packages: deps }, 'build dependencies');
+          job.progress(8, `downloading and building PHP ${candidate}`);
+          await runLongOp(job, 'pkg.php.build', { minor: version }, `PHP ${version} build`);
+          job.progress(75, `${layout === 'keel' ? 'restarting' : 'starting'} keel-php${version}-fpm`);
+          build = await job.agent.op('pkg.php.build.finish', { minor: version });
+          const unitName = build.unit ?? `keel-php${version}-fpm`;
+          if (build.unitError || build.active === false) throw new Error(`PHP ${build.version ?? candidate} built but ${unitName} did not come back: ${build.unitError ?? 'unit inactive'}; see journalctl -u ${unitName}`);
+          restarted = Boolean(build.restarted);
+          job.log(`${unitName} ${restarted ? 'restarted' : 'started'} with PHP ${build.version ?? candidate}`);
+        } else job.log(`PHP ${version} Keel build ${candidate} is already php.net's latest; re-rendering the domains on it`);
+        job.progress(80, 're-detecting PHP versions');
+        await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after PHP build failed'); job.log(`capability re-detection failed: ${err.message}`, 'warn'); });
+        const detectedNow = await job.agent.op('pkg.php.versions');
+        const now = detectedNow.versions.find((v) => v.id === version) ?? null;
+        if (!now || now.layout !== 'keel') throw new Error(`PHP ${version} does not resolve to the Keel build after the build (found ${now ? `${now.layout} at ${now.binary}` : 'nothing'}); no domain was moved`);
+        job.log(`PHP ${version} now resolves to the Keel build at ${now.binary}${now.packagedTwin ? ` (distribution packages ${now.packagedTwin.version ?? ''} remain installed and unused)`.replace(/\s+\)/, ')') : ''}`);
+        if (await relinkCliToBuild(job, now, detectedNow.defaultBinary ?? null)) job.log(`/usr/bin/php now points at the Keel build ${now.binary}`);
+        job.progress(82, `re-rendering the domains on PHP ${version}`);
+        resync = await php.resyncMinor(job, version);
+        if (resync.failed.length && !resync.applied) throw new Error(`No domain could be moved to the PHP ${version} Keel build: ${resync.failed.slice(0, 3).map((f) => `${f.domain} (${f.error})`).join('; ')}`);
+        const rec = S('software.php.keel_resynced', {}) || {};
+        settings.set('software.php.keel_resynced', { ...rec, [version]: { version: build?.version ?? now.version ?? candidate, at: new Date().toISOString() } });
       } else {
         job.progress(10, `upgrading ${packages.length} package(s)`);
         await runLongOp(job, 'pkg.upgrade', { packages, dist: false }, `PHP ${version} upgrade`);
@@ -1241,7 +1348,7 @@ export function createSoftwareService(ctx) {
       try { detected = (await job.agent.op('pkg.php.versions')).versions.find((v) => v.id === version)?.version ?? null; job.log(`PHP ${version} now reports PHP_VERSION ${detected ?? 'unknown'}`); } catch (err) { job.log(`PHP re-detection failed: ${err.message}`, 'warn'); }
       updates.invalidate();
       job.progress(100, 'done');
-      return { version, layout: layout ?? null, method, from: current ?? null, to: detected ?? build?.version ?? candidate, candidate, packages, restarted, updated: true };
+      return { version, layout: layout ?? null, method, build: buildWanted, from: current ?? null, to: detected ?? build?.version ?? candidate, candidate, packages, restarted, updated: true, ...(resync ? { resync } : {}) };
     },
   };
 

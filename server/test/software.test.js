@@ -1901,16 +1901,19 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
       expect(php83).toMatchObject({ label: 'PHP 8.3', current: '8.3.6', candidate: '8.3.36-1', layout: 'debian', packages: ['php8.3-fpm', 'php8.3-cli'], unit: 'php8.3-fpm', action: { method: 'POST', path: '/software/php/update', body: { version: '8.3' } } });
       expect(php83.reasons[0]).toMatch(/^CVE-2026-109619: .*\(fixed in 8\.3\.36\)$/);
       expect(php83.reasons).toContain('2 package updates pending (security)');
-      // Affected, but nothing newer to install: the item stays with no action.
-      expect(items[0]).toMatchObject({ label: 'PHP 8.2', current: '8.2.20', candidate: null, action: null });
-      expect(items[0].reasons).toHaveLength(1);
+      // Affected, no distribution package carries a fix, php.net has a newer 8.2: the update is a source build over the packages.
+      expect(items[0]).toMatchObject({ label: 'PHP 8.2', current: '8.2.20', candidate: '8.2.35', layout: 'debian', source: 'release', method: 'source', build: true, packages: [], action: { method: 'POST', path: '/software/php/update', body: { version: '8.2' } } });
+      expect(items[0].reasons).toHaveLength(2);
+      expect(items[0].reasons[1]).toBe('php.net released 8.2.35; no distribution package carries a fix, so it is built from source');
+      expect(php83).toMatchObject({ source: 'package', method: 'package', build: false });
       expect(items[2]).toMatchObject({ label: 'OpenSSL', current: '3.0.13-0ubuntu3.4', candidate: '3.0.13-0ubuntu3.5', packages: ['openssl'], action: { path: '/software/update/run', body: { packages: ['openssl'], dist: false, refreshIndex: false } } });
       expect(items[3]).toMatchObject({ label: 'Git', current: '2.43.0-1', candidate: '2.43.0-2', packages: ['git'], action: { path: '/software/runtimes/update', body: { tool: 'git' } } });
       expect(items[4]).toMatchObject({ label: 'Node.js 22', current: 'v22.11.0', candidate: 'v22.14.0', action: { path: '/software/runtimes/update', body: { runtime: 'nodejs', version: '22' } } });
       expect(items[5]).toMatchObject({ label: 'PHP 8.4 (Keel build)', current: '8.4.33', candidate: '8.4.35', layout: 'keel', packages: [], source: 'release', action: { body: { version: '8.4' } }, reasons: ['php.net released 8.4.35'] });
-      expect(items.map((i) => i.source)).toEqual([null, 'package', 'package', 'package', 'release', 'release']);
+      expect(items.map((i) => i.source)).toEqual(['release', 'package', 'package', 'package', 'release', 'release']);
       expect(items.some((i) => i.packages.includes('vim') || i.packages.includes('libssl3'))).toBe(false);
-      expect(app.agent.callsTo('pkg.php.release').map((c) => c.args)).toEqual([{ minor: '8.4' }]);
+      // php.net is asked for the advisory-hit packaged minor and the Keel build, never for 8.3 whose packages carry the fix.
+      expect(app.agent.callsTo('pkg.php.release').map((c) => c.args)).toEqual([{ minor: '8.2' }, { minor: '8.4' }]);
       expect(app.agent.callsTo('pkg.node.release').map((c) => c.args)).toEqual([{ major: 22 }]);
       expect(app.ctx.settings.get('software.php.releases')['8.4']).toMatchObject({ version: '8.4.35', sha256: SHA_A });
       expect(app.ctx.settings.get('software.node.releases')['22']).toMatchObject({ version: 'v22.14.0' });
@@ -1931,16 +1934,18 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
       age('software.php.releases');
       age('software.node.releases');
       await post('/api/software/updates/critical/refresh');
-      expect(app.agent.callsTo('pkg.php.release').map((c) => c.args)).toEqual([{ minor: '8.4' }]);
+      expect(app.agent.callsTo('pkg.php.release').map((c) => c.args)).toEqual([{ minor: '8.2' }, { minor: '8.4' }]);
       expect(app.agent.callsTo('pkg.node.release').map((c) => c.args)).toEqual([{ major: 22 }]);
       // Catalog rows carry the same verdict with its source and check time; the catalog itself carries the check times.
       const catalog = (await get('/api/software/php/catalog')).body.data;
       const cat = catalog.versions;
       const list = (await get('/api/software/updates/critical')).body.data;
       expect(catalog.updates).toEqual({ checkedAt: list.checkedAt, packagesCheckedAt: list.packagesCheckedAt, releasesCheckedAt: list.releasesCheckedAt });
-      expect(cat.find((v) => v.id === '8.3').update).toEqual({ candidate: '8.3.36-1', severity: 'critical', reasons: php83.reasons, current: '8.3.6', source: 'package', checkedAt: list.packagesCheckedAt });
-      expect(cat.find((v) => v.id === '8.4').update).toEqual({ candidate: '8.4.35', severity: 'update', reasons: ['php.net released 8.4.35'], current: '8.4.33', source: 'release', checkedAt: list.releasesCheckedAt });
-      expect(cat.find((v) => v.id === '8.2').update).toMatchObject({ candidate: null, severity: 'critical', source: null, checkedAt: list.packagesCheckedAt });
+      expect(cat.find((v) => v.id === '8.3').update).toEqual({ candidate: '8.3.36-1', severity: 'critical', reasons: php83.reasons, current: '8.3.6', source: 'package', method: 'package', build: false, checkedAt: list.packagesCheckedAt });
+      expect(cat.find((v) => v.id === '8.4').update).toEqual({ candidate: '8.4.35', severity: 'update', reasons: ['php.net released 8.4.35'], current: '8.4.33', source: 'release', method: 'source', build: true, checkedAt: list.releasesCheckedAt });
+      expect(cat.find((v) => v.id === '8.2').update).toMatchObject({ candidate: '8.2.35', severity: 'critical', source: 'release', method: 'source', build: true, checkedAt: list.releasesCheckedAt });
+      // The advisory badge and the Updates column never contradict each other: a hit row always carries either a candidate or an explicit null.
+      for (const v of cat.filter((x) => x.installed && x.advisories.length)) expect(v.update).not.toBeNull();
       expect(cat.find((v) => v.id === '8.5').update).toBeNull();
       const rt = (await get('/api/software/runtimes')).body.data;
       expect(rt.updates).toEqual(catalog.updates);
@@ -1969,6 +1974,10 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
   it('Check for updates re-runs the OS update simulation when the recorded check is older than six hours', async () => {
     pendingCheck(PENDING, '2026-11-01T05:41:00.000Z');
     withVersions([PHP83, PHP82P]);
+    // php.net unreachable and nothing cached: an advisory with no package candidate stays without a fix.
+    app.ctx.settings.set('software.php.releases', null);
+    app.agent.set('pkg.php.release', () => ({}));
+    app.ctx.software.updates.invalidate();
     app.agent.calls.length = 0;
     try {
       const res = await post('/api/software/updates/critical/refresh');
@@ -2001,8 +2010,9 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
       const [a, b] = await Promise.all([app.ctx.software.updates.refresh(), app.ctx.software.updates.refresh()]);
       expect(a).toBe(b);
       expect(app.agent.callsTo('pkg.upgradable')).toHaveLength(1);
-      expect(app.agent.callsTo('pkg.php.release').map((c) => c.args)).toEqual([{ minor: '8.4' }]);
+      expect(app.agent.callsTo('pkg.php.release').map((c) => c.args)).toEqual([{ minor: '8.3' }, { minor: '8.4' }]);
       expect(a.items.find((i) => i.kind === 'php' && i.id === '8.4')).toMatchObject({ candidate: '8.4.35' });
+      expect(a.items.find((i) => i.kind === 'php' && i.id === '8.3')).toMatchObject({ candidate: '8.3.35', method: 'source', build: true });
       // Once settled, the next call is a run of its own again.
       app.ctx.settings.set('software.updates.last_check', { ...app.ctx.settings.get('software.updates.last_check'), at: '2026-11-01T05:41:00.000Z' });
       await app.ctx.software.updates.refresh();
@@ -2032,6 +2042,9 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
   it('refuses a PHP update without a candidate (422) and for a version that is not installed', async () => {
     pendingCheck(PENDING);
     withVersions([PHP83, PHP82P, KEEL84]);
+    app.ctx.settings.set('software.php.releases', null);
+    app.agent.set('pkg.php.release', () => ({}));
+    app.ctx.software.updates.invalidate();
     app.agent.calls.length = 0;
     try {
       const none = await post('/api/software/php/update', { version: '8.2' });
@@ -2052,14 +2065,19 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
   it('updates a packaged version: pkg.upgrade of its pending packages, FPM reload, pending re-check, re-detection, audit', async () => {
     pendingCheck(PENDING);
     withVersions([PHP83, PHP82P, KEEL84]);
+    app.ctx.settings.set('software.php.releases', null);
+    app.agent.set('pkg.php.release', () => ({}));
+    app.ctx.software.updates.invalidate();
     app.agent.calls.length = 0;
     try {
       const res = await post('/api/software/php/update', { version: '8.3' });
       expect(res.status, JSON.stringify(res.body)).toBe(202);
-      expect(res.body.data).toMatchObject({ version: '8.3', candidate: '8.3.36-1', method: 'package', job: { type: 'software.php.update' } });
+      expect(res.body.data).toMatchObject({ version: '8.3', candidate: '8.3.36-1', method: 'package', build: false, job: { type: 'software.php.update' } });
       const job = await waitForJob(app.ctx, res.body.data.job.id);
       expect(job.status, job.error).toBe('done');
-      expect(job.result).toMatchObject({ version: '8.3', method: 'package', from: '8.3.6', candidate: '8.3.36-1', packages: ['php8.3-fpm', 'php8.3-cli'], restarted: true, updated: true });
+      expect(job.result).toMatchObject({ version: '8.3', method: 'package', build: false, from: '8.3.6', candidate: '8.3.36-1', packages: ['php8.3-fpm', 'php8.3-cli'], restarted: true, updated: true });
+      expect(job.result.resync).toBeUndefined();
+      expect(app.agent.callsTo('pkg.install')).toHaveLength(0);
       expect(app.agent.callsTo('pkg.upgrade').map((c) => c.args)).toEqual([{ packages: ['php8.3-fpm', 'php8.3-cli'], dist: false, wait: false }]);
       expect(app.agent.callsTo('svc.reload').map((c) => c.args)).toEqual([{ unit: 'php8.3-fpm' }]);
       const names = app.agent.calls.map((c) => c.name);
@@ -2085,17 +2103,20 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
     try {
       const res = await post('/api/software/php/update', { version: '8.4' });
       expect(res.status, JSON.stringify(res.body)).toBe(202);
-      expect(res.body.data).toMatchObject({ version: '8.4', candidate: '8.4.35', method: 'source' });
+      expect(res.body.data).toMatchObject({ version: '8.4', candidate: '8.4.35', method: 'source', build: true });
       const job = await waitForJob(app.ctx, res.body.data.job.id);
       expect(job.status, job.error).toBe('done');
-      expect(job.result).toMatchObject({ version: '8.4', layout: 'keel', method: 'source', from: '8.4.33', candidate: '8.4.35', restarted: true, packages: [] });
+      expect(job.result).toMatchObject({ version: '8.4', layout: 'keel', method: 'source', build: true, from: '8.4.33', candidate: '8.4.35', restarted: true, packages: [], resync: { domains: 0, pinned: 0, inherited: 0, applied: 0, failed: [] } });
+      expect(app.agent.callsTo('pkg.install').map((c) => c.args)).toEqual([{ packages: PHP_BUILD_DEPS.debian, wait: false }]);
       expect(app.agent.callsTo('pkg.php.build').map((c) => c.args)).toEqual([{ minor: '8.4', wait: false }]);
       expect(app.agent.callsTo('pkg.php.build.finish').map((c) => c.args)).toEqual([{ minor: '8.4' }]);
       expect(app.agent.callsTo('pkg.upgrade')).toHaveLength(0);
-      expect(app.agent.callsTo('pkg.install')).toHaveLength(0);
       const names = app.agent.calls.map((c) => c.name);
+      expect(names.indexOf('pkg.php.build')).toBeGreaterThan(names.indexOf('pkg.install'));
       expect(names.indexOf('pkg.php.build.finish')).toBeGreaterThan(names.indexOf('pkg.php.build'));
       expect(names.indexOf('sys.binaries')).toBeGreaterThan(names.indexOf('pkg.php.build.finish'));
+      expect(names.lastIndexOf('pkg.php.versions')).toBeGreaterThan(names.indexOf('sys.binaries'));
+      expect(app.ctx.settings.get('software.php.keel_resynced')['8.4']).toMatchObject({ version: '8.4.35' });
       // A unit that does not come back fails the job.
       app.agent.set('pkg.php.build.finish', ({ minor }) => ({ minor, version: `${minor}.35`, unit: `keel-php${minor}-fpm`, active: false, unitError: 'Job for keel-php8.4-fpm.service failed', restarted: true }));
       const again = await post('/api/software/php/update', { version: '8.4' });
@@ -2142,5 +2163,282 @@ describe('Critical updates and direct Update buttons (contract §63)', () => {
     expect(app.agent.callsTo('pkg.upgrade')).toHaveLength(0);
     expect(app.agent.callsTo('pkg.node.install')).toHaveLength(0);
     app.ctx.settings.set('software.updates.last_check', null);
+  });
+
+  // The owner's case: the distribution's PHP 8.5 (8.5.4) carries an advisory,
+  // no package fixes it, php.net's 8.5 is newer. The update builds php.net's
+  // release, the build then wins over the packages for that minor, and every
+  // domain on the minor (plus the hostname site) is rendered on it.
+  const twin82 = { binary: '/usr/bin/php8.2', version: '8.2.20', layout: 'debian', packagePrefix: 'php8.2-', fpmUnit: 'php8.2-fpm', poolDir: '/etc/php/8.2/fpm/pool.d' };
+  const KEEL82_BOTH = () => ({ ...keelVersion('8.2'), version: '8.2.35', packagedTwin: twin82 });
+  const stubWeb = (calls, phpSocket) => ({
+    setPhpVersion: async (domain, version, req, opts) => { calls.push(['setPhpVersion', domain, version, opts?.reload, opts?.repool === true]); },
+    hostApps: { resyncPhpDefault: async (version) => { calls.push(['resyncPhpDefault', version]); return { applied: true, version, socket: '/run/keel-php/php8.2-fpm-keel-host.sock' }; }, list: async () => ({ apps: [] }) },
+    hostname: { status: async () => ({ phpSocket }) },
+  });
+
+  it('a packaged minor with an advisory and no package fix: php.net source build -> build.finish -> re-detect (the build wins) -> resync of its domains and the hostname site', async () => {
+    pendingCheck([]);
+    let built = false;
+    app.agent.set('pkg.php.versions', () => ({ versions: [PHP83, built ? KEEL82_BOTH() : PHP82P], defaultId: '8.3', defaultBinary: '/usr/bin/php8.3' }));
+    app.agent.set('pkg.php.release', ({ minor }) => ({ minor, version: `${minor}.35`, filename: `php-${minor}.35.tar.xz`, sha256: SHA_A }));
+    app.agent.set('pkg.php.build', ({ minor }) => ({ minor, version: `${minor}.35`, prefix: `/opt/keel/php/${minor}`, background: false, code: 0, output: [`Building PHP ${minor}.35`] }));
+    app.agent.set('pkg.php.build.finish', ({ minor }) => { built = true; return { minor, version: `${minor}.35`, prefix: `/opt/keel/php/${minor}`, binary: `/opt/keel/php/${minor}/bin/php`, unit: `keel-php${minor}-fpm`, active: true, restarted: false, link: `/usr/local/bin/php${minor}`, buildDirsRemoved: [] }; });
+    app.ctx.settings.set('software.php.releases', null);
+    app.ctx.settings.set('software.php.keel_resynced', null);
+    app.ctx.software.updates.invalidate();
+    await put('/api/software/php/domains', { domains: ['alice.com'], version: '8.2' });
+    await put('/api/software/php/domains', { domains: ['bob.com'], version: null });
+    const prevWeb = app.ctx.web;
+    const calls = [];
+    app.ctx.web = stubWeb(calls, '/run/php/php8.2-fpm-keel-host.sock');
+    app.agent.calls.length = 0;
+    try {
+      const row = (await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === '8.2');
+      expect(row).toMatchObject({ layout: 'debian', method: 'package', update: { candidate: '8.2.35', severity: 'critical', source: 'release', method: 'source', build: true } });
+      expect(row.update.reasons.join(' ')).toMatch(/built from source/);
+      const res = await post('/api/software/php/update', { version: '8.2' });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(res.body.data).toMatchObject({ version: '8.2', candidate: '8.2.35', method: 'source', build: true, job: { type: 'software.php.update' } });
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, job.error).toBe('done');
+      expect(job.result).toMatchObject({ version: '8.2', layout: 'debian', method: 'source', build: true, from: '8.2.20', to: '8.2.35', candidate: '8.2.35', updated: true, resync: { domains: 1, pinned: 1, inherited: 0, applied: 1, failed: [], host: { applied: true } } });
+      const names = app.agent.calls.map((c) => c.name);
+      expect(app.agent.callsTo('pkg.install').map((c) => c.args)).toEqual([{ packages: PHP_BUILD_DEPS.debian, wait: false }]);
+      expect(app.agent.callsTo('pkg.php.build').map((c) => c.args)).toEqual([{ minor: '8.2', wait: false }]);
+      expect(app.agent.callsTo('pkg.php.build.finish').map((c) => c.args)).toEqual([{ minor: '8.2' }]);
+      expect(app.agent.callsTo('pkg.upgrade')).toHaveLength(0);
+      expect(names.indexOf('pkg.php.build')).toBeGreaterThan(names.indexOf('pkg.install'));
+      expect(names.indexOf('pkg.php.build.finish')).toBeGreaterThan(names.indexOf('pkg.php.build'));
+      expect(names.indexOf('sys.binaries')).toBeGreaterThan(names.indexOf('pkg.php.build.finish'));
+      expect(names.lastIndexOf('pkg.php.versions')).toBeGreaterThan(names.indexOf('sys.binaries'));
+      // Only the domain pinned to 8.2 is re-rendered (8.3 is the default, so inherited ones stay), with its pool rewritten in the build's tree
+      // (repool: an applied row from the packaged tree must not short-circuit); the hostname site follows because it ran on 8.2's socket.
+      expect(calls).toEqual([['setPhpVersion', 'alice.com', '8.2', true, true], ['resyncPhpDefault', '8.3']]);
+      expect(app.agent.callsTo('pkg.php.default.set')).toHaveLength(0);
+      expect(job.logs.some((l) => /now resolves to the Keel build at \/opt\/keel\/php\/8\.2\/bin\/php \(distribution packages 8\.2\.20 remain installed and unused\)/.test(l.line))).toBe(true);
+      expect(job.logs.some((l) => /PHP 8\.2 now reports PHP_VERSION 8\.2\.35/.test(l.line))).toBe(true);
+      expect(app.ctx.settings.get('software.php.keel_resynced')['8.2']).toMatchObject({ version: '8.2.35' });
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted AS args FROM audit_log WHERE action = 'software.php.update' AND target = '8.2' ORDER BY id DESC").get().args)).toMatchObject({ from: '8.2.20', to: '8.2.35', method: 'source', build: true });
+      // The catalog row now: the Keel build with the packages beside it, up to date, no contradiction with the (now absent) advisory.
+      const after = (await get('/api/software/php/catalog')).body.data.versions;
+      expect(after.filter((v) => v.id === '8.2')).toHaveLength(1);
+      const both = after.find((v) => v.id === '8.2');
+      expect(both).toMatchObject({ label: 'PHP 8.2 (Keel build)', version: '8.2.35', layout: 'keel', source: true, method: 'source', prefix: '/opt/keel/php/8.2', packagePrefix: 'php8.2-', packagedTwin: { binary: '/usr/bin/php8.2', version: '8.2.20', packagePrefix: 'php8.2-', fpmUnit: 'php8.2-fpm' }, update: null, domains: 1 });
+      expect(both.note).toBe('Distribution packages 8.2.20 remain installed and unused; Remove packages drops them without touching the Keel build.');
+      expect(both.packages).toEqual([]);
+    } finally {
+      app.ctx.web = prevWeb;
+      await put('/api/software/php/domains', { domains: ['alice.com'], version: null });
+      app.agent.set('pkg.php.versions', stock);
+      app.agent.set('pkg.php.release', () => ({}));
+      app.agent.reset('pkg.php.build'); app.agent.reset('pkg.php.build.finish');
+      app.ctx.settings.set('software.php.keel_resynced', null);
+      app.ctx.software.updates.invalidate();
+    }
+  });
+
+  it('a Keel build already on php.net\'s latest that shadows packages offers the resync alone (no build); once resynced the row is up to date', async () => {
+    pendingCheck([]);
+    withVersions([PHP83, KEEL82_BOTH()]);
+    app.agent.set('pkg.php.release', ({ minor }) => ({ minor, version: `${minor}.35`, filename: `php-${minor}.35.tar.xz`, sha256: SHA_A }));
+    app.ctx.settings.set('software.php.releases', null);
+    app.ctx.settings.set('software.php.keel_resynced', null);
+    app.ctx.software.updates.invalidate();
+    await put('/api/software/php/domains', { domains: ['alice.com'], version: '8.2' });
+    const def = await put('/api/software/php/default', { version: '8.2' });
+    if (def.body.data?.job) await waitForJob(app.ctx, def.body.data.job.id);
+    const prevWeb = app.ctx.web;
+    const calls = [];
+    app.ctx.web = stubWeb(calls, '/run/keel-php/php8.2-fpm-keel-host.sock');
+    app.agent.calls.length = 0;
+    try {
+      const list = (await get('/api/software/updates/critical')).body.data;
+      expect(list.items.find((i) => i.kind === 'php' && i.id === '8.2')).toMatchObject({ current: '8.2.35', candidate: '8.2.35', severity: 'update', source: 'release', method: 'source', build: false, action: { body: { version: '8.2' } } });
+      const res = await post('/api/software/php/update', { version: '8.2' });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(res.body.data).toMatchObject({ method: 'source', build: false, candidate: '8.2.35' });
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, job.error).toBe('done');
+      expect(app.agent.callsTo('pkg.install')).toHaveLength(0);
+      expect(app.agent.callsTo('pkg.php.build')).toHaveLength(0);
+      expect(app.agent.callsTo('pkg.php.build.finish')).toHaveLength(0);
+      // 8.2 is the default here: the pinned domain, the inherited one and the hostname site are all re-rendered.
+      expect(calls).toEqual([['setPhpVersion', 'alice.com', '8.2', false, true], ['setPhpVersion', 'bob.com', '8.2', true, true], ['resyncPhpDefault', '8.2']]);
+      expect(job.result).toMatchObject({ method: 'source', build: false, resync: { domains: 2, pinned: 1, inherited: 1, applied: 2 } });
+      expect(app.ctx.settings.get('software.php.keel_resynced')['8.2']).toMatchObject({ version: '8.2.35' });
+      expect((await get('/api/software/updates/critical')).body.data.items.some((i) => i.kind === 'php' && i.id === '8.2')).toBe(false);
+      expect((await get('/api/software/php/catalog')).body.data.versions.find((v) => v.id === '8.2').update).toBeNull();
+      expect((await post('/api/software/php/update', { version: '8.2' })).status).toBe(422);
+    } finally {
+      app.ctx.web = prevWeb;
+      await put('/api/software/php/domains', { domains: ['alice.com'], version: null });
+      await put('/api/software/php/default', { version: '8.3' });
+      app.agent.set('pkg.php.versions', stock);
+      app.agent.set('pkg.php.release', () => ({}));
+      app.ctx.settings.set('software.php.keel_resynced', null);
+      app.ctx.software.updates.invalidate();
+    }
+  });
+
+  it('a source build over a packaged minor is allowed from Install Software only when php.net is newer than the packages', async () => {
+    const fromPackages = { installed: true, id: '8.2', version: '8.2.20', source: false, layout: 'debian' };
+    expect(resolveInstall({ runtime: 'php', version: '8.2' }, 'debian', { method: 'source', installed: fromPackages, latest: '8.2.35' })).toMatchObject({ installer: 'php-source', minor: '8.2' });
+    expect(() => resolveInstall({ runtime: 'php', version: '8.2' }, 'debian', { method: 'source', installed: fromPackages, latest: '8.2.20' })).toThrow(/php\.net's latest 8\.2 release \(8\.2\.20\) is not newer/);
+    expect(() => resolveInstall({ runtime: 'php', version: '8.2' }, 'debian', { method: 'source', installed: fromPackages, latest: '8.2.9' })).toThrow(/is not newer/);
+    expect(() => resolveInstall({ runtime: 'php', version: '8.2' }, 'debian', { method: 'source', installed: fromPackages })).toThrow(/remove those packages first/);
+    app.agent.set('pkg.php.release', ({ minor }) => ({ minor, version: `${minor}.35`, filename: `php-${minor}.35.tar.xz`, sha256: SHA_A }));
+    app.ctx.settings.set('software.php.releases', null);
+    app.agent.calls.length = 0;
+    try {
+      const res = await post('/api/software/runtimes/install', { runtime: 'php', version: '8.2', method: 'source' });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(res.body.data).toMatchObject({ target: 'php:8.2', method: 'source', prefix: '/opt/keel/php/8.2' });
+      await waitForJob(app.ctx, res.body.data.job.id);
+      app.agent.set('pkg.php.release', ({ minor }) => ({ minor, version: `${minor}.6`, filename: `php-${minor}.6.tar.xz`, sha256: SHA_A }));
+      app.ctx.settings.set('software.php.releases', null);
+      const old = await post('/api/software/runtimes/install', { runtime: 'php', version: '8.2', method: 'source' });
+      expect(old.status).toBe(422);
+      expect(old.body.error.message).toMatch(/\(8\.2\.6\) is not newer/);
+    } finally {
+      app.agent.set('pkg.php.release', () => ({}));
+      app.ctx.settings.set('software.php.releases', null);
+      app.ctx.software.updates.invalidate();
+    }
+  });
+
+  it('removes only the distribution packages beside a Keel build with { packages: true }, never the build, and refuses while the hostname site still runs on them', async () => {
+    withVersions([PHP83, KEEL82_BOTH()]);
+    const removals = [];
+    app.agent.set('pkg.php.remove', ({ version, dry, packages }) => {
+      expect(packages).toBe(true);
+      const base = { version, layout: 'debian', manager: 'apt', packages: [`php${version}-fpm`, `php${version}-cli`], purge: false, extra: [], packagesOnly: true, keelPrefix: `/opt/keel/php/${version}` };
+      if (dry) return { ...base, dry: true, remove: base.packages, output: [] };
+      removals.push(version);
+      return { ...base, forced: false, confirmed: [], output: ['Removing php8.2-fpm'] };
+    });
+    await put('/api/software/php/offered', { versions: ['8.3', '8.2'] });
+    const prevWeb = app.ctx.web;
+    app.ctx.web = stubWeb([], '/run/php/php8.2-fpm-keel-host.sock');
+    app.agent.calls.length = 0;
+    try {
+      const still = await post('/api/software/php/remove', { version: '8.2', packages: true });
+      expect(still.status, JSON.stringify(still.body)).toBe(422);
+      expect(still.body.error.message).toMatch(/hostname site .* still runs on the PHP 8\.2 packages' socket/);
+      expect(app.agent.callsTo('pkg.php.remove')).toHaveLength(0);
+      app.ctx.web = stubWeb([], '/run/keel-php/php8.2-fpm-keel-host.sock');
+      expect((await post('/api/software/php/remove', { version: '8.3', packages: true })).status).toBe(422);
+      expect((await post('/api/software/php/remove', { version: '8.3', packages: true })).body.error.message).toMatch(/no distribution packages beside a Keel build/);
+      expect((await post('/api/software/php/remove', { version: '8.2', packages: 'yes' })).status).toBe(422);
+      const res = await post('/api/software/php/remove', { version: '8.2', packages: true });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(res.body.data).toMatchObject({ version: '8.2', packages: true, extra: [], forced: false });
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, job.error).toBe('done');
+      expect(job.result).toEqual({ version: '8.2', packages: ['php8.2-fpm', 'php8.2-cli'], removed: true, packagesOnly: true, keelKept: true, prefix: '/opt/keel/php/8.2' });
+      expect(app.agent.callsTo('pkg.php.remove').map((c) => c.args)).toEqual([{ version: '8.2', dry: true, packages: true }, { version: '8.2', packages: true, wait: false }]);
+      expect(removals).toEqual(['8.2']);
+      // The Keel build stays an offered version; the audit names the package-only removal.
+      expect(app.ctx.software.php.offeredVersions()).toEqual(['8.3', '8.2']);
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted AS args FROM audit_log WHERE action = 'software.php.remove' AND target = '8.2' ORDER BY id DESC").get().args)).toMatchObject({ packages: true, force: false });
+      // Without packages: true the same minor removes the Keel build through the usual guards (the CLI/system default here is 8.3).
+      app.agent.set('pkg.php.remove', ({ version, dry, packages }) => { expect(packages).toBeUndefined(); return dry ? { version, layout: 'keel', packages: [], dry: true, remove: [], extra: [], output: [] } : { version, layout: 'keel', prefix: `/opt/keel/php/${version}`, packages: [], removed: true, output: [] }; });
+      const build = await post('/api/software/php/remove', { version: '8.2' });
+      expect(build.status, JSON.stringify(build.body)).toBe(202);
+      expect((await waitForJob(app.ctx, build.body.data.job.id)).result).toMatchObject({ version: '8.2', layout: 'keel', prefix: '/opt/keel/php/8.2', removed: true });
+    } finally {
+      app.ctx.web = prevWeb;
+      await put('/api/software/php/offered', { versions: null });
+      app.agent.reset('pkg.php.remove');
+      app.agent.set('pkg.php.versions', stock);
+      app.ctx.software.updates.invalidate();
+    }
+  });
+
+  it('refuses Remove packages while a domain on the minor was never moved onto the Keel build (keel_resynced unset), and allows it once the resync is recorded', async () => {
+    withVersions([PHP83, KEEL82_BOTH()]);
+    app.agent.set('pkg.php.remove', ({ version, dry }) => (dry ? { version, layout: 'debian', manager: 'apt', packages: [`php${version}-fpm`], dry: true, remove: [`php${version}-fpm`], extra: [], output: [], packagesOnly: true, keelPrefix: `/opt/keel/php/${version}` } : { version, layout: 'debian', manager: 'apt', packages: [`php${version}-fpm`], purge: false, extra: [], forced: false, confirmed: [], output: [], packagesOnly: true, keelPrefix: `/opt/keel/php/${version}` }));
+    app.ctx.settings.set('software.php.keel_resynced', null);
+    await put('/api/software/php/domains', { domains: ['alice.com'], version: '8.2' });
+    const prevWeb = app.ctx.web;
+    app.ctx.web = stubWeb([], '/run/keel-php/php8.2-fpm-keel-host.sock');
+    app.agent.calls.length = 0;
+    try {
+      const refused = await post('/api/software/php/remove', { version: '8.2', packages: true });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      expect(refused.body.error.message).toMatch(/domains on PHP 8\.2 still run on the distribution packages; run Update on PHP 8\.2 first/);
+      expect(app.agent.callsTo('pkg.php.remove')).toHaveLength(0);
+      // A resync recorded for an older build does not count either.
+      app.ctx.settings.set('software.php.keel_resynced', { '8.2': { version: '8.2.33', at: '2026-11-01T00:00:00.000Z' } });
+      expect((await post('/api/software/php/remove', { version: '8.2', packages: true })).status).toBe(422);
+      app.ctx.settings.set('software.php.keel_resynced', { '8.2': { version: '8.2.35', at: new Date().toISOString() } });
+      const res = await post('/api/software/php/remove', { version: '8.2', packages: true });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, job.error).toBe('done');
+      expect(app.agent.callsTo('pkg.php.remove').map((c) => c.args)).toEqual([{ version: '8.2', dry: true, packages: true }, { version: '8.2', packages: true, wait: false }]);
+      expect(app.agent.callsTo('pkg.php.default.set')).toHaveLength(0);
+    } finally {
+      app.ctx.web = prevWeb;
+      await put('/api/software/php/domains', { domains: ['alice.com'], version: null });
+      app.agent.reset('pkg.php.remove');
+      app.agent.set('pkg.php.versions', stock);
+      app.ctx.settings.set('software.php.keel_resynced', null);
+      app.ctx.software.updates.invalidate();
+    }
+  });
+
+  it('relinks /usr/bin/php to the Keel build when the packaged twin was the CLI default: on Update before the resync, and on Remove packages before the removal', async () => {
+    pendingCheck([]);
+    const keelDefault = { ...KEEL82_BOTH(), isDefault: true };
+    app.agent.set('pkg.php.versions', () => ({ versions: [{ ...PHP83, isDefault: false }, keelDefault], defaultId: '8.2', defaultBinary: '/usr/bin/php8.2' }));
+    app.agent.set('pkg.php.release', ({ minor }) => ({ minor, version: `${minor}.35`, filename: `php-${minor}.35.tar.xz`, sha256: SHA_A }));
+    app.agent.set('pkg.php.remove', ({ version, dry }) => (dry ? { version, layout: 'debian', manager: 'apt', packages: [`php${version}-fpm`], dry: true, remove: [`php${version}-fpm`], extra: [], output: [], packagesOnly: true, keelPrefix: `/opt/keel/php/${version}` } : { version, layout: 'debian', manager: 'apt', packages: [`php${version}-fpm`], purge: false, extra: [], forced: false, confirmed: [], output: [], packagesOnly: true, keelPrefix: `/opt/keel/php/${version}` }));
+    app.ctx.settings.set('software.php.releases', null);
+    app.ctx.settings.set('software.php.keel_resynced', null);
+    app.ctx.software.updates.invalidate();
+    await put('/api/software/php/domains', { domains: ['alice.com'], version: '8.2' });
+    const prevWeb = app.ctx.web;
+    const calls = [];
+    app.ctx.web = stubWeb(calls, '/run/keel-php/php8.2-fpm-keel-host.sock');
+    app.agent.calls.length = 0;
+    try {
+      const res = await post('/api/software/php/update', { version: '8.2' });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(res.body.data).toMatchObject({ method: 'source', build: false });
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, job.error).toBe('done');
+      expect(app.agent.callsTo('pkg.php.default.set').map((c) => c.args)).toEqual([{ version: '8.2' }]);
+      const names = app.agent.calls.map((c) => c.name);
+      expect(names.indexOf('pkg.php.default.set')).toBeGreaterThan(names.indexOf('pkg.php.versions'));
+      expect(job.logs.some((l) => /\/usr\/bin\/php now points at the Keel build \/opt\/keel\/php\/8\.2\/bin\/php/.test(l.line))).toBe(true);
+      expect(calls.find((c) => c[0] === 'setPhpVersion' && c[1] === 'alice.com')).toEqual(['setPhpVersion', 'alice.com', '8.2', expect.any(Boolean), true]);
+      expect(app.ctx.settings.get('software.php.keel_resynced')['8.2']).toMatchObject({ version: '8.2.35' });
+      // Remove packages on a row the discovery still reports as the default: the relink runs first, then the removal.
+      app.agent.calls.length = 0;
+      const rm = await post('/api/software/php/remove', { version: '8.2', packages: true });
+      expect(rm.status, JSON.stringify(rm.body)).toBe(202);
+      expect((await waitForJob(app.ctx, rm.body.data.job.id)).status).toBe('done');
+      // The request's dry run comes first; inside the job the relink precedes the real removal.
+      const order = app.agent.calls.filter((c) => c.name === 'pkg.php.default.set' || c.name === 'pkg.php.remove').map((c) => [c.name, Boolean(c.args.dry)]);
+      expect(order).toEqual([['pkg.php.remove', true], ['pkg.php.default.set', false], ['pkg.php.remove', false]]);
+      expect(app.agent.callsTo('pkg.php.default.set').map((c) => c.args)).toEqual([{ version: '8.2' }]);
+      // Already on the build: nothing to relink.
+      app.agent.set('pkg.php.versions', () => ({ versions: [{ ...PHP83, isDefault: false }, keelDefault], defaultId: '8.2', defaultBinary: '/opt/keel/php/8.2/bin/php' }));
+      app.agent.calls.length = 0;
+      const again = await post('/api/software/php/remove', { version: '8.2', packages: true });
+      expect(again.status, JSON.stringify(again.body)).toBe(202);
+      expect((await waitForJob(app.ctx, again.body.data.job.id)).status).toBe('done');
+      expect(app.agent.callsTo('pkg.php.default.set')).toHaveLength(0);
+    } finally {
+      app.ctx.web = prevWeb;
+      await put('/api/software/php/domains', { domains: ['alice.com'], version: null });
+      app.agent.reset('pkg.php.remove');
+      app.agent.set('pkg.php.versions', stock);
+      await put('/api/software/php/default', { version: '8.3' });
+      app.agent.set('pkg.php.release', () => ({}));
+      app.ctx.settings.set('software.php.keel_resynced', null);
+      app.ctx.software.updates.invalidate();
+    }
   });
 });

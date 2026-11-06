@@ -189,6 +189,25 @@ const keelPhpDir = () => process.env.WHM_KEEL_PHP_DIR || KEEL_PHP_DIR;
 const systemdUnitDir = () => process.env.WHM_SYSTEMD_UNIT_DIR || SYSTEMD_UNIT_DIR;
 const keelPhpUnit = (minor) => `keel-php${minor}-fpm`;
 
+// A Keel build of a minor wins over the distribution tree of the same minor:
+// the entry keeps the minor as its id and reports the packaged tree it
+// shadows as packagedTwin, so the packages can still be removed (pkg.php.remove
+// { packages: true }) and /usr/bin/php pointing at them still resolves to the minor.
+export function preferKeelBuilds(versions) {
+  const out = [];
+  for (const v of versions) {
+    if (v.layout !== 'keel') { if (!out.some((x) => x.id === v.id)) out.push(v); continue; }
+    const idx = out.findIndex((x) => x.id === v.id);
+    if (idx < 0) { out.push(v); continue; }
+    const twin = out[idx];
+    if (twin.layout === 'keel') continue;
+    out[idx] = { ...v, packagedTwin: { binary: twin.binary, layout: twin.layout, packagePrefix: twin.packagePrefix ?? null, fpmUnit: twin.fpmUnit ?? null, poolDir: twin.poolDir ?? null, version: null } };
+  }
+  return out;
+}
+
+const samePath = (a, b) => { try { return fs.realpathSync(a) === b; } catch { return false; } };
+
 // PHP installations this host may carry, by packaging layout.
 export function discoverPhp() {
   const found = new Map();
@@ -218,25 +237,37 @@ export function discoverPhp() {
   if (fs.existsSync('/etc/php.ini') && fs.existsSync('/usr/bin/php')) {
     add('system', '/usr/bin/php', 'rhel', { label: 'System PHP', iniPath: '/etc/php.ini', iniPaths: { php: '/etc/php.ini' }, poolDir: '/etc/php-fpm.d', fpmUnit: 'php-fpm', packagePrefix: 'php-' });
   }
+  const keel = [];
   for (const dir of safeReaddir(keelPhpDir())) {
     if (!/^\d\.\d+$/.test(dir)) continue;
     const prefix = path.join(keelPhpDir(), dir);
     // php-build.sh writes .keel-build-ok as its last step; a prefix without it is a build that died in make install.
-    if (!fs.existsSync(path.join(prefix, '.keel-build-ok')) || !fs.existsSync(path.join(prefix, 'etc', 'php-fpm.conf'))) continue;
-    add(dir, path.join(prefix, 'bin', 'php'), 'keel', {
-      label: `PHP ${dir} (Keel build)`, iniPath: path.join(prefix, 'lib', 'php.ini'), iniPaths: { php: path.join(prefix, 'lib', 'php.ini') },
+    const binary = path.join(prefix, 'bin', 'php');
+    if (!fs.existsSync(binary) || !fs.existsSync(path.join(prefix, '.keel-build-ok')) || !fs.existsSync(path.join(prefix, 'etc', 'php-fpm.conf'))) continue;
+    keel.push({
+      id: dir, binary, layout: 'keel', label: `PHP ${dir} (Keel build)`, iniPath: path.join(prefix, 'lib', 'php.ini'), iniPaths: { php: path.join(prefix, 'lib', 'php.ini') },
       poolDir: path.join(prefix, 'etc', 'php-fpm.d'), fpmUnit: keelPhpUnit(dir), packagePrefix: null, source: true, prefix,
     });
   }
   // Only when nothing else was found: with Keel builds present /usr/bin/php is one of them (update-alternatives).
-  if (found.size === 0 && fs.existsSync('/usr/bin/php')) {
+  if (found.size === 0 && keel.length === 0 && fs.existsSync('/usr/bin/php')) {
     add('system', '/usr/bin/php', 'unknown', { label: 'System PHP', iniPath: null, iniPaths: {}, poolDir: null, fpmUnit: 'php-fpm', packagePrefix: 'php-' });
   }
   let defaultBinary = null;
   try { defaultBinary = fs.realpathSync('/usr/bin/php'); } catch { /* no system php */ }
-  const versions = [...found.values()];
-  const def = versions.find((v) => { try { return fs.realpathSync(v.binary) === defaultBinary; } catch { return false; } });
+  const versions = preferKeelBuilds([...found.values(), ...keel]);
+  const def = versions.find((v) => samePath(v.binary, defaultBinary) || (v.packagedTwin && samePath(v.packagedTwin.binary, defaultBinary)));
   return { versions, defaultId: def?.id ?? null, defaultBinary };
+}
+
+async function phpBinaryVersion(binary) {
+  try { const r = await exec(binary, ['-n', '-r', 'echo PHP_VERSION;'], { allowFailure: true, timeoutMs: 20_000 }); return r.stdout.trim().match(/^\d[\d.]*/)?.[0] ?? null; } catch { return null; }
+}
+
+// The entry with its packaged twin's PHP_VERSION filled in (null without a twin).
+async function withTwinVersion(v) {
+  if (!v.packagedTwin) return v;
+  return { ...v, packagedTwin: { ...v.packagedTwin, version: await phpBinaryVersion(v.packagedTwin.binary) } };
 }
 
 function phpVersion(id) {
@@ -881,8 +912,7 @@ defineOp('pkg.php.versions', {
     const { versions, defaultId, defaultBinary } = discoverPhp();
     const out = [];
     for (const v of versions) {
-      const ver = await exec(v.binary, ['-n', '-r', 'echo PHP_VERSION;'], { allowFailure: true, timeoutMs: 20_000 });
-      const entry = { ...v, version: ver.stdout.trim().match(/^\d[\d.]*/)?.[0] ?? null, isDefault: v.id === defaultId, fpmActive: await unitActive(v.fpmUnit), fpmInstalled: hasBinary(`php-fpm${v.id}`) || fs.existsSync(`/usr/sbin/php-fpm${v.id}`) || fs.existsSync(path.join(path.dirname(v.binary), '..', 'sbin', 'php-fpm')) || fs.existsSync(v.poolDir || '/nonexistent') };
+      const entry = { ...(await withTwinVersion(v)), version: await phpBinaryVersion(v.binary), isDefault: v.id === defaultId, fpmActive: await unitActive(v.fpmUnit), fpmInstalled: hasBinary(`php-fpm${v.id}`) || fs.existsSync(`/usr/sbin/php-fpm${v.id}`) || fs.existsSync(path.join(path.dirname(v.binary), '..', 'sbin', 'php-fpm')) || fs.existsSync(v.poolDir || '/nonexistent') };
       if (modules) {
         const m = await exec(v.binary, ['-m'], { allowFailure: true, timeoutMs: 20_000 });
         entry.modules = m.stdout.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('['));
@@ -955,16 +985,24 @@ async function removeKeelPhp(minor, ctx) {
 }
 
 defineOp('pkg.php.remove', {
-  description: 'Remove every package of one installed PHP version (or the prefix, unit and link of a Keel source build); refuses the CLI default, the last remaining version and a removal that would take other packages with it (unless force), keeps /etc/php/<ver> unless purge; dry only simulates',
+  description: 'Remove every package of one installed PHP version (or the prefix, unit and link of a Keel source build; packages: true removes the distribution packages a Keel build of the same minor shadows, keeping the build); refuses the CLI default, the last remaining version and a removal that would take other packages with it (unless force), keeps /etc/php/<ver> unless purge; dry only simulates',
   destructive: true,
   timeoutMs: LONG,
-  schema: z.object({ version: phpVersionId, purge: z.boolean().default(false), force: z.boolean().default(false), extra: z.array(pkgName).max(200).default([]), dry: z.boolean().default(false), wait }).strict(),
-  run: async ({ version, purge, force, extra: confirmed, dry, wait: waitFor }, ctx) => {
-    const { versions, defaultId } = phpDiscovery.discover();
-    const v = versions.find((x) => x.id === version);
-    if (!v) throw new OpError('not_found', `PHP version "${version}" is not installed on this server`);
-    if (v.id === defaultId) throw new OpError('refused', `PHP ${version} is the CLI default (/usr/bin/php); make another version the default first`);
-    if (versions.length < 2) throw new OpError('refused', `PHP ${version} is the only installed version; install another one before removing it`);
+  schema: z.object({ version: phpVersionId, purge: z.boolean().default(false), force: z.boolean().default(false), extra: z.array(pkgName).max(200).default([]), dry: z.boolean().default(false), packages: z.boolean().default(false), wait }).strict(),
+  run: async ({ version, purge, force, extra: confirmed, dry, packages: packagesOnly, wait: waitFor }, ctx) => {
+    const { versions, defaultId, defaultBinary } = phpDiscovery.discover();
+    const found = versions.find((x) => x.id === version);
+    if (!found) throw new OpError('not_found', `PHP version "${version}" is not installed on this server`);
+    let v = found;
+    if (packagesOnly) {
+      if (found.layout !== 'keel' || !found.packagedTwin) throw new OpError('not_found', `PHP ${version} has no distribution packages beside a Keel build; remove the version itself instead`);
+      // /usr/bin/php still pointing at the packages: removing them would leave the CLI default dangling.
+      if (defaultBinary && samePath(found.packagedTwin.binary, defaultBinary)) throw new OpError('refused', `/usr/bin/php still points at the PHP ${version} packages; make the Keel build (or another version) the CLI default first`);
+      v = { id: found.id, binary: found.packagedTwin.binary, layout: found.packagedTwin.layout, packagePrefix: found.packagedTwin.packagePrefix };
+    } else {
+      if (found.id === defaultId) throw new OpError('refused', `PHP ${version} is the CLI default (/usr/bin/php); make another version the default first`);
+      if (versions.length < 2) throw new OpError('refused', `PHP ${version} is the only installed version; install another one before removing it`);
+    }
     if (v.layout === 'keel') {
       if (dry) return { version, layout: 'keel', manager: null, packages: [], purge, dry: true, remove: [], extra: [], output: [] };
       return removeKeelPhp(v.id, ctx);
@@ -1000,7 +1038,7 @@ defineOp('pkg.php.remove', {
     const bare = prefix.slice(0, -1);
     const own = (p) => p.startsWith(prefix) || p === bare || p === `libapache2-mod-${bare}` || (pm.family === 'debian' && (p === 'php' || (p.startsWith('php-') && remove.includes(p.replace(/^php-/, prefix)))));
     const extra = remove.filter((p) => !requested.has(p) && !own(p));
-    if (dry) return { version, layout: v.layout, manager: pm.manager, packages, purge, dry: true, remove, extra, output: sim.output };
+    if (dry) return { version, layout: v.layout, manager: pm.manager, packages, purge, dry: true, remove, extra, output: sim.output, ...(packagesOnly ? { packagesOnly: true, keelPrefix: found.prefix } : {}) };
     if (extra.length && !force) throw new OpError('refused', `Removing PHP ${version} would also remove ${extra.join(', ')}; move what depends on it to another version first, or force the removal`, { version, packages, extra });
     // A forced removal is bound to the collateral the caller confirmed at
     // request time: a dependant that appeared since (an install that queued
@@ -1008,7 +1046,7 @@ defineOp('pkg.php.remove', {
     const unexpected = extra.filter((p) => !confirmed.includes(p));
     if (force && unexpected.length) throw new OpError('refused', `the removal would now also take ${unexpected.join(', ')}; confirm again`, { version, packages, extra, confirmed, unexpected });
     const argv = pm.family === 'debian' ? [purge ? 'purge' : 'remove', '-y', '-q', ...APT_DPKG_OPTS, '--', ...packages] : ['-y', '-q', 'remove', '--', ...packages];
-    return { version, manager: pm.manager, packages, purge, forced: Boolean(force && extra.length), extra, confirmed, ...finished(await runLong({ kind: 'remove', bin: pm.binary, argv, env: APT_ENV, wait: waitFor }, ctx)) };
+    return { version, layout: v.layout, manager: pm.manager, packages, purge, forced: Boolean(force && extra.length), extra, confirmed, ...(packagesOnly ? { packagesOnly: true, keelPrefix: found.prefix } : {}), ...finished(await runLong({ kind: 'remove', bin: pm.binary, argv, env: APT_ENV, wait: waitFor }, ctx)) };
   },
 });
 
@@ -2058,7 +2096,8 @@ defineOp('pkg.runtime.detect', {
     for (const v of discoverPhp().versions) {
       let version = null;
       try { const r = await exec(v.binary, ['-n', '-r', 'echo PHP_VERSION;'], { allowFailure: true, timeoutMs: PROBE_TIMEOUT }); version = r.stdout.trim().match(/^\d[\d.]*/)?.[0] ?? null; } catch { /* unreadable binary */ }
-      php.push({ id: v.id, version, layout: v.layout, source: Boolean(v.source), ...(v.prefix ? { prefix: v.prefix } : {}) });
+      const twin = (await withTwinVersion(v)).packagedTwin;
+      php.push({ id: v.id, version, layout: v.layout, source: Boolean(v.source), ...(v.prefix ? { prefix: v.prefix } : {}), ...(twin ? { packagedTwin: { binary: twin.binary, version: twin.version, layout: twin.layout, packagePrefix: twin.packagePrefix } } : {}) });
     }
     const node = await listNode(ctx);
     const python = [];

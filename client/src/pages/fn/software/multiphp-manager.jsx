@@ -61,20 +61,24 @@ export function removalExtras(err) {
 
 // The Remove confirm: the plain removal, or, with the simulated extra
 // packages, the "Remove anyway" step a root may take after the refusal.
-export function removeConfirm(v, extra = null) {
-  const label = v.label || `PHP ${v.id}`;
+// `packages: true` is the removal of the distribution packages a Keel build
+// of the same minor shadows (the build stays and keeps serving the minor).
+export function removeConfirm(v, extra = null, { packages = false } = {}) {
+  const label = packages ? `the PHP ${v.id} distribution packages` : v.label || `PHP ${v.id}`;
   if (extra?.length) {
     const apps = [...new Set(extra.map((p) => (/^roundcube/.test(p) ? 'webmail' : /^phpmyadmin/i.test(p) ? 'phpMyAdmin' : null)).filter(Boolean))];
     return {
       title: `Remove ${label} anyway?`,
-      message: <>The package manager would also remove <CodeList names={extra} />{apps.length ? <> — {apps.join(' and ')} on the server hostname site would stop answering until published on another version</> : null}. Move what depends on PHP {v.id} to another version first, or remove it anyway (the removal is audited as forced).</>,
+      message: <>The package manager would also remove <CodeList names={extra} />{apps.length ? <> — {apps.join(' and ')} on the server hostname site would stop answering until published on another version</> : null}. Move what depends on {packages ? `the PHP ${v.id} packages` : `PHP ${v.id}`} to another version first, or remove {packages ? 'them' : 'it'} anyway (the removal is audited as forced).</>,
       confirmLabel: 'Remove anyway',
       danger: true,
     };
   }
-  const message = v.source
-    ? `Stops and removes the keel-php${v.id}-fpm service, the php${v.id} link in /usr/local/bin and the whole build under ${PHP_SOURCE_PREFIX}/${v.id}. Nothing runs on it (no domain is pinned to it and it is not the system default).`
-    : `Removes every php${v.id}-* package; /etc/php/${v.id} is kept. Nothing runs on it (no domain is pinned to it and it is not the system default). The removal is simulated first and refused when other packages (webmail, phpMyAdmin) would go with it.`;
+  const message = packages
+    ? `Removes every php${v.id}-* package${v.packagedTwin?.version ? ` (${v.packagedTwin.version})` : ''}; the Keel build under ${PHP_SOURCE_PREFIX}/${v.id} keeps serving PHP ${v.id}, so no domain moves. The removal is simulated first and refused when other packages (webmail, phpMyAdmin) would go with it, or while the hostname site still runs on the packages' socket.`
+    : v.source
+      ? `Stops and removes the keel-php${v.id}-fpm service, the php${v.id} link in /usr/local/bin and the whole build under ${PHP_SOURCE_PREFIX}/${v.id}. Nothing runs on it (no domain is pinned to it and it is not the system default).${v.packagedTwin ? ` The distribution packages${v.packagedTwin.version ? ` ${v.packagedTwin.version}` : ''} stay installed and become the PHP ${v.id} of this server again.` : ''}`
+      : `Removes every php${v.id}-* package; /etc/php/${v.id} is kept. Nothing runs on it (no domain is pinned to it and it is not the system default). The removal is simulated first and refused when other packages (webmail, phpMyAdmin) would go with it.`;
   return { title: `Remove ${label}?`, message, confirmLabel: 'Remove', danger: true };
 }
 
@@ -92,14 +96,31 @@ const versionLabel = (v) => `${v.label || `PHP ${v.id}`}${v.version ? ` (${v.ver
 // What the row's Update button sends (POST /software/php/update, contract §63).
 export const phpUpdateBody = (v) => ({ version: v.id });
 
-// Confirm copy for an installed row with a candidate.
+// Confirm copy for an installed row with a candidate (contract §63): the
+// package upgrade, the Keel rebuild, the resync of a build that already is
+// php.net's latest, or the source build that replaces a packaged minor no
+// distribution package fixes.
 export function phpUpdateMessage(v) {
   const u = v.update || {};
   const reasons = u.reasons?.length ? ` ${u.reasons.join(' ')}` : '';
-  return v.source || v.layout === 'keel'
-    ? `Rebuilds PHP ${v.id} from the official php.net ${u.candidate} source over ${PHP_SOURCE_PREFIX}/${v.id} (about 15 minutes) and restarts keel-php${v.id}-fpm.${reasons}`
+  const keel = v.source || v.layout === 'keel';
+  const twin = v.packagedTwin?.version ? ` The distribution packages ${v.packagedTwin.version} stay installed and unused; Remove packages drops them later.` : '';
+  if (u.method === 'source' && !keel) {
+    return `Builds PHP ${v.id} from the official php.net ${u.candidate} source into ${PHP_SOURCE_PREFIX}/${v.id} (about 15 minutes) with its own keel-php${v.id}-fpm service, then replaces the packaged version for every domain on PHP ${v.id} (and the hostname site when it runs on it): their pools and vhosts are re-rendered on the Keel build. The distribution packages${v.version ? ` ${v.version}` : ''} stay installed and unused; Remove packages drops them afterwards.${reasons}`;
+  }
+  if (keel && u.method === 'source' && u.build === false) {
+    return `Re-renders every domain on PHP ${v.id} (and the hostname site when it runs on it) onto the Keel build ${u.candidate} under ${PHP_SOURCE_PREFIX}/${v.id}; nothing is rebuilt.${twin}${reasons}`;
+  }
+  return keel
+    ? `Rebuilds PHP ${v.id} from the official php.net ${u.candidate} source over ${PHP_SOURCE_PREFIX}/${v.id} (about 15 minutes), restarts keel-php${v.id}-fpm and re-renders every domain on PHP ${v.id} onto it.${twin}${reasons}`
     : `Upgrades the pending php${v.id}-* packages to ${u.candidate} and reloads ${v.fpmUnit || 'PHP-FPM'}.${reasons}`;
 }
+
+// A red confirm for anything an advisory drives.
+export const phpUpdateDanger = (u) => u?.severity === 'critical' || u?.severity === 'security';
+
+// What a Remove packages button sends (the Keel build stays).
+export const phpRemovePackagesBody = (v, force = false) => ({ version: v.id, packages: true, ...(force ? { force: true } : {}) });
 
 // "Check for updates": a fresh php.net lookup and OS update check on the
 // server, then the caller's catalog again so every row shows the new verdict.
@@ -116,8 +137,8 @@ export async function checkForUpdates(refetch) {
 export function updateState(v, stamp, checking = false) {
   if (!v?.installed) return null;
   const u = v.update;
-  if (u?.candidate) return { kind: u.severity === 'critical' || u.severity === 'security' ? 'security' : 'update', candidate: u.candidate, reasons: u.reasons || [], checkedAt: u.checkedAt ?? stamp?.checkedAt ?? null };
-  if (u) return { kind: 'nofix', candidate: null, reasons: u.reasons || [], checkedAt: u.checkedAt ?? stamp?.checkedAt ?? null };
+  if (u?.candidate) return { kind: phpUpdateDanger(u) ? 'security' : 'update', candidate: u.candidate, reasons: u.reasons || [], method: u.method ?? (u.source === 'release' && (v.source || v.layout === 'keel') ? 'source' : 'package'), build: u.build ?? null, checkedAt: u.checkedAt ?? stamp?.checkedAt ?? null };
+  if (u) return { kind: 'nofix', candidate: null, reasons: u.reasons || [], method: null, build: null, checkedAt: u.checkedAt ?? stamp?.checkedAt ?? null };
   if (checking || !stamp) return { kind: 'checking', candidate: null, reasons: [], checkedAt: null };
   const keel = Boolean(v.source || v.layout === 'keel' || v.method === 'source');
   const at = keel ? stamp.releasesCheckedAt : stamp.packagesCheckedAt;
@@ -134,10 +155,14 @@ export function PhpUpdateCell({ row, stamp, checking, busy, onUpdate }) {
   if (s.kind === 'checking') return <span className="muted small">Checking…</span>;
   if (s.kind === 'unknown') return <span className="muted small">Not checked yet — use Check for updates</span>;
   if (s.kind === 'security' || s.kind === 'update') {
+    const from = s.method === 'source' ? ' from php.net' : '';
+    // A resync-only candidate (nothing is built) is never a "Security update", whatever advisory the build still carries.
+    const resync = s.method === 'source' && s.build === false;
+    const danger = s.kind === 'security' && !resync;
     return (
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }} title={title}>
-        {s.kind === 'security' ? <><StatusPill status="failed">Security update</StatusPill><span>{s.candidate}</span></> : <span>Update available: <strong>{s.candidate}</strong></span>}
-        <Button size="sm" variant={s.kind === 'security' ? 'danger' : 'primary'} loading={busy} title={title} onClick={() => onUpdate(row)}>Update</Button>
+        {resync ? <span>Move domains to the Keel build <strong>{s.candidate}</strong></span> : danger ? <><StatusPill status="failed">Security update</StatusPill><span>{s.candidate}{from}</span></> : <span>Update available: <strong>{s.candidate}</strong>{from}</span>}
+        <Button size="sm" variant={danger ? 'danger' : 'primary'} loading={busy} title={title} onClick={() => onUpdate(row)}>Update</Button>
       </span>
     );
   }
@@ -243,8 +268,19 @@ export default function MultiPhpManager({ fn }) {
   const update = async (v) => {
     const u = v.update;
     if (!u?.candidate) return;
-    if (!(await confirm({ title: `Update ${versionLabel(v)} to ${u.candidate}?`, message: phpUpdateMessage(v), confirmLabel: 'Update', danger: u.severity === 'critical' }))) return;
+    if (!(await confirm({ title: `Update ${versionLabel(v)} to ${u.candidate}?`, message: phpUpdateMessage(v), confirmLabel: u.method === 'source' && !(v.source || v.layout === 'keel') ? 'Build and update' : 'Update', danger: phpUpdateDanger(u) }))) return;
     runner.start(() => api.post('/software/php/update', phpUpdateBody(v)), `Update ${versionLabel(v)}`);
+  };
+  // The distribution packages a Keel build shadows: removed on their own, the build stays.
+  const removePackages = async (v) => {
+    if (!(await confirm(removeConfirm(v, null, { packages: true })))) return;
+    let extra = null;
+    const started = await runner.start(async () => {
+      try { return await api.post('/software/php/remove', phpRemovePackagesBody(v)); } catch (err) { extra = isRoot ? removalExtras(err) : null; throw err; }
+    }, `Remove PHP ${v.id} packages`);
+    if (started || !extra) return;
+    if (!(await confirm(removeConfirm(v, extra, { packages: true })))) return;
+    runner.start(() => api.post('/software/php/remove', phpRemovePackagesBody(v, true)), `Remove PHP ${v.id} packages (forced)`);
   };
   const setOffered = async (v, on) => {
     setBusy(true); setError(null);
@@ -285,6 +321,7 @@ export default function MultiPhpManager({ fn }) {
                     <tr key={v.id}>
                       <td><strong>{v.label || `PHP ${v.id}`}</strong> {v.version && <span className="muted">{v.version}</span>} <SourceBuildPill row={v} /> <PhpAdvisoryBadge advisories={v.advisories} />
                         {v.installed && v.binary && <><br /><code className="small">{v.binary}</code></>}
+                        {v.installed && v.packagedTwin && <><br /><span className="muted small" style={{ display: 'block', maxWidth: 360 }}>Distribution packages{v.packagedTwin.version ? ` ${v.packagedTwin.version}` : ''} remain installed and unused{v.packagedTwin.binary ? <> (<code className="small">{v.packagedTwin.binary}</code>)</> : null}.</span></>}
                         {!v.installed && v.method === 'source' && <><br /><code className="small">{PHP_SOURCE_PREFIX}/{v.id}</code></>}
                         {!v.installed && v.note && v.note !== sharedNote && <><br /><span className="muted small" style={{ display: 'block', maxWidth: 360 }}>{v.note}</span></>}
                       </td>
@@ -297,6 +334,7 @@ export default function MultiPhpManager({ fn }) {
                       <td className="actions-col">
                         {!v.installed && <Button size="sm" loading={runner.busy} disabled={v.state === 'unsupported'} title={v.state === 'unsupported' ? v.note || 'Not available for this OS' : v.method === 'source' ? `Built from the php.net source into ${PHP_SOURCE_PREFIX}/${v.id}` : undefined} onClick={() => install(v)}>Install</Button>}
                         {v.installed && !v.isSystemDefault && <Button size="sm" loading={busy} onClick={() => setDefault(v.id)}>Set as default</Button>}
+                        {v.installed && v.packagedTwin && <Button size="sm" variant="danger" loading={runner.busy} title={`Removes the php${v.id}-* packages; the Keel build stays`} onClick={() => removePackages(v)}>Remove packages</Button>}
                         {v.installed && <Button size="sm" variant="danger" loading={runner.busy} disabled={Boolean(blocker)} title={blocker || undefined} onClick={() => remove(v)}>Remove</Button>}
                       </td>
                     </tr>
@@ -307,7 +345,7 @@ export default function MultiPhpManager({ fn }) {
           </div>
           <div style={{ padding: '0 16px 12px' }}>
             <ErrorBanner error={error || runner.error} />
-            <p className="muted small"><em>Updates</em> compares every installed version with the pending packages of the last OS update check and, for a Keel build, with php.net's latest release of its branch; <em>Check for updates</em> runs both checks again. An Update runs as a job below (packages are upgraded and PHP-FPM reloaded; a Keel build is rebuilt from the newer php.net source and its service restarted, about 15 minutes).</p>
+            <p className="muted small"><em>Updates</em> compares every installed version with the pending packages of the last OS update check and, for a Keel build, with php.net's latest release of its branch; <em>Check for updates</em> runs both checks again. An Update runs as a job below (packages are upgraded and PHP-FPM reloaded; a Keel build is rebuilt from the newer php.net source and its service restarted, about 15 minutes). A packaged version hit by an advisory that no distribution package fixes is updated <em>from php.net</em>: the release is built from source into {PHP_SOURCE_PREFIX}/&lt;version&gt;, the build becomes that version for every domain on it (and the hostname site when it runs on it), and the packages stay installed and unused until <em>Remove packages</em>.</p>
             <p className="muted small">Accounts see only the versions switched to <em>Offered</em> (all installed ones until you hide one); a version a domain already runs stays selectable for that domain. A plan's own version list narrows it further.</p>
           </div>
         </Card>

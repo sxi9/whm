@@ -20,7 +20,7 @@ const { ConfirmProvider } = await import('../src/components/Modal.jsx');
 const { FUNCTION_BY_KEY } = await import('../src/nav.js');
 const { default: InstallSoftware, readDeepLink, TABS } = await import('../src/pages/fn/software/install-distro-packages.jsx');
 const { default: ModuleInstallers, installerPackages } = await import('../src/pages/fn/software/module-installers.jsx');
-const { default: MultiPhpManager, removeBlocker, removalExtras, removeConfirm, toggleOffered, updateState, phpUpdateBody, phpUpdateMessage, checkForUpdates } = await import('../src/pages/fn/software/multiphp-manager.jsx');
+const { default: MultiPhpManager, removeBlocker, removalExtras, removeConfirm, toggleOffered, updateState, phpUpdateBody, phpUpdateMessage, phpUpdateDanger, phpRemovePackagesBody, checkForUpdates, PhpUpdateCell } = await import('../src/pages/fn/software/multiphp-manager.jsx');
 const { ApiError } = await import('../src/api/client.js');
 const { generatorPackages } = await import('../src/pages/fn/server-configuration/statistics-software-configuration.jsx');
 const { quotaPackages } = await import('../src/pages/fn/server-configuration/initial-quota-setup.jsx');
@@ -136,7 +136,7 @@ describe('Install Software page', () => {
     // The Update button posts the version alone; the confirm names the method.
     expect(phpUpdateBody(versions[1])).toEqual({ version: '8.3' });
     expect(phpUpdateMessage(versions[1])).toMatch(/^Upgrades the pending php8\.3-\* packages to 8\.3\.36-1 and reloads PHP-FPM\. CVE-2026-109619/);
-    expect(phpUpdateMessage(versions[3])).toMatch(/^Rebuilds PHP 8\.1 from the official php\.net 8\.1\.34 source over \/opt\/keel\/php\/8\.1 .* restarts keel-php8\.1-fpm\./);
+    expect(phpUpdateMessage(versions[3])).toMatch(/^Rebuilds PHP 8\.1 from the official php\.net 8\.1\.34 source over \/opt\/keel\/php\/8\.1 .* restarts keel-php8\.1-fpm and re-renders every domain on PHP 8\.1 onto it\./);
     // Check for updates posts the refresh, then refetches the catalog.
     let refetched = 0;
     await checkForUpdates(() => { refetched += 1; });
@@ -434,6 +434,107 @@ describe('pages that used to link to the package search', () => {
     expect(html).toContain('webmail and phpMyAdmin on the server hostname site would stop answering');
     expect(html).toContain('audited as forced');
     expect(renderToStaticMarkup(removeConfirm(v, ['libfoo']).message)).not.toContain('hostname site');
+  });
+
+  // The live host's case: the distribution's 8.5 (8.5.4) carries an advisory no
+  // package fixes while php.net's 8.5 is newer, a build of 8.4 is at php.net's
+  // latest, and an 8.3 Keel build shadows its packages.
+  it('PHP Version Manager: a resync-only candidate (build: false) that still carries an advisory reads "Move domains to the Keel build", never "Security update", and agrees with its confirm', () => {
+    const stamp = { checkedAt: '2026-11-06T06:00:00.000Z', packagesCheckedAt: '2026-11-06T05:41:00.000Z', releasesCheckedAt: '2026-11-06T05:50:00.000Z' };
+    const row = { installed: true, id: '8.3', label: 'PHP 8.3 (Keel build)', version: '8.3.30', layout: 'keel', source: true, method: 'source', prefix: '/opt/keel/php/8.3', packagedTwin: { binary: '/usr/bin/php8.3', version: '8.3.6', packagePrefix: 'php8.3-', fpmUnit: 'php8.3-fpm' }, advisories: [{ id: 'CVE-2026-1', title: 'x', grade: 'critical', fixedIn: null }], update: { candidate: '8.3.30', severity: 'security', reasons: ['CVE-2026-1: x', 'the Keel build 8.3.30 shadows the distribution packages 8.3.6; the domains on PHP 8.3 are re-rendered onto it'], current: '8.3.30', source: 'release', method: 'source', build: false, checkedAt: stamp.releasesCheckedAt } };
+    const html = renderToStaticMarkup(h(PhpUpdateCell, { row, stamp, checking: false, busy: false, onUpdate: () => {} }));
+    expect(html).toContain('Move domains to the Keel build <strong>8.3.30</strong>');
+    expect(html).not.toContain('Security update');
+    expect(html).not.toContain('from php.net');
+    expect(html).toMatch(/<button type="button" class="btn btn-primary btn-sm[^"]*"[^>]*>Update<\/button>/);
+    expect(html).not.toContain('btn-danger');
+    expect(updateState(row, stamp)).toMatchObject({ kind: 'security', candidate: '8.3.30', method: 'source', build: false });
+    expect(phpUpdateMessage(row)).toMatch(/nothing is rebuilt/);
+    // The same row with a real rebuild keeps the security wording.
+    const rebuild = renderToStaticMarkup(h(PhpUpdateCell, { row: { ...row, update: { ...row.update, candidate: '8.3.31', build: true } }, stamp, checking: false, busy: false, onUpdate: () => {} }));
+    expect(rebuild).toContain('>Security update</span><span>8.3.31 from php.net</span>');
+    expect(rebuild).toContain('btn-danger');
+  });
+
+  it('PHP Version Manager: a packaged version with an advisory no package fixes gets "Security update · x.y.z from php.net"; the badge and the Updates column never contradict', () => {
+    fixtures.responses.clear();
+    fixtures.posts.length = 0;
+    const row = (o) => ({ installed: true, state: 'installed', version: null, binary: null, iniPath: null, fpmInstalled: true, fpmActive: true, fpmUnit: null, isDefault: false, isSystemDefault: false, offered: true, domains: 0, packages: [], repo: 'php', repoStatus: null, advisories: [], note: null, method: 'package', ...o });
+    const cve = { id: 'CVE-2026-109619', title: 'PHP2Shell', grade: 'critical', fixedIn: '8.5.12' };
+    const stamp = { checkedAt: '2026-11-06T06:00:00.000Z', packagesCheckedAt: '2026-11-06T05:41:00.000Z', releasesCheckedAt: '2026-11-06T05:50:00.000Z' };
+    const phpCatalog = {
+      family: 'debian', os: { id: 'ubuntu', versionId: '26.04' }, effectiveDefault: '8.5', configuredDefault: '8.5', offered: null, updates: stamp,
+      versions: [
+        row({ id: '8.5', label: 'PHP 8.5', version: '8.5.4', binary: '/usr/bin/php8.5', fpmUnit: 'php8.5-fpm', isDefault: true, isSystemDefault: true, domains: 2, layout: 'debian', advisories: [cve], update: { candidate: '8.5.12', severity: 'critical', reasons: ['CVE-2026-109619: PHP2Shell (fixed in 8.5.12)', 'php.net released 8.5.12; no distribution package carries a fix, so it is built from source'], current: '8.5.4', source: 'release', method: 'source', build: true, checkedAt: stamp.releasesCheckedAt } }),
+        row({ id: '8.4', label: 'PHP 8.4 (Keel build)', version: '8.4.27', binary: '/opt/keel/php/8.4/bin/php', fpmUnit: 'keel-php8.4-fpm', method: 'source', source: true, layout: 'keel', prefix: '/opt/keel/php/8.4', update: null }),
+        row({ id: '8.3', label: 'PHP 8.3 (Keel build)', version: '8.3.30', binary: '/opt/keel/php/8.3/bin/php', fpmUnit: 'keel-php8.3-fpm', method: 'source', source: true, layout: 'keel', prefix: '/opt/keel/php/8.3', packagePrefix: 'php8.3-', packagedTwin: { binary: '/usr/bin/php8.3', version: '8.3.6', packagePrefix: 'php8.3-', fpmUnit: 'php8.3-fpm' }, note: 'Distribution packages 8.3.6 remain installed and unused; Remove packages drops them without touching the Keel build.', update: { candidate: '8.3.30', severity: 'update', reasons: ['the Keel build 8.3.30 shadows the distribution packages 8.3.6; the domains on PHP 8.3 are re-rendered onto it'], current: '8.3.30', source: 'release', method: 'source', build: false, checkedAt: stamp.releasesCheckedAt } }),
+        row({ id: '8.2', label: 'PHP 8.2', version: '8.2.20', binary: '/usr/bin/php8.2', fpmUnit: 'php8.2-fpm', layout: 'debian', advisories: [{ ...cve, fixedIn: '8.2.35' }], update: { candidate: null, severity: 'critical', reasons: ['CVE-2026-109619: PHP2Shell (fixed in 8.2.35)'], current: '8.2.20', source: null, method: null, build: null, checkedAt: stamp.checkedAt } }),
+      ],
+    };
+    set('/software/php/versions', { data: { versions: phpCatalog.versions, effectiveDefault: '8.5' } });
+    set('/software/php/catalog', { data: phpCatalog });
+    set('/software/php/domains', { data: { domains: [], systemDefault: { effective: '8.5' } }, meta: { total: 0 } });
+    set('/software/php/pools', { data: { pools: [] } });
+    const html = render(h(MultiPhpManager, { fn: FUNCTION_BY_KEY['software/multiphp-manager'] }), '/software/multiphp-manager');
+    // 8.5: the advisory badge says "update to 8.5.12" and the Updates column offers exactly that, from php.net, in red.
+    expect(html).toContain('CVE-2026-109619 · update to 8.5.12');
+    expect(html).toContain('>Security update</span><span>8.5.12 from php.net</span>');
+    expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*" title="CVE-2026-109619: PHP2Shell \(fixed in 8\.5\.12\)\nphp\.net released 8\.5\.12; no distribution package carries a fix, so it is built from source">Update<\/button>/);
+    expect(html).not.toContain('Up to date · 8.5.4');
+    // 8.4: a Keel build at php.net's latest is up to date.
+    expect(html).toContain('Up to date · 8.4.27');
+    // 8.3: a build shadowing packages that was never resynced offers the resync, the row notes the packages and offers Remove packages.
+    expect(html).toContain('Move domains to the Keel build <strong>8.3.30</strong>');
+    expect(html).toContain('Distribution packages 8.3.6 remain installed and unused (<code class="small">/usr/bin/php8.3</code>).');
+    expect(html).toMatch(/<button type="button" class="btn btn-danger btn-sm[^"]*" title="Removes the php8\.3-\* packages; the Keel build stays">Remove packages<\/button>/);
+    expect((html.match(/>Remove packages<\/button>/g) || []).length).toBe(1);
+    // 8.2: an advisory with nothing newer anywhere is the only row that says "no fix".
+    expect(html).toContain('>Advisory</span> <span class="muted small">no fix available yet</span>');
+    expect((html.match(/no fix available yet/g) || []).length).toBe(1);
+    expect((html.match(/>Update<\/button>/g) || []).length).toBe(2);
+    // Each row with an advisory badge carries either an Update or "no fix"; never "Up to date".
+    expect(html).not.toMatch(/update to 8\.5\.12[\s\S]{0,1500}Up to date · 8\.5\.4/);
+    expect(html).toContain('A packaged version hit by an advisory that no distribution package fixes is updated <em>from php.net</em>');
+    // The states as data.
+    expect(updateState(phpCatalog.versions[0], stamp)).toMatchObject({ kind: 'security', candidate: '8.5.12', method: 'source', build: true, checkedAt: stamp.releasesCheckedAt });
+    expect(updateState(phpCatalog.versions[1], stamp)).toMatchObject({ kind: 'latest', candidate: null });
+    expect(updateState(phpCatalog.versions[2], stamp)).toMatchObject({ kind: 'update', candidate: '8.3.30', method: 'source', build: false });
+    expect(updateState(phpCatalog.versions[3], stamp)).toMatchObject({ kind: 'nofix', candidate: null, method: null });
+    // A release-sourced update on a Keel row without `method` still reads as a source build.
+    expect(updateState({ installed: true, source: true, update: { candidate: '8.4.28', severity: 'update', source: 'release' } }, stamp)).toMatchObject({ kind: 'update', method: 'source' });
+    expect(phpUpdateDanger({ severity: 'security' })).toBe(true);
+    expect(phpUpdateDanger({ severity: 'update' })).toBe(false);
+    // Confirm copy: the source build replaces the packaged version for every domain on the minor, takes ~15 minutes, and the packages stay.
+    const build = phpUpdateMessage(phpCatalog.versions[0]);
+    expect(build).toMatch(/^Builds PHP 8\.5 from the official php\.net 8\.5\.12 source into \/opt\/keel\/php\/8\.5 \(about 15 minutes\) with its own keel-php8\.5-fpm service, then replaces the packaged version for every domain on PHP 8\.5 \(and the hostname site when it runs on it\)/);
+    expect(build).toContain('The distribution packages 8.5.4 stay installed and unused; Remove packages drops them afterwards.');
+    expect(build).toContain('CVE-2026-109619: PHP2Shell (fixed in 8.5.12)');
+    const resync = phpUpdateMessage(phpCatalog.versions[2]);
+    expect(resync).toMatch(/^Re-renders every domain on PHP 8\.3 \(and the hostname site when it runs on it\) onto the Keel build 8\.3\.30 under \/opt\/keel\/php\/8\.3; nothing is rebuilt\. The distribution packages 8\.3\.6 stay installed and unused; Remove packages drops them later\./);
+    expect(phpUpdateBody(phpCatalog.versions[0])).toEqual({ version: '8.5' });
+    // Remove packages: the body names the minor with packages: true; the confirm says the build keeps serving the minor.
+    expect(phpRemovePackagesBody(phpCatalog.versions[2])).toEqual({ version: '8.3', packages: true });
+    expect(phpRemovePackagesBody(phpCatalog.versions[2], true)).toEqual({ version: '8.3', packages: true, force: true });
+    const rm = removeConfirm(phpCatalog.versions[2], null, { packages: true });
+    expect(rm.title).toBe('Remove the PHP 8.3 distribution packages?');
+    expect(rm.message).toContain('Removes every php8.3-* package (8.3.6); the Keel build under /opt/keel/php/8.3 keeps serving PHP 8.3, so no domain moves.');
+    expect(rm.message).toContain('while the hostname site still runs on the packages\' socket');
+    expect(removeConfirm(phpCatalog.versions[2], ['roundcube-core'], { packages: true })).toMatchObject({ title: 'Remove the PHP 8.3 distribution packages anyway?', confirmLabel: 'Remove anyway', danger: true });
+    // Removing the build itself with packages beside it says the packages take over again.
+    expect(removeConfirm(phpCatalog.versions[2]).message).toContain('The distribution packages 8.3.6 stay installed and become the PHP 8.3 of this server again.');
+    expect(removeConfirm(phpCatalog.versions[1]).message).not.toContain('become the PHP');
+    // Install Software's PHP card renders the same states from the runtime catalog.
+    set('/software/pkg/detect', { data: detect });
+    set('/software/pkg/recent', { data: [] });
+    set('/software/runtimes/recent', { data: [] });
+    const rows = phpCatalog.versions.map((v) => ({ id: v.id, label: v.label, installed: true, version: v.version, packages: [], repo: 'php', note: v.note, method: v.method, source: v.source, layout: v.layout, state: 'installed', update: v.update, packagedTwin: v.packagedTwin }));
+    set('/software/runtimes', { data: { ...catalog, runtimes: [{ key: 'php', label: 'PHP', single: false, versions: rows }, ...catalog.runtimes.slice(1)], updates: stamp } });
+    const card = render(h(InstallSoftware, { fn }));
+    expect(card).toContain('>Security update</span><span>8.5.12 from php.net</span>');
+    expect(card).toContain('Move domains to the Keel build <strong>8.3.30</strong>');
+    expect(card).toContain('no fix available yet');
+    expect(card).toContain('Up to date · 8.4.27');
+    expect(card).toContain('Distribution packages 8.3.6 remain installed and unused');
   });
 
   it('picks packages by host family for statistics generators and quota tools', () => {

@@ -289,6 +289,21 @@ describe('cross-category helpers on ctx.web', () => {
     await app.ctx.web.setListenPorts({ http: 80, https: 443 }, null);
   });
 
+  it('setPhpVersion with repool rewrites a pool whose row is already applied (the resync onto a Keel build); without it the applied row short-circuits', async () => {
+    expect(app.ctx.db.prepare("SELECT status FROM web_php_pools WHERE username = 'alice' AND version = '8.1'").get().status).toBe('applied');
+    const before = app.agent.callsTo('web.phpfpm.pool.write').length;
+    await app.ctx.web.setPhpVersion('example.com', '8.1', null, { reload: false });
+    expect(app.agent.callsTo('web.phpfpm.pool.write')).toHaveLength(before);
+    const audits = [];
+    await app.ctx.web.setPhpVersion('example.com', '8.1', { audit: (e) => audits.push(e) }, { reload: false, repool: true });
+    expect(app.agent.callsTo('web.phpfpm.pool.write')).toHaveLength(before + 1);
+    expect(app.agent.callsTo('web.phpfpm.pool.write').pop().args).toMatchObject({ user: 'alice', version: '8.1', errorLog: '/home/alice/logs/php-error.log' });
+    expect(app.agent.callsTo('web.vhost.write').pop().args).toMatchObject({ domain: 'example.com', phpVersion: '8.1', reload: false });
+    expect(audits.map((a) => a.action)).toEqual(['web.phpfpm.pool.write', 'web.php.set']);
+    expect(audits[1].args).toMatchObject({ version: '8.1', effective: '8.1', repool: true });
+    expect(app.ctx.db.prepare("SELECT status FROM web_php_pools WHERE username = 'alice' AND version = '8.1'").get().status).toBe('applied');
+  });
+
   it('a per-domain PHP version survives the account sync, with one pool per version in use', async () => {
     expect(app.ctx.web.vhostFor('example.com').phpVersion).toBe('8.1');
     const r = await app.ctx.web.ensureVhost('alice', null);

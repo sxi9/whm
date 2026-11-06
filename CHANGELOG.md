@@ -9,9 +9,27 @@ not for the commit log.
 ## [Unreleased]
 
 ### Added
+- **PHP version updater: a packaged PHP with an advisory no package fixes is updated from php.net.** PHP Version Manager
+  and Install Software no longer show *Up to date* beside an advisory badge: when the distribution's PHP (8.5.4 on
+  Ubuntu 26.04) is affected and php.net's release of that branch is newer, the Updates column reads *Security update ·
+  8.5.12 from php.net* with a red **Update**; the job builds the release from the official source into
+  `/opt/keel/php/<minor>` (build dependencies installed first), the build then wins over the distribution tree of the
+  same minor everywhere (`discoverPhp` / `phpLayout`; the entry keeps the minor as its id and reports the packages as
+  `packagedTwin`), and every domain on that minor — the inherited ones when it is the default — plus the hostname site
+  are re-rendered on it in the same job. The row then reads *PHP x.y (Keel build) x.y.z* with the note that the
+  distribution packages remain installed and unused, **Remove packages** drops just those (`POST /api/software/php/remove
+  { version, packages: true }`, agent `pkg.php.remove { packages: true }`, simulated first, refused while the hostname
+  site still renders on their socket), and **Remove** on the row removes the build so the packages serve the minor again.
+  A build that already matches php.net's latest but whose domains were never moved onto it offers *Move domains to the
+  Keel build* (the resync alone, recorded in `software.php.keel_resynced`); *Advisory · no fix available yet* now appears
+  only when neither a package nor a newer php.net release exists. Install Software accepts a source build over a packaged
+  minor only while php.net's release is newer (`422` otherwise). Contracts §52 / §63 amendments; manual §22.5.
 - **The server hostname site runs on its own PHP-FPM pool.** `https://<hostname>/` (webmail, phpMyAdmin, the signon
   script) no longer borrows the distribution's `www` pool socket: the panel writes a `keel-host` pool
-  (`keel-host.conf`, user `www-data`/`apache`, `pm = ondemand`, uploads and sessions under `/var/lib/whm/keel-host`)
+  (`keel-host.conf`, user `www-data`/`apache`, `pm = ondemand`, uploads and sessions under `/var/lib/keel-host` — its own
+  directory, since `/var/lib/whm` is readable by the panel user only and a pool state kept there made phpMyAdmin and the
+  webmail/phpMyAdmin sign-on fail with "session_start(): Permission denied"; the pool write creates or repairs it and drops
+  the old empty location, and the sign-on page now reports an unwritable session directory instead of looping)
   in the pool directory of the effective default PHP version — a distro tree or a Keel source build — and renders the
   site and every `keel-host.d/*.conf` drop-in against `php<ver>-fpm-keel-host.sock`. Removing the distro PHP or making
   a source build the default no longer leaves the site pointing at a socket that is gone; changing the default moves
@@ -298,6 +316,23 @@ not for the commit log.
 - `scripts/install.sh` installs every workspace with one root `npm ci` and prunes dev dependencies last.
 
 ### Fixed
+- **PHP version updater review fixes (Keel build over packages).** (1) The resync after a build (and *Move domains to the
+  Keel build*) now rewrites every tenant pool in the build's tree (`setPhpVersion(..., { repool: true })`): an applied
+  `web_php_pools` row from the packaged tree no longer short-circuits the pool write while the vhost is rendered on the
+  new `/run/keel-php` socket, which answered 503 for every domain on the minor. (2) **Remove packages** is refused
+  (`422` "Update PHP first") while a domain pinned to the minor, or the default minor, was never resynced onto the build
+  (`software.php.keel_resynced` unset or for an older build), instead of stopping `php<minor>-fpm` under running
+  sites. (3) When `/usr/bin/php` pointed at the packaged twin, the update job relinks it to the Keel build
+  (`pkg.php.default.set`) before the resync, and Remove packages does the same before the removal, so the agent's
+  "make the Keel build the CLI default first" refusal is no longer a dead end. (4) The distro tree a Keel build shadows
+  is kept as `phpLayout().shadowed`: a pool write or removal for that minor also drops the leftover `keel-host.conf` /
+  `whm-<user>.conf` from `/etc/php/<minor>/fpm/pool.d` and reloads the packaged unit (`shadowedRemoved`), and
+  `web.host.status` lists such a pool flagged `shadowed` without ever choosing its socket. (5) `/var/lib/keel-host`
+  is root-owned (0750 root:pool group; only `tmp` and `php-error.log` belong to the pool user) and every chown/chmod
+  there runs on an `O_NOFOLLOW` descriptor, closing the symlink race between the check and the chown that let the
+  hostname site's user redirect a root chown. (6) A resync-only Update (nothing built) no longer reads *Security
+  update x.y.z from php.net* when the build still carries an advisory; the column says *Move domains to the Keel
+  build* like its confirm.
 - **Removing a PHP version no longer takes webmail and phpMyAdmin down.** PHP Version Manager › Remove simulates the package removal first (`apt-get -s remove` / `dnf remove --assumeno`, agent `pkg.php.remove { dry: true }`) and refuses with `422` naming the packages when the package manager would remove anything outside `php<ver>-*` (on the live host `apt-get remove php8.5-*` took `roundcube-core` and `phpmyadmin` with it); the confirm lists them and root may **Remove anyway** (`POST /api/software/php/remove { version, force: true }`, audited as forced). The version the server-hostname site's webmail / phpMyAdmin run on is refused outright, a source build is never offered for a minor the distribution already provides (`422` "installed from packages"), installing over an existing Keel build answers `422` before any job, and `php-build.sh` writes `10-opcache.ini` only when the build produced `opcache.so` (no more "Failed loading Zend extension 'opcache'" on every start). Manual §22.5, contract §52 amendment.
 - Row "more actions" (⋯) menus and the admin shell's user menu closed as soon as the pointer moved
   onto them (the floating menu sat outside the wrapper whose `mouseleave` closed it). Every popover

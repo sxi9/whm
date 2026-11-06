@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { exec, hasBinary } from '../src/exec.js';
 import { runOp, createContext, OpError, DEFAULT_ALLOWED_ROOTS, catalog, PHP_MINORS, PHP_UNIT_PATHS, PHP_LINK_PATHS } from '../src/lib.js';
 import {
-  parseOsRelease, pickNodeTarball, verifySha256, probePpaSeries, phpDiscovery, phpPackageGlob, discoverPhp, parsePhpRelease, renderPhpUnit, phpMinor, PHP_SOURCE_MINORS,
+  parseOsRelease, pickNodeTarball, verifySha256, probePpaSeries, phpDiscovery, phpPackageGlob, discoverPhp, preferKeelBuilds, parsePhpRelease, renderPhpUnit, phpMinor, PHP_SOURCE_MINORS,
   APT_SOURCES_DIR, APT_KEYRINGS_DIR, YUM_REPOS_DIR, NODE_DIR, LOCAL_BIN_DIR, KEEL_PHP_DIR, KEEL_PHP_RUN_DIR, SYSTEMD_UNIT_DIR,
 } from '../src/ops/pkg.js';
 import { phpLayout } from '../src/ops/web.js';
@@ -428,6 +428,23 @@ describe('pkg.runtime.detect', () => {
     const r = await runOp('pkg.runtime.detect', {}, ctx);
     expect(r.php.find((p) => p.id === '8.4')).toEqual({ id: '8.4', version: '8.4.27', layout: 'keel', source: true, prefix });
     for (const p of r.php.filter((x) => x.layout !== 'keel')) expect(p.source).toBe(false);
+    // packagedTwin appears only when distro packages of the same minor remain (the host has no /etc/php/8.4 here).
+    expect(r.php.find((p) => p.id === '8.4').packagedTwin).toBeUndefined();
+    expect(r.php.filter((p) => p.id === '8.4')).toHaveLength(1);
+  });
+
+  it.skipIf(!linux)('reports the distribution packages a Keel build shadows as packagedTwin with their PHP_VERSION', async () => {
+    const distro = fs.existsSync('/etc/php') ? fs.readdirSync('/etc/php').find((d) => /^\d\.\d+$/.test(d) && fs.existsSync(`/usr/bin/php${d}`)) : null;
+    if (!distro) return;
+    setOs(OS.ubuntu);
+    const prefix = fakeKeelTree(distro);
+    exec.mockImplementation(async (bin) => (bin === path.join(prefix, 'bin', 'php') ? ok(`${distro}.99`) : bin === `/usr/bin/php${distro}` ? ok(`${distro}.1`) : ok('')));
+    const r = await runOp('pkg.runtime.detect', {}, ctx);
+    expect(r.php.filter((p) => p.id === distro)).toHaveLength(1);
+    expect(r.php.find((p) => p.id === distro)).toEqual({ id: distro, version: `${distro}.99`, layout: 'keel', source: true, prefix, packagedTwin: { binary: `/usr/bin/php${distro}`, version: `${distro}.1`, layout: 'debian', packagePrefix: `php${distro}-` } });
+    const v = (await runOp('pkg.php.versions', {}, ctx)).versions.find((x) => x.id === distro);
+    expect(v).toMatchObject({ layout: 'keel', version: `${distro}.99`, packagePrefix: null, packagedTwin: { binary: `/usr/bin/php${distro}`, version: `${distro}.1`, fpmUnit: `php${distro}-fpm`, poolDir: `/etc/php/${distro}/fpm/pool.d` } });
+    expect(phpLayout().versions.filter((x) => x.version === distro)).toEqual([expect.objectContaining({ flavor: 'keel', poolDir: `${prefix}/etc/php-fpm.d` })]);
   });
 });
 
@@ -974,7 +991,20 @@ describe('pkg.php.build.finish', () => {
 });
 
 describe('discoverPhp / phpLayout see a Keel build', () => {
-  it('lists /opt/keel/php/<minor> with the keel layout, after any distro tree of the same minor', () => {
+  it('a Keel build of a minor wins over the distro tree of the same minor and reports it as packagedTwin', () => {
+    const deb = (id) => ({ id, binary: `/usr/bin/php${id}`, layout: 'debian', label: `PHP ${id}`, packagePrefix: `php${id}-`, fpmUnit: `php${id}-fpm`, poolDir: `/etc/php/${id}/fpm/pool.d` });
+    const keel = (id) => ({ id, binary: `/opt/keel/php/${id}/bin/php`, layout: 'keel', label: `PHP ${id} (Keel build)`, packagePrefix: null, source: true, prefix: `/opt/keel/php/${id}` });
+    const out = preferKeelBuilds([deb('8.5'), deb('8.3'), keel('8.5'), keel('8.4')]);
+    expect(out.map((v) => [v.id, v.layout])).toEqual([['8.5', 'keel'], ['8.3', 'debian'], ['8.4', 'keel']]);
+    expect(out[0]).toEqual({ ...keel('8.5'), packagedTwin: { binary: '/usr/bin/php8.5', layout: 'debian', packagePrefix: 'php8.5-', fpmUnit: 'php8.5-fpm', poolDir: '/etc/php/8.5/fpm/pool.d', version: null } });
+    expect(out[1].packagedTwin).toBeUndefined();
+    expect(out[2].packagedTwin).toBeUndefined();
+    // Two trees of the same minor without a build keep the first (the /etc/php one); a build never shadows another build.
+    expect(preferKeelBuilds([deb('8.3'), { ...deb('8.3'), layout: 'rhel' }]).map((v) => v.layout)).toEqual(['debian']);
+    expect(preferKeelBuilds([keel('8.4'), keel('8.4')])).toHaveLength(1);
+  });
+
+  it('lists /opt/keel/php/<minor> with the keel layout, instead of any distro tree of the same minor', () => {
     fakeKeelTree('9.1');
     fs.mkdirSync(path.join(dirs.WHM_KEEL_PHP_DIR, '8.3'), { recursive: true });
     fs.mkdirSync(path.join(dirs.WHM_KEEL_PHP_DIR, '.build-x'), { recursive: true });
@@ -1044,6 +1074,53 @@ describe('pkg.php.remove for a Keel build', () => {
     expect(fs.existsSync(elsewhere)).toBe(true);
     expect(fs.readlinkSync(link)).toBe('/usr/bin/php8.4');
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('{ packages: true } removes the distribution packages a Keel build shadows and leaves the build alone', async () => {
+    const prefix = fakeKeelTree('8.5');
+    const twin = { binary: '/usr/bin/php8.5', layout: 'debian', packagePrefix: 'php8.5-', fpmUnit: 'php8.5-fpm', poolDir: '/etc/php/8.5/fpm/pool.d', version: '8.5.4' };
+    const both = () => ({
+      versions: [
+        { id: '8.5', binary: path.join(prefix, 'bin', 'php'), layout: 'keel', label: 'PHP 8.5 (Keel build)', packagePrefix: null, source: true, prefix, packagedTwin: twin },
+        { id: '8.3', binary: '/usr/bin/php8.3', layout: 'debian', label: 'PHP 8.3', packagePrefix: 'php8.3-' },
+      ],
+      defaultId: '8.3', defaultBinary: '/usr/bin/php8.3',
+    });
+    phpDiscovery.discover = both;
+    hasBinary.mockImplementation((name) => name === 'apt-get' || name === 'dpkg-query' || name === 'systemctl');
+    const calls = [];
+    exec.mockImplementation(async (bin, argv) => {
+      calls.push([bin, argv]);
+      if (bin === 'dpkg-query') return ok('php8.5-fpm\nphp8.5-cli\nphp8.5-common:amd64\n');
+      if (bin === 'apt-get' && argv.includes('-s')) return ok('Remv php8.5-fpm [8.5.4-1]\nRemv php8.5-cli [8.5.4-1]\nRemv php8.5-common [8.5.4-1]\n');
+      if (bin === 'apt-get') return ok('Removing php8.5-fpm');
+      throw new Error(`unexpected ${bin}`);
+    });
+    const dry = await runOp('pkg.php.remove', { version: '8.5', packages: true, dry: true }, ctx);
+    expect(dry).toMatchObject({ version: '8.5', layout: 'debian', manager: 'apt', packages: ['php8.5-fpm', 'php8.5-cli', 'php8.5-common'], dry: true, extra: [], packagesOnly: true, keelPrefix: prefix });
+    expect(calls.some(([bin, argv]) => bin === 'apt-get' && !argv.includes('-s'))).toBe(false);
+    calls.length = 0;
+    const r = await runOp('pkg.php.remove', { version: '8.5', packages: true }, ctx);
+    expect(r).toMatchObject({ version: '8.5', layout: 'debian', manager: 'apt', packages: ['php8.5-fpm', 'php8.5-cli', 'php8.5-common'], packagesOnly: true, keelPrefix: prefix, forced: false, extra: [] });
+    expect(calls.filter(([bin]) => bin === 'systemctl')).toHaveLength(0);
+    expect(calls.find(([bin, argv]) => bin === 'apt-get' && !argv.includes('-s'))[1].slice(-3)).toEqual(['php8.5-fpm', 'php8.5-cli', 'php8.5-common']);
+    // The build is untouched: prefix, marker and ini still there.
+    expect(fs.existsSync(path.join(prefix, '.keel-build-ok'))).toBe(true);
+    expect(fs.existsSync(path.join(prefix, 'lib', 'php.ini'))).toBe(true);
+    // Without packages: true the same minor removes the Keel build (and refuses while it is the CLI default).
+    phpDiscovery.discover = () => ({ ...both(), defaultId: '8.5', defaultBinary: '/usr/bin/php8.5' });
+    expect((await opError(runOp('pkg.php.remove', { version: '8.5' }, ctx))).code).toBe('refused');
+    // /usr/bin/php resolving to the packages refuses the package removal (defaultBinary is a realpath; the twin binary must exist to compare).
+    const twinBin = path.join(base, 'usr-bin-php8.5');
+    fs.writeFileSync(twinBin, '');
+    phpDiscovery.discover = () => { const b = both(); b.versions[0] = { ...b.versions[0], packagedTwin: { ...twin, binary: twinBin } }; return { ...b, defaultId: '8.5', defaultBinary: fs.realpathSync(twinBin) }; };
+    const refused = await opError(runOp('pkg.php.remove', { version: '8.5', packages: true }, ctx));
+    expect(refused.code).toBe('refused');
+    expect(refused.message).toMatch(/still points at the PHP 8\.5 packages/);
+    // A minor without packages beside its build has nothing to remove that way.
+    phpDiscovery.discover = KEEL_SET;
+    expect((await opError(runOp('pkg.php.remove', { version: '8.4', packages: true }, ctx))).code).toBe('not_found');
+    expect((await opError(runOp('pkg.php.remove', { version: '8.5', packages: 'yes' }, ctx))).code).toBe('invalid_args');
   });
 
   it('still refuses the CLI default and the only version, and refuses a prefix override outside the allowed roots', async () => {

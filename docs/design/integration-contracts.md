@@ -676,13 +676,41 @@ owns one pool for the site, written in the tree of the **effective default** PHP
     `/opt/keel/php/<ver>/etc/php-fpm.d`): `[keel-host]`, `user`/`group` = the tree's `listenOwner` (`www-data`, `apache`
     on RHEL), `listen = <socketDir>/php<ver>-fpm-keel-host.sock` (`/run/php`, `/run/keel-php`, `/run/php-fpm`, Remi's
     `/var/opt/remi/...`; `php-fpm-keel-host.sock` for the RHEL `system` tree), `pm = ondemand`, `max_children 10`,
-    uploads/sessions/`sys_temp_dir` under `HOST_POOL.stateDir` = `/var/lib/whm/keel-host/tmp` (0700, owned by the pool
-    user; a symlink or a foreign owner there is `refused`), `error_log /var/lib/whm/keel-host/php-error.log`, no
+    uploads/sessions/`sys_temp_dir` under `HOST_POOL.stateDir/tmp` = `/var/lib/keel-host/tmp` (0700, owned by the pool
+    user; a symlink or a foreign owner there is `refused`), `error_log /var/lib/keel-host/php-error.log` (created empty
+    0640, pool-owned). **Amendment 2026-11-06:** the state directory moved from `/var/lib/whm/keel-host` to its own
+    allowed root `/var/lib/keel-host` (0750, pool user:group) — `/var/lib/whm` is 0750 `whmpanel:whmpanel`, so the pool
+    user could not traverse it and every `session_start()` under the hostname site (phpMyAdmin, the signon script,
+    Roundcube) failed `EACCES`. `ensureHostPoolState()` creates or repairs the new tree on every pool write, migrates
+    nothing, and removes `HOST_POOL.legacyStateDir` (`tmp` first, then the directory) only when empty. The socket stays
+    `listen.owner`/`listen.group` = the pool user with `listen.mode 0660`, which Apache (the same user) connects to. The
+    signon script (`deploy/phpmyadmin/pma-signon.php`) checks the `files` handler's `session.save_path` (the `N;[mode;]/path`
+    prefix stripped, PHP's temp dir when unset) is a writable directory before `session_start()` and answers a 500 page
+    naming the fix instead of a warning and a redirect loop. No
     `open_basedir` (Roundcube/phpMyAdmin live under `/usr/share`, `/var/lib`, `/etc`). Tested with `php-fpm -t`
     (`--fpm-config` for a Keel build, like `web.phpfpm.pool.write`), restored on rejection (`config_invalid`), then
     that version's unit is reloaded. Idempotent (`changed:false`, no test, no reload). `capability_missing` when the
     version has no tree. `others` lists every other tree that still carries `keel-host.conf` (`hostPools()`), so the
-    caller can drop them.
+    caller can drop them. **Amendment 2026-11-06 (review):** `ensureHostPoolState()` keeps `/var/lib/keel-host`
+    root-owned (`0750 root:<pool gid>`) so the pool user cannot rename its entries; only `tmp` (0700) and
+    `php-error.log` (0640, `nlink` 1) are chowned to the pool user, and every ownership/mode change goes through a
+    descriptor opened `O_RDONLY | O_NOFOLLOW (| O_DIRECTORY)` + `fstat` → `fchown`/`fchmod` (a symlink is `ELOOP` →
+    `refused`; no path-based chown/chmod anywhere). `phpLayout()` returns `{ versions, shadowed, installed }`: the
+    distro tree of a minor a Keel build took over is moved to `shadowed` (`{ ...tree, shadowed: true }`), never
+    selected for a pool, vhost or socket, but `hostPools()` lists its `keel-host.conf` flagged `shadowed: true`
+    (`web.host.status.pools`; `phpSocket` comes from `hostPoolSocketOf(pools)`, the first unshadowed pool), and
+    `web.host.pool.write` / `web.phpfpm.pool.write` / `web.host.pool.remove` / `web.phpfpm.pool.remove` for that
+    minor also unlink the same pool file in the shadowed tree and reload the packaged unit, reporting
+    `shadowedRemoved: { path, flavor, reloaded, unit }`. Service side (§52/§63): `setPhpVersion(domain, version, req,
+    { reload, repool })` — `repool: true` rewrites the pool even when its `web_php_pools` row is `applied` (audit arg
+    `repool`), and `php.resyncMinor` passes it through `applyPhpToDomains(job, domains, version, { repool: true })`;
+    `php.packagesBlocker` also refuses ("The domains on PHP x.y still run on the distribution packages; run Update on
+    PHP x.y first", field "Update PHP first") while `php.usage()[minor]` or the effective default is the minor and
+    `software.php.keel_resynced[minor].version` is not the build's; the update job (after the minor resolves to
+    `layout: 'keel'`, before the resync) and the `packages: true` removal job (before `pkg.php.remove`) run
+    `pkg.php.default.set { version }` when the entry `isDefault` with a `packagedTwin` and `defaultBinary` is not the
+    build's binary. Client: a `build: false` candidate renders *Move domains to the Keel build* with a primary button
+    whatever its `severity`.
   - `web.host.pool.remove { version, reload=true }` (destructive) → `{ version, path, socket, removed, reloaded, unit }`;
     `removed:false` with `path:null` for a version with no tree.
   - `web.host.ensure` and `web.host.app.write` take an optional `phpSocket` (an absolute `*.sock` path under `/run`,
@@ -1418,6 +1446,34 @@ Reports are the account's own files, rendered and read back as the account; noth
     to the agent, logs a warning, and its result adds `{ extra, forced: true }`. Audit `software.php.remove` args carry
     `{ force, forced, extra }`. Response: `{ job, version, extra, forced }`.
   - *Route* `POST /php/remove { version, force?: boolean }` (root only).
+- **Amendment 2026-11-06 (a Keel build wins over the distribution tree of its minor; the PHP version updater, §63):**
+  - *Agent discovery* (`discoverPhp`, `preferKeelBuilds(versions)` exported, `phpLayout`): a Keel build under
+    `/opt/keel/php/<minor>` is THE entry for that minor — id stays the minor, `layout: 'keel'`, binary
+    `/opt/keel/php/<minor>/bin/php`, `packagePrefix: null` — and the distribution tree of the same minor is no longer
+    listed; the entry reports it as `packagedTwin: { binary, layout, packagePrefix, fpmUnit, poolDir, version }`
+    (`version` is the twin binary's `PHP_VERSION`, filled by `pkg.php.versions` / `pkg.runtime.detect`, `null` from the
+    synchronous discovery). `defaultId` resolves to the minor when `/usr/bin/php` points at either binary. `phpLayout`
+    lists the Keel tree alone for that minor (no `<minor>-pkg` tree: nothing needs it; pools left in `/etc/php/<minor>`
+    keep running on the packaged unit and go with the packages). A tree of the same minor without a build is unchanged.
+  - *Agent* `pkg.php.remove { version, packages?: false, … }`: `packages: true` on a minor whose entry carries
+    `packagedTwin` removes the DISTRIBUTION PACKAGES only (the twin's layout glob, simulated first, `extra`/`force` as
+    before; `refused` while `/usr/bin/php` resolves to the twin binary) and never touches the prefix, unit or link —
+    the result adds `{ packagesOnly: true, keelPrefix }`; `packages: true` on anything else is `not_found`. Without it
+    the minor removes the Keel build (prefix, unit, link) exactly as before and the packages become the minor again.
+  - *Service* `php.catalog()` row for a minor with both: label `PHP <minor> (Keel build)`, `version` = the build's,
+    `layout: 'keel'`, `source: true`, `method: 'source'`, `prefix`, plus `packagedTwin: { binary, version, packagePrefix,
+    fpmUnit }`, `packagePrefix` (the twin's, so the package layout can still be removed) and `note` "Distribution packages
+    <v> remain installed and unused; Remove packages drops them without touching the Keel build." `php.remove(version,
+    user, req, { force, packages })`: `packages: true` skips the default / usage / plan guards (the build keeps serving the
+    minor) and refuses only a minor without a twin and the hostname site still rendering on the packages' socket
+    (`/run/php/php<minor>-fpm*.sock`, "Update PHP first"); job `software.php.remove { version, packages: true }` → agent
+    `packages: true`; result `{ version, packages, removed: true, packagesOnly: true, keelKept: true, prefix }`; the
+    offered list is untouched; audit args carry `packages`.
+  - *`resolveInstall(req, family, { method, installed, latest })`*: a source build over a packaged minor is allowed when
+    `latest` (php.net's newest release of that minor, looked up by `runtimes.install` when `method: 'source'` meets a
+    packaged install) is newer than the packaged version — the update path — and still `422` otherwise ("php.net's
+    latest x.y release (v) is not newer; remove those packages first"). `detectedVersion` passes `packagedTwin` through.
+  - *Route* `POST /php/remove { version, force?, packages?: boolean }` (root only).
   - *Catalog/install:* `resolveInstall(input, family, { method, installed })` takes the `detectedVersion()` answer for
     the minor: an existing Keel build (`source`/`layout: 'keel'`) → 422 "already installed as a Keel build" for any
     method; a distribution tree with `method: 'source'` → 422 "PHP x.y is installed from packages; remove those packages
@@ -1798,6 +1854,38 @@ findings, so every page agrees on what needs an update and what runs when the op
   enum, no `method`) → `202 { job, target, packages, method: 'package'|'node' }`, job `software.runtime.update`; `422` for
   `runtime: 'php'` (PHP goes through `/php/update`), a Node.js major not under `/opt/keel/node`, or packages none of which
   is installed. Audit `software.php.update { from, to, method, packages, jobId }` and `software.runtime.update`.
+- **Amendment 2026-11-06 (the PHP version updater: a packaged minor with an advisory no package fixes is updated from
+  php.net by a source build; §52 amendment of the same date for the discovery precedence):**
+  - *`critical()` PHP items* carry `method: 'package' | 'source' | null` and `build: boolean | null` (null without a
+    candidate). A packaged version (`layout` ≠ `keel`) with an open advisory and NO pending package of its prefix, whose
+    minor is in `PHP_SOURCE_MINORS`, asks php.net (`releaseFor('php', minor)`, same six-hour cache) and, when that release
+    is newer than the installed one, becomes `{ candidate: '<release>', severity: 'critical' | 'security', source:
+    'release', method: 'source', build: true, reasons: [...advisories, 'php.net released x.y.z; no distribution package
+    carries a fix, so it is built from source'] }`; without a newer release it stays `candidate: null` ("Advisory · no fix
+    available yet"). A Keel build whose minor still carries `packagedTwin` (§52) and whose domains were never re-rendered
+    on it (setting `software.php.keel_resynced[minor].version` ≠ the build's version) is listed with `candidate` = its own
+    version, `severity: 'update'`, `method: 'source'`, `build: false` — the update is the resync alone; once php.net is
+    newer the item is the rebuild (`build: true`) as before. `rowUpdate` passes `method` and `build` through.
+  - *`php.update(version)`* → `{ job, version, candidate, method, build }`; job `software.php.update { …, method, build,
+    family? }`. `method: 'source'` runs: (`build`) `pkg.install { packages: PHP_BUILD_DEPS[family] }` → `pkg.php.build {
+    minor }` → `pkg.php.build.finish { minor }` (the unit must come back) → `capabilities.refresh()` → `pkg.php.versions`
+    (the minor MUST now resolve to `layout: 'keel'`, else the job fails before any domain moves) → `php.resyncMinor`:
+    every domain pinned to the minor (`account_domains.php_version`, suspended accounts excluded) plus the inherited ones
+    when the minor is the effective default, through `applyPhpToDomains` (`ctx.web.setPhpVersion`, Apache reloaded after
+    the last), then the hostname site through `ctx.web.hostApps.resyncPhpDefault(effectiveDefault)` when it runs on the
+    minor (`php.hostAppsPhpVersion`) or the minor is the default → setting `software.php.keel_resynced[minor] = { version,
+    at }` → re-detect and log the new `PHP_VERSION`. Result adds `build` and `resync: { domains, pinned, inherited,
+    applied, failed, host }`; a resync in which no domain could be moved fails the job. The package method is unchanged.
+    Without a package manager for the build dependencies the request is `422`. Audit args add `build`.
+  - *Client* (`updateState` → `{ kind, candidate, reasons, method, build, checkedAt }`): the Updates column reads
+    *Security update · x.y.z from php.net* + red **Update** (`phpUpdateDanger`: critical or security) for a source
+    candidate driven by an advisory, *Update available: x.y.z from php.net* for a plain Keel rebuild, *Move domains to the
+    Keel build x.y.z* for the resync-only item, *Advisory · no fix available yet* only without a candidate, *Up to date*
+    otherwise — so the advisory badge ("update to x.y.z") and the column never contradict. The confirm for a packaged row
+    (`phpUpdateMessage`, button "Build and update") says the build replaces the packaged version for every domain on the
+    minor and the hostname site, takes about 15 minutes, and that the packages stay installed; a row with
+    `packagedTwin` shows the packages note and a **Remove packages** action (`phpRemovePackagesBody` → `POST
+    /software/php/remove { version, packages: true, force? }`, same refused-extras flow as Remove).
 - **Job `software.php.update`** (params `{ version, layout, candidate, current, packages, unit, method }`), in order:
   `method: 'package'` → `pkg.upgrade { packages, dist: false }` through `runLongOp` (apt `install --only-upgrade` / dnf
   `upgrade` of exactly those names), `svc.reload { unit }` of the version's FPM unit (a failure is logged, not fatal),

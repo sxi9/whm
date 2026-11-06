@@ -14,6 +14,9 @@ import { NODE_LINK_PATHS, PHP_UNIT_PATHS, PHP_LINK_PATHS, PG_HBA_ROOTS, TERM_RUN
 
 export const DEFAULT_ALLOWED_ROOTS = [
   '/home', '/var/lib/whm', '/etc/whm', '/var/log/whm',
+  // The hostname site's PHP-FPM pool state (sessions, uploads, error log; web.host.pool.write): its own root
+  // because /var/lib/whm is 0750 whmpanel and the pool user cannot traverse it.
+  '/var/lib/keel-host',
   '/etc/apache2', '/etc/httpd', '/etc/nginx', '/var/www',
   '/etc/bind', '/var/named', '/var/lib/bind', '/var/cache/bind',
   '/etc/exim', '/etc/exim4', '/etc/dovecot', '/var/spool/exim', '/var/spool/exim4', '/var/log/exim', '/var/log/exim4', '/var/log/mail.log',

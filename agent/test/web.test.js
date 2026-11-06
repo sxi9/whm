@@ -10,7 +10,7 @@ import {
   mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, DOVECOT_INCLUDES, EXIM_VMAIL, FTP_VIRTUAL, dovecotLayout,
   pureFtpdAuthLink, createPureFtpdAuthLink, PURE_FTPD_AUTH_LINK,
   renderHostVhost, renderHostApp, renderHostIndex, parseHostMeta, wwwPoolSocket, hostCertPaths, HOST_VHOST,
-  hostPools, hostPoolSocket, hostPoolPath, renderHostPool, HOST_POOL,
+  hostPools, hostPoolSocket, hostPoolPath, renderHostPool, HOST_POOL, ensureHostPoolState, hostPoolSocketOf, shadowedTree,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -757,7 +757,11 @@ describe('server hostname site: its own PHP-FPM pool (keel-host)', () => {
   const rhel = { version: '8.2', flavor: 'rhel', poolDir: '/etc/php-fpm.d', bin: 'php-fpm', units: ['php-fpm'], socketDir: '/run/php-fpm', listenOwner: 'apache' };
 
   it("lives in the pool directory of the version it is written for, with a socket beside that version's tenant sockets", () => {
-    expect(HOST_POOL).toEqual({ name: 'keel-host', stateDir: '/var/lib/whm/keel-host' });
+    expect(HOST_POOL).toEqual({ name: 'keel-host', stateDir: '/var/lib/keel-host', legacyStateDir: '/var/lib/whm/keel-host' });
+    // Its own allowed root, exact: /var/lib/whm is 0750 whmpanel and the pool user cannot traverse it.
+    expect(() => ctx.assertAllowedPath('/var/lib/keel-host/tmp', 'write')).not.toThrow();
+    expect(() => ctx.assertAllowedPath('/var/lib/keel-host-evil', 'write')).toThrow();
+    expect(() => ctx.assertAllowedPath('/var/lib/keel-host/../whm/x', 'write')).toThrow();
     expect(hostPoolPath(debian)).toBe('/etc/php/8.3/fpm/pool.d/keel-host.conf');
     expect(hostPoolPath(keel)).toBe('/opt/keel/php/8.4/etc/php-fpm.d/keel-host.conf');
     expect(hostPoolSocket(debian)).toBe('/run/php/php8.3-fpm-keel-host.sock');
@@ -771,9 +775,11 @@ describe('server hostname site: its own PHP-FPM pool (keel-host)', () => {
     const text = renderHostPool(debian);
     expect(text.startsWith('; Managed by Keel (PHP-FPM pool for the server hostname site, runs as www-data, PHP 8.3)')).toBe(true);
     expect(text).toContain('[keel-host]\nuser = www-data\ngroup = www-data\nlisten = /run/php/php8.3-fpm-keel-host.sock\nlisten.owner = www-data\nlisten.group = www-data\nlisten.mode = 0660\npm = ondemand\npm.max_children = 10\npm.process_idle_timeout = 10s\n');
-    expect(text).toContain('php_admin_value[upload_tmp_dir] = /var/lib/whm/keel-host/tmp');
-    expect(text).toContain('php_admin_value[session.save_path] = /var/lib/whm/keel-host/tmp');
-    expect(text).toContain('php_admin_value[error_log] = /var/lib/whm/keel-host/php-error.log');
+    expect(text).toContain('php_admin_value[upload_tmp_dir] = /var/lib/keel-host/tmp');
+    expect(text).toContain('php_admin_value[session.save_path] = /var/lib/keel-host/tmp');
+    expect(text).toContain('php_admin_value[sys_temp_dir] = /var/lib/keel-host/tmp');
+    expect(text).toContain('php_admin_value[error_log] = /var/lib/keel-host/php-error.log');
+    expect(text).not.toContain('/var/lib/whm/');
     expect(text).toContain('security.limit_extensions = .php .phar .phtml');
     expect(text).not.toContain('open_basedir');
     expect(text).not.toContain('[www-data]');
@@ -784,6 +790,98 @@ describe('server hostname site: its own PHP-FPM pool (keel-host)', () => {
     const tenant = renderPhpPool({ user: 'alice', version: '8.3', pm: 'ondemand', maxChildren: 5, processIdleTimeout: 10, maxRequests: 500, memoryLimit: '256M', uploadMaxFilesize: '64M', postMaxSize: '64M', maxExecutionTime: 120 }, { socket: '/run/php/php8.3-fpm-alice.sock', homeDir: '/home/alice' });
     expect(tenant).toContain('(PHP-FPM pool for alice, PHP 8.3)');
     expect(tenant).toContain('[alice]\nuser = alice\ngroup = alice\n');
+  });
+
+  it('creates the state directory root-owned (0750 root:pool group, tmp 0700 and the error log pool-owned) through O_NOFOLLOW descriptors, never a path chown, and drops the old /var/lib/whm location only when empty', () => {
+    const owner = { name: 'www-data', uid: 33, gid: 33 };
+    const { O_RDONLY, O_NOFOLLOW, O_DIRECTORY } = fs.constants;
+    const DIR = O_RDONLY | O_NOFOLLOW | O_DIRECTORY;
+    const FILE = O_RDONLY | O_NOFOLLOW;
+    const fsm = (entries, { readdir = {} } = {}) => {
+      const calls = [];
+      const fds = new Map();
+      let next = 7;
+      const fail = (code) => { const err = new Error(code); err.code = code; throw err; };
+      const st = (e) => ({ isSymbolicLink: () => e.type === 'link', isDirectory: () => e.type === 'dir', isFile: () => e.type === 'file', uid: e.uid ?? 0, nlink: e.nlink ?? 1 });
+      return {
+        calls,
+        openSync: (p, flags) => {
+          calls.push(['open', p, flags]);
+          const e = entries[p];
+          if (!e) fail('ENOENT');
+          if (e.type === 'link') fail('ELOOP');
+          if ((flags & O_DIRECTORY) && e.type !== 'dir') fail('ENOTDIR');
+          const fd = next++; fds.set(fd, p); return fd;
+        },
+        fstatSync: (fd) => st(entries[fds.get(fd)]),
+        fchownSync: (fd, u, g) => calls.push(['fchown', fds.get(fd), u, g]),
+        fchmodSync: (fd, m) => calls.push(['fchmod', fds.get(fd), m]),
+        closeSync: (fd) => { calls.push(['close', fds.get(fd)]); fds.delete(fd); },
+        chownSync: () => { throw new Error('path chown must never be used'); },
+        chmodSync: () => { throw new Error('path chmod must never be used'); },
+        lstatSync: (p) => { if (!entries[p]) fail('ENOENT'); return st(entries[p]); },
+        mkdirSync: (p, o) => { calls.push(['mkdir', p, o.mode]); entries[p] = { type: 'dir' }; },
+        writeFileSync: (p, c, o) => { calls.push(['write', p, o.mode, o.flag]); entries[p] = { type: 'file' }; },
+        readdirSync: (p) => readdir[p] || [],
+        rmdirSync: (p) => { calls.push(['rmdir', p]); delete entries[p]; },
+        open: () => fds.size,
+      };
+    };
+    const fresh = fsm({});
+    ensureHostPoolState(owner, fresh);
+    expect(fresh.calls).toEqual([
+      ['open', '/var/lib/keel-host', DIR], ['mkdir', '/var/lib/keel-host', 0o750], ['open', '/var/lib/keel-host', DIR], ['fchown', '/var/lib/keel-host', 0, 33], ['fchmod', '/var/lib/keel-host', 0o750], ['close', '/var/lib/keel-host'],
+      ['open', '/var/lib/keel-host/tmp', DIR], ['mkdir', '/var/lib/keel-host/tmp', 0o700], ['open', '/var/lib/keel-host/tmp', DIR], ['fchown', '/var/lib/keel-host/tmp', 33, 33], ['fchmod', '/var/lib/keel-host/tmp', 0o700], ['close', '/var/lib/keel-host/tmp'],
+      ['open', '/var/lib/keel-host/php-error.log', FILE], ['write', '/var/lib/keel-host/php-error.log', 0o640, 'wx'], ['open', '/var/lib/keel-host/php-error.log', FILE], ['fchown', '/var/lib/keel-host/php-error.log', 33, 33], ['fchmod', '/var/lib/keel-host/php-error.log', 0o640], ['close', '/var/lib/keel-host/php-error.log'],
+    ]);
+    expect(fresh.open()).toBe(0);
+    // Repair: a state directory the pool user owned (pre-fix) goes back to root; tmp and the log stay the pool user's; the old location goes when empty, stays otherwise.
+    const repair = fsm({ '/var/lib/keel-host': { type: 'dir', uid: 33 }, '/var/lib/keel-host/tmp': { type: 'dir', uid: 33 }, '/var/lib/keel-host/php-error.log': { type: 'file', uid: 33 }, '/var/lib/whm/keel-host': { type: 'dir' }, '/var/lib/whm/keel-host/tmp': { type: 'dir' } });
+    ensureHostPoolState(owner, repair);
+    expect(repair.calls.filter((c) => c[0] === 'mkdir' || c[0] === 'write')).toEqual([]);
+    expect(repair.calls.filter((c) => c[0] === 'fchown')).toEqual([['fchown', '/var/lib/keel-host', 0, 33], ['fchown', '/var/lib/keel-host/tmp', 33, 33], ['fchown', '/var/lib/keel-host/php-error.log', 33, 33]]);
+    expect(repair.calls.filter((c) => c[0] === 'rmdir')).toEqual([['rmdir', '/var/lib/whm/keel-host/tmp'], ['rmdir', '/var/lib/whm/keel-host']]);
+    expect(repair.open()).toBe(0);
+    const busy = fsm({ '/var/lib/whm/keel-host': { type: 'dir' }, '/var/lib/whm/keel-host/tmp': { type: 'dir' } }, { readdir: { '/var/lib/whm/keel-host/tmp': ['sess_abc'], '/var/lib/whm/keel-host': ['tmp', 'php-error.log'] } });
+    ensureHostPoolState(owner, busy);
+    expect(busy.calls.filter((c) => c[0] === 'rmdir')).toEqual([]);
+    // Nothing is chowned away from a foreign owner; a symlink planted at any of the three paths is ELOOP at open -> refused, never followed
+    // (the chown runs on the descriptor of what was opened, so a swap after the open cannot reach another file either).
+    for (const entries of [
+      { '/var/lib/keel-host': { type: 'dir', uid: 1000 } },
+      { '/var/lib/keel-host': { type: 'link' } },
+      { '/var/lib/keel-host': { type: 'dir' }, '/var/lib/keel-host/tmp': { type: 'link' } },
+      { '/var/lib/keel-host': { type: 'dir' }, '/var/lib/keel-host/tmp': { type: 'file' } },
+      { '/var/lib/keel-host': { type: 'dir' }, '/var/lib/keel-host/tmp': { type: 'dir' }, '/var/lib/keel-host/php-error.log': { type: 'link' } },
+      { '/var/lib/keel-host': { type: 'dir' }, '/var/lib/keel-host/tmp': { type: 'dir' }, '/var/lib/keel-host/php-error.log': { type: 'dir' } },
+      { '/var/lib/keel-host': { type: 'dir' }, '/var/lib/keel-host/tmp': { type: 'dir' }, '/var/lib/keel-host/php-error.log': { type: 'file', uid: 1000 } },
+      { '/var/lib/keel-host': { type: 'dir' }, '/var/lib/keel-host/tmp': { type: 'dir' }, '/var/lib/keel-host/php-error.log': { type: 'file', nlink: 2 } },
+    ]) {
+      const bad = fsm(entries);
+      expect(() => ensureHostPoolState(owner, bad), JSON.stringify(entries)).toThrow(/refused|not a|owned by|links/);
+      const last = Object.keys(entries).pop();
+      expect(bad.calls.filter((c) => c[0] === 'fchown' && c[1] === last), JSON.stringify(entries)).toEqual([]);
+      expect(bad.open(), JSON.stringify(entries)).toBe(0);
+    }
+  });
+
+  it('a distro tree a Keel build shadows is listed apart from the versions and still reports its keel-host pool for cleanup', () => {
+    const keelRoot = process.env.WHM_KEEL_PHP_DIR;
+    const present = new Set(['/etc/php/8.3/fpm/pool.d', '/etc/apache2', `${keelRoot}/8.3/etc/php-fpm.d`, `${keelRoot}/8.3/.keel-build-ok`, `${keelRoot}/8.3/sbin/php-fpm`, '/etc/php/8.1/fpm/pool.d']);
+    const io = { readdirSync: (d) => (d === '/etc/php' ? ['8.1', '8.3'] : d === keelRoot ? ['8.3'] : []), exists: (p) => present.has(p), hasBinary: (b) => b === 'php-fpm8.3' || b === 'php-fpm8.1' };
+    const layout = phpLayout(io);
+    expect(layout.versions.map((v) => [v.version, v.flavor])).toEqual([['8.1', 'debian'], ['8.3', 'keel']]);
+    expect(layout.shadowed).toEqual([{ version: '8.3', flavor: 'debian', poolDir: '/etc/php/8.3/fpm/pool.d', bin: 'php-fpm8.3', units: ['php8.3-fpm'], socketDir: '/run/php', listenOwner: 'www-data', shadowed: true }]);
+    expect(shadowedTree(layout, '8.3')).toMatchObject({ flavor: 'debian', shadowed: true });
+    expect(shadowedTree(layout, '8.1')).toBeNull();
+    const pools = hostPools(layout, { exists: (p) => p === '/etc/php/8.3/fpm/pool.d/keel-host.conf' || p === `${keelRoot}/8.3/etc/php-fpm.d/keel-host.conf` });
+    expect(pools).toEqual([
+      { version: '8.3', flavor: 'keel', path: `${keelRoot}/8.3/etc/php-fpm.d/keel-host.conf`, socket: '/run/keel-php/php8.3-fpm-keel-host.sock', units: ['keel-php8.3-fpm'] },
+      { version: '8.3', flavor: 'debian', path: '/etc/php/8.3/fpm/pool.d/keel-host.conf', socket: '/run/php/php8.3-fpm-keel-host.sock', units: ['php8.3-fpm'], shadowed: true },
+    ]);
+    // The handler socket never comes from the shadowed tree, even when only it carries the pool.
+    expect(hostPoolSocketOf(pools)).toBe('/run/keel-php/php8.3-fpm-keel-host.sock');
+    expect(hostPoolSocketOf(hostPools(layout, { exists: (p) => p === '/etc/php/8.3/fpm/pool.d/keel-host.conf' }))).toBeNull();
   });
 
   it('lists the trees that carry the pool, newest first, from the layout alone', () => {

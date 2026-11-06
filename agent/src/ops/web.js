@@ -177,37 +177,65 @@ export const KEEL_PHP_RUN_DIR = '/run/keel-php';
 // PHP-FPM: Debian ships one tree per version under /etc/php/<ver>/fpm; RHEL
 // ships a single /etc/php-fpm.d (or Remi SCL trees under /etc/opt/remi);
 // Keel source builds carry their own etc/php-fpm.d under /opt/keel/php/<minor>.
-export function phpLayout() {
+// `versions` are the trees pools and vhosts render on; `shadowed` are the
+// distro trees of a minor that has a Keel build: never selected, but still
+// cleaned (their keel-host.conf / whm-<user>.conf keep running on the packaged
+// unit until the packages are removed).
+const layoutIo = { readdirSync: (d) => fs.readdirSync(d), exists, hasBinary };
+export function phpLayout(io = layoutIo) {
   const versions = [];
+  const shadowed = [];
   try {
-    for (const v of fs.readdirSync('/etc/php')) {
-      if (!/^\d\.\d+$/.test(v) || !exists(`/etc/php/${v}/fpm/pool.d`)) continue;
-      versions.push({ version: v, flavor: 'debian', poolDir: `/etc/php/${v}/fpm/pool.d`, bin: hasBinary(`php-fpm${v}`) ? `php-fpm${v}` : null, units: [`php${v}-fpm`], socketDir: '/run/php', listenOwner: 'www-data' });
+    for (const v of io.readdirSync('/etc/php')) {
+      if (!/^\d\.\d+$/.test(v) || !io.exists(`/etc/php/${v}/fpm/pool.d`)) continue;
+      versions.push({ version: v, flavor: 'debian', poolDir: `/etc/php/${v}/fpm/pool.d`, bin: io.hasBinary(`php-fpm${v}`) ? `php-fpm${v}` : null, units: [`php${v}-fpm`], socketDir: '/run/php', listenOwner: 'www-data' });
     }
   } catch { /* no /etc/php */ }
   try {
-    // Source builds (pkg.php.build) under /opt/keel/php/<minor>; a distro tree of the same minor is listed first and wins.
+    // Source builds (pkg.php.build) under /opt/keel/php/<minor>. A Keel build is
+    // the tree listed for its minor: the distro tree of the same minor moves to
+    // `shadowed` (its packages stay installed and unused until pkg.php.remove
+    // { packages: true }), so every pool and vhost of that minor renders on the build.
     const keelRoot = process.env.WHM_KEEL_PHP_DIR || KEEL_PHP_DIR;
-    const listenOwner = exists('/etc/apache2') ? 'www-data' : 'apache';
-    for (const v of fs.readdirSync(keelRoot)) {
+    const listenOwner = io.exists('/etc/apache2') ? 'www-data' : 'apache';
+    for (const v of io.readdirSync(keelRoot)) {
       const prefix = `${keelRoot}/${v}`;
       // .keel-build-ok is php-build.sh's last step; a prefix without it is an unfinished build, not a version.
-      if (!/^\d\.\d+$/.test(v) || !exists(`${prefix}/etc/php-fpm.d`) || !exists(`${prefix}/.keel-build-ok`) || versions.some((x) => x.version === v)) continue;
-      versions.push({ version: v, flavor: 'keel', poolDir: `${prefix}/etc/php-fpm.d`, bin: exists(`${prefix}/sbin/php-fpm`) ? `${prefix}/sbin/php-fpm` : null, fpmConfig: `${prefix}/etc/php-fpm.conf`, units: [`keel-php${v}-fpm`], socketDir: KEEL_PHP_RUN_DIR, listenOwner });
+      if (!/^\d\.\d+$/.test(v) || !io.exists(`${prefix}/etc/php-fpm.d`) || !io.exists(`${prefix}/.keel-build-ok`) || versions.some((x) => x.version === v && x.flavor === 'keel')) continue;
+      const twin = versions.findIndex((x) => x.version === v);
+      if (twin >= 0) shadowed.push({ ...versions.splice(twin, 1)[0], shadowed: true });
+      versions.push({ version: v, flavor: 'keel', poolDir: `${prefix}/etc/php-fpm.d`, bin: io.exists(`${prefix}/sbin/php-fpm`) ? `${prefix}/sbin/php-fpm` : null, fpmConfig: `${prefix}/etc/php-fpm.conf`, units: [`keel-php${v}-fpm`], socketDir: KEEL_PHP_RUN_DIR, listenOwner });
     }
   } catch { /* no source builds */ }
   try {
-    for (const d of fs.readdirSync('/etc/opt/remi')) {
+    for (const d of io.readdirSync('/etc/opt/remi')) {
       const m = d.match(/^php(\d)(\d+)$/);
-      if (m && exists(`/etc/opt/remi/${d}/php-fpm.d`)) versions.push({ version: `${m[1]}.${m[2]}`, flavor: 'remi', poolDir: `/etc/opt/remi/${d}/php-fpm.d`, bin: hasBinary(`${d}-php-fpm`) ? `${d}-php-fpm` : null, units: [`${d}-php-fpm`], socketDir: `/var/opt/remi/${d}/run/php-fpm`, listenOwner: 'apache' });
+      if (m && io.exists(`/etc/opt/remi/${d}/php-fpm.d`)) versions.push({ version: `${m[1]}.${m[2]}`, flavor: 'remi', poolDir: `/etc/opt/remi/${d}/php-fpm.d`, bin: io.hasBinary(`${d}-php-fpm`) ? `${d}-php-fpm` : null, units: [`${d}-php-fpm`], socketDir: `/var/opt/remi/${d}/run/php-fpm`, listenOwner: 'apache' });
     }
   } catch { /* no remi */ }
-  if (exists('/etc/php-fpm.d')) {
+  if (io.exists('/etc/php-fpm.d')) {
     let version = null;
-    if (hasBinary('php')) { try { version = fs.readlinkSync('/etc/alternatives/php').match(/php(\d\.\d+)/)?.[1] || null; } catch { version = null; } }
-    versions.push({ version: version || 'system', flavor: 'rhel', poolDir: '/etc/php-fpm.d', bin: hasBinary('php-fpm') ? 'php-fpm' : null, units: ['php-fpm'], socketDir: '/run/php-fpm', listenOwner: 'apache' });
+    if (io.hasBinary('php')) { try { version = fs.readlinkSync('/etc/alternatives/php').match(/php(\d\.\d+)/)?.[1] || null; } catch { version = null; } }
+    versions.push({ version: version || 'system', flavor: 'rhel', poolDir: '/etc/php-fpm.d', bin: io.hasBinary('php-fpm') ? 'php-fpm' : null, units: ['php-fpm'], socketDir: '/run/php-fpm', listenOwner: 'apache' });
   }
-  return { versions: versions.sort((a, b) => a.version.localeCompare(b.version, undefined, { numeric: true })), installed: versions.length > 0 };
+  return { versions: versions.sort((a, b) => a.version.localeCompare(b.version, undefined, { numeric: true })), shadowed, installed: versions.length > 0 };
+}
+
+// The shadowed distro tree of a minor, when a Keel build took it over.
+export function shadowedTree(layout, version) {
+  return (layout.shadowed || []).find((v) => v.version === version) || null;
+}
+
+// Drops the pool file `name` a shadowed distro tree still carries and reloads
+// the packaged unit, so no second FPM master keeps serving it.
+async function dropShadowedPool(layout, version, name, ctx) {
+  const tree = shadowedTree(layout, version);
+  if (!tree) return null;
+  const file = ctx.assertAllowedPath(path.join(tree.poolDir, `${name}.conf`), 'write');
+  if (!exists(file)) return null;
+  fs.unlinkSync(file);
+  dropLegacyBackup(file);
+  return { path: file, flavor: tree.flavor, ...(await reloadUnit(tree.units)) };
 }
 
 export function phpSocket(version, user) {
@@ -974,16 +1002,22 @@ export function wwwPoolSocket(layout = phpLayout(), io = { exists }) {
 // etc/php-fpm.d), running as the web server user, so removing the distro PHP
 // or defaulting to a source build never leaves the site pointing at a socket
 // that no longer exists. Named keel-host.conf: tenant pools are whm-<user>.conf.
-export const HOST_POOL = { name: 'keel-host', stateDir: '/var/lib/whm/keel-host' };
+// The state directory is its own root: /var/lib/whm is 0750 whmpanel:whmpanel,
+// which the pool user cannot traverse, so sessions there failed with EACCES.
+export const HOST_POOL = { name: 'keel-host', stateDir: '/var/lib/keel-host', legacyStateDir: '/var/lib/whm/keel-host' };
 export function hostPoolSocket(tree) {
   return `${tree.socketDir}/php${tree.version === 'system' ? '' : tree.version}-fpm-${HOST_POOL.name}.sock`;
 }
 export function hostPoolPath(tree) {
   return path.join(tree.poolDir, `${HOST_POOL.name}.conf`);
 }
-// Every tree that carries the host pool, newest PHP first.
+// Every tree that carries the host pool, newest PHP first; a shadowed distro
+// tree is listed (flagged) so its leftover pool can be dropped, never chosen.
 export function hostPools(layout = phpLayout(), io = { exists }) {
-  return [...layout.versions].reverse().filter((v) => io.exists(hostPoolPath(v))).map((v) => ({ version: v.version, flavor: v.flavor, path: hostPoolPath(v), socket: hostPoolSocket(v), units: v.units }));
+  return [...layout.versions, ...(layout.shadowed || [])].reverse().filter((v) => io.exists(hostPoolPath(v))).map((v) => ({ version: v.version, flavor: v.flavor, path: hostPoolPath(v), socket: hostPoolSocket(v), units: v.units, ...(v.shadowed ? { shadowed: true } : {}) }));
+}
+export function hostPoolSocketOf(pools) {
+  return pools.find((p) => !p.shadowed)?.socket ?? null;
 }
 export function renderHostPool(tree) {
   const owner = tree.listenOwner || 'www-data';
@@ -993,7 +1027,7 @@ export function renderHostPool(tree) {
 // The handler socket the hostname site should use when the caller passes none:
 // the host pool of the newest tree that has one, else the distro www pool.
 function hostPhpSocketFallback() {
-  return hostPools()[0]?.socket || wwwPoolSocket();
+  return hostPoolSocketOf(hostPools()) || wwwPoolSocket();
 }
 
 const socketPath = confPath.regex(/^\/(?:run|var\/run|var\/opt)\/[A-Za-z0-9._\/-]+\.sock$/, 'PHP-FPM socket path under /run');
@@ -1175,7 +1209,7 @@ defineOp('web.host.status', {
     const certificate = { ...cert, present: exists(cert.fullchain) && exists(cert.key) };
     const apache = apacheLayout();
     const pools = hostPools();
-    if (!apache) return { installed: false, exists: false, enabled: false, managed: false, hostname: null, meta: null, ssl: false, certificate, docroot: HOST_VHOST.docroot, docrootExists: isDirectory(HOST_VHOST.docroot), phpSocket: pools[0]?.socket || wwwPoolSocket(), pools, appsDir: null, apps: [] };
+    if (!apache) return { installed: false, exists: false, enabled: false, managed: false, hostname: null, meta: null, ssl: false, certificate, docroot: HOST_VHOST.docroot, docrootExists: isDirectory(HOST_VHOST.docroot), phpSocket: hostPoolSocketOf(pools) || wwwPoolSocket(), pools, appsDir: null, apps: [] };
     const layout = hostLayout(apache);
     const file = ctx.assertAllowedPath(layout.file, 'read');
     const appsDir = ctx.assertAllowedPath(layout.appsDir, 'read');
@@ -1183,7 +1217,7 @@ defineOp('web.host.status', {
     const meta = parseHostMeta(text);
     return {
       installed: Boolean(apache.bin), flavor: apache.flavor, path: file, link: layout.link, exists: text != null, managed: text != null && text.includes(HOST_MARK), enabled: layout.link ? exists(layout.link) : text != null,
-      hostname: meta?.hostname ?? null, meta, ssl: Boolean(meta?.ssl), certificate, docroot: meta?.docroot ?? HOST_VHOST.docroot, docrootExists: isDirectory(meta?.docroot ?? HOST_VHOST.docroot), phpSocket: meta?.phpSocket ?? pools[0]?.socket ?? wwwPoolSocket(), pools, appsDir, apps: listHostApps(appsDir),
+      hostname: meta?.hostname ?? null, meta, ssl: Boolean(meta?.ssl), certificate, docroot: meta?.docroot ?? HOST_VHOST.docroot, docrootExists: isDirectory(meta?.docroot ?? HOST_VHOST.docroot), phpSocket: meta?.phpSocket ?? hostPoolSocketOf(pools) ?? wwwPoolSocket(), pools, appsDir, apps: listHostApps(appsDir),
     };
   },
 });
@@ -1207,18 +1241,56 @@ defineOp('web.host.remove', {
   },
 });
 
-// The pool's state directory (uploads, sessions, PHP error log) belongs to the
-// pool user; a symlink or a foreign owner there is refused rather than chowned.
-function ensureHostPoolState(owner) {
+// The pool's state directory is root-owned (0750 root:<pool group>) so the
+// pool user cannot rename or replace its entries; only tmp (0700) and
+// php-error.log (0640) belong to the pool user. Every ownership or mode change
+// goes through a descriptor opened with O_NOFOLLOW (a symlink is ELOOP ->
+// refused, never followed), so nothing running as the pool user can swap an
+// entry for a link to a root file between the check and the chown. A foreign
+// owner is refused rather than chowned. The pre-2026-11-06 location under
+// /var/lib/whm is dropped when empty, never migrated: sessions and uploads
+// there are transient.
+export function ensureHostPoolState(owner, io = fs) {
+  const { O_RDONLY, O_NOFOLLOW, O_DIRECTORY } = fs.constants;
   const dir = HOST_POOL.stateDir;
-  for (const [d, mode] of [[dir, 0o750], [path.join(dir, 'tmp'), 0o700]]) {
-    let st = null;
-    try { st = fs.lstatSync(d); } catch { st = null; }
-    if (st && (st.isSymbolicLink() || !st.isDirectory())) throw new OpError('refused', `${d} exists and is not a directory`);
-    if (st && st.uid !== 0 && st.uid !== owner.uid) throw new OpError('refused', `${d} is owned by uid ${st.uid}, not root or ${owner.name}`);
-    if (!st) fs.mkdirSync(d, { recursive: true, mode });
-    fs.chownSync(d, owner.uid, owner.gid);
-    fs.chmodSync(d, mode);
+  const refuse = (p, what) => new OpError('refused', `${p} exists and is not a ${what}`);
+  const openNoFollow = (p, flags, what) => {
+    try { return io.openSync(p, flags); } catch (err) {
+      if (err.code === 'ENOENT') return null;
+      if (err.code === 'ELOOP' || err.code === 'ENOTDIR' || err.code === 'EISDIR') throw refuse(p, what);
+      throw err;
+    }
+  };
+  const settle = (p, fd, { uid, gid, mode, what, isKind }) => {
+    try {
+      const st = io.fstatSync(fd);
+      if (!isKind(st)) throw refuse(p, what);
+      if (st.uid !== 0 && st.uid !== owner.uid) throw new OpError('refused', `${p} is owned by uid ${st.uid}, not root or ${owner.name}`);
+      if (what === 'regular file' && st.nlink > 1) throw new OpError('refused', `${p} has ${st.nlink} links; refusing to change its owner`);
+      io.fchownSync(fd, uid, gid);
+      io.fchmodSync(fd, mode);
+    } finally { io.closeSync(fd); }
+  };
+  for (const [d, uid, gid, mode] of [[dir, 0, owner.gid, 0o750], [path.join(dir, 'tmp'), owner.uid, owner.gid, 0o700]]) {
+    let fd = openNoFollow(d, O_RDONLY | O_NOFOLLOW | O_DIRECTORY, 'directory');
+    if (fd == null) {
+      io.mkdirSync(d, { recursive: true, mode });
+      fd = openNoFollow(d, O_RDONLY | O_NOFOLLOW | O_DIRECTORY, 'directory');
+      if (fd == null) throw new OpError('refused', `${d} vanished after it was created`);
+    }
+    settle(d, fd, { uid, gid, mode, what: 'directory', isKind: (st) => st.isDirectory() });
+  }
+  const log = path.join(dir, 'php-error.log');
+  let fd = openNoFollow(log, O_RDONLY | O_NOFOLLOW, 'regular file');
+  if (fd == null) {
+    io.writeFileSync(log, '', { mode: 0o640, flag: 'wx' });
+    fd = openNoFollow(log, O_RDONLY | O_NOFOLLOW, 'regular file');
+    if (fd == null) throw new OpError('refused', `${log} vanished after it was created`);
+  }
+  settle(log, fd, { uid: owner.uid, gid: owner.gid, mode: 0o640, what: 'regular file', isKind: (st) => st.isFile() });
+  const legacy = HOST_POOL.legacyStateDir;
+  for (const d of [path.join(legacy, 'tmp'), legacy]) {
+    try { if (io.lstatSync(d).isDirectory() && io.readdirSync(d).length === 0) io.rmdirSync(d); } catch { /* absent, not empty, or not ours to remove */ }
   }
 }
 
@@ -1249,7 +1321,8 @@ defineOp('web.host.pool.write', {
       if (!validated) { restore(file, previous); throw new OpError('config_invalid', `PHP-FPM rejected the hostname pool; the previous file was restored: ${lastLine(stderr || stdout)}`, { output: `${stdout}${stderr}`.trim() }); }
     }
     const result = reload ? await reloadUnit(tree.units) : { reloaded: false, unit: null };
-    return { ...base, changed: true, validated, ...result };
+    const shadowedRemoved = await dropShadowedPool(layout, version, HOST_POOL.name, ctx);
+    return { ...base, changed: true, validated, ...result, ...(shadowedRemoved ? { shadowedRemoved } : {}) };
   },
 });
 
@@ -1258,13 +1331,15 @@ defineOp('web.host.pool.remove', {
   destructive: true,
   schema: z.object({ version: phpVersion, reload: z.boolean().default(true) }).strict(),
   run: async ({ version, reload }, ctx) => {
-    const tree = phpLayout().versions.find((v) => v.version === version);
-    if (!tree) return { version, path: null, removed: false, reloaded: false, unit: null };
+    const layout = phpLayout();
+    const tree = layout.versions.find((v) => v.version === version);
+    const shadowedRemoved = await dropShadowedPool(layout, version, HOST_POOL.name, ctx);
+    if (!tree) return { version, path: null, removed: false, reloaded: false, unit: null, ...(shadowedRemoved ? { shadowedRemoved } : {}) };
     const file = ctx.assertAllowedPath(hostPoolPath(tree), 'write');
     const existed = exists(file);
     if (existed) fs.unlinkSync(file);
     dropLegacyBackup(file);
-    return { version, path: file, socket: hostPoolSocket(tree), removed: existed, ...(existed && reload ? await reloadUnit(tree.units) : { reloaded: false, unit: null }) };
+    return { version, path: file, socket: hostPoolSocket(tree), removed: existed, ...(existed && reload ? await reloadUnit(tree.units) : { reloaded: false, unit: null }), ...(shadowedRemoved ? { shadowedRemoved } : {}) };
   },
 });
 
@@ -1522,7 +1597,8 @@ defineOp('web.phpfpm.pool.write', {
       if (!validated) { restore(file, previous); throw new OpError('config_invalid', `PHP-FPM rejected the pool; the previous file was restored: ${lastLine(stderr || stdout)}`, { output: `${stdout}${stderr}`.trim() }); }
     }
     const reload = p.reload ? await reloadUnit(tree.units) : { reloaded: false, unit: null };
-    return { user: p.user, version: p.version, path: file, socket, validated, bytes: Buffer.byteLength(content), ...reload };
+    const shadowedRemoved = await dropShadowedPool(layout, p.version, `whm-${p.user}`, ctx);
+    return { user: p.user, version: p.version, path: file, socket, validated, bytes: Buffer.byteLength(content), ...reload, ...(shadowedRemoved ? { shadowedRemoved } : {}) };
   },
 });
 
@@ -1531,13 +1607,15 @@ defineOp('web.phpfpm.pool.remove', {
   destructive: true,
   schema: z.object({ user: arg.username, version: phpVersion }).strict(),
   run: async ({ user, version }, ctx) => {
-    const tree = phpLayout().versions.find((v) => v.version === version);
-    if (!tree) return { user, version, removed: false };
+    const layout = phpLayout();
+    const tree = layout.versions.find((v) => v.version === version);
+    const shadowedRemoved = await dropShadowedPool(layout, version, `whm-${user}`, ctx);
+    if (!tree) return { user, version, removed: false, ...(shadowedRemoved ? { shadowedRemoved } : {}) };
     const file = ctx.assertAllowedPath(path.join(tree.poolDir, `whm-${user}.conf`), 'write');
     const existed = exists(file);
     if (existed) fs.unlinkSync(file);
     dropLegacyBackup(file);
-    return { user, version, path: file, removed: existed, ...(existed ? await reloadUnit(tree.units) : { reloaded: false, unit: null }) };
+    return { user, version, path: file, removed: existed, ...(existed ? await reloadUnit(tree.units) : { reloaded: false, unit: null }), ...(shadowedRemoved ? { shadowedRemoved } : {}) };
   },
 });
 
