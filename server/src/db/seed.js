@@ -78,7 +78,7 @@ export const DEFAULT_FEATURES = {
   autossl: true, phpversion: true, multiphp: true, webdisk: true, api: true, passwordchange: true,
   hotlink: true, leechprotect: true, indexmanager: true, errpgs: true, redirects: true, cpanelpro_support: false,
   ipblocker: true, dirprivacy: true, webstats: true, wordpress: true, ddns: true, virusscan: true, traceroute: true, optimizews: true, plugins: true,
-  dbwizard: true, gitversioncontrol: true, applicationmanager: true, terminal: true, caldav: true, usermanager: true,
+  dbwizard: true, gitversioncontrol: true, applicationmanager: true, terminal: true, caldav: true, usermanager: true, installers: true,
 };
 
 export async function seed({ db, config, crypto, logger }) {

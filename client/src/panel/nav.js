@@ -74,6 +74,7 @@ export const PANEL_CATEGORY_DEFS = [
     ['Directory privacy', 'Ask visitors for a username and password before a folder opens.', 1, { feature: 'dirprivacy' }],
     ['Indexes', 'Whether a folder without an index page lists its files.', 1, { feature: 'indexmanager' }],
     ['Git version control', 'Clone or create repositories under your home and deploy them to your sites.', 3, { slug: 'git', feature: 'gitversioncontrol' }],
+    ['Web Disk', 'Open your home folder like a drive on your computer or phone over WebDAV.', 3, { slug: 'webdisk', feature: 'webdisk' }],
   ]],
   ['Email', 'Mail', [
     ['Email accounts', 'Mailboxes on your domains.', 1, { slug: 'accounts', feature: 'emailaccts' }],
@@ -136,6 +137,7 @@ export const PANEL_CATEGORY_DEFS = [
   ]],
   ['Software', 'Package', [
     ['WordPress', 'Install, update and remove WordPress on your domains.', 1, { feature: 'wordpress' }],
+    ['Installers', 'One-click WordPress, Joomla and Drupal on your domains.', 5, { feature: 'installers' }],
     ['Plugins', 'Extra tools your hosting provider installed for your account.', 1, { feature: 'plugins' }],
     ['Application manager', 'Run Node.js and Python applications as services and publish them on your domains.', 3, { slug: 'apps', feature: 'applicationmanager' }],
   ]],

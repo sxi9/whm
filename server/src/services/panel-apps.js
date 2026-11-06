@@ -66,7 +66,9 @@ export function createPanelAppsService(ctx) {
     countDomain: db.prepare('SELECT COUNT(*) AS n FROM panel_apps WHERE account_id = ? AND domain = ?'),
     byUsername: db.prepare('SELECT p.* FROM panel_apps p JOIN accounts a ON a.id = p.account_id WHERE a.username = ? ORDER BY p.id'),
     count: db.prepare('SELECT COUNT(*) AS n FROM panel_apps WHERE account_id = ?'),
-    ports: db.prepare('SELECT port FROM panel_apps ORDER BY port'),
+    // Web Disk rows keep their port while disabled (nothing listens, so the
+    // probe would call it free); both tables share the pool.
+    ports: db.prepare('SELECT port FROM panel_apps UNION SELECT port FROM panel_webdisk'),
     insert: db.prepare(`INSERT INTO panel_apps (account_id, name, type, dir, entry, runtime, port, domain, mount, websocket, env_json, status, error)
       VALUES (@account_id, @name, @type, @dir, @entry, @runtime, @port, @domain, @mount, @websocket, @env_json, @status, @error)`),
     update: db.prepare(`UPDATE panel_apps SET dir = @dir, entry = @entry, runtime = @runtime, domain = @domain, mount = @mount, websocket = @websocket, env_json = @env_json, status = @status, error = @error, updated_at = @updated_at
@@ -189,8 +191,8 @@ export function createPanelAppsService(ctx) {
     return value;
   }
 
-  // The lowest port of the pool no app row holds and nothing on the host
-  // listens on (apps.port.free; a host without `ss` is trusted on the rows).
+  // The lowest port of the pool no app or Web Disk row holds and nothing on
+  // the host listens on (apps.port.free; a host without `ss` is trusted on the rows).
   async function pickPort(req) {
     const range = portRange(ctx.settings);
     const used = new Set(stmts.ports.all().map((r) => r.port));

@@ -1198,8 +1198,16 @@ export function createServiceConfigService(ctx) {
       return { settings: next, live: false };
     },
   });
+  // The legacy port settings are stored only; the Web Disks that really run
+  // are the per-account rclone daemons (panel-webdisk.js, contract §71).
   const webdisk = {
     ...simpleSettings('webdisk', 'webdisk.config.update'),
+    get() {
+      const base = simpleSettings('webdisk', 'webdisk.config.update').get();
+      let disks = [];
+      try { disks = ctx.panelWebdisk?.listAll ? ctx.panelWebdisk.listAll() : []; } catch (err) { logger.debug({ err }, 'webdisk: account list unavailable'); }
+      return { ...base, live: disks.some((d) => d.enabled), disks, hostname: serverHostname(), apache: capabilities.has('apache') };
+    },
     update(input, req) {
       if (input.port != null && input.sslPort != null && input.port === input.sslPort) throw unprocessable('The plain and SSL ports must differ', { sslPort: ['Must differ from port'] });
       const next = { ...getConf('webdisk'), ...input };

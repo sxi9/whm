@@ -1039,7 +1039,10 @@ const dirName = z.string().regex(/^(?!\.{1,2}$)[A-Za-z0-9._-]{1,64}$/, 'director
 const ipOrCidr = z.string().max(64).refine((v) => { const [ip, bits, ...rest] = v.split('/'); return !rest.length && arg.ip.safeParse(ip).success && (bits === undefined || (/^\d{1,3}$/.test(bits) && Number(bits) <= (ip.includes(':') ? 128 : 32))); }, 'IP address or CIDR');
 // A reverse-proxied application (Radicale and the like): the alias is handed to a
 // loopback port instead of a directory, with the prefix announced as X-Script-Name.
-const hostAppProxy = z.object({ port: z.number().int().min(PROXY_PORT_MIN).max(65535), scriptName: hostAppAlias.optional() }).strict();
+// `path` keeps a prefix on the way upstream (a daemon serving under its own
+// base URL, as rclone does for Web Disk) and `preserveHost` hands the daemon
+// the public Host header (WebDAV MOVE/COPY compare it with the Destination URL).
+const hostAppProxy = z.object({ port: z.number().int().min(PROXY_PORT_MIN).max(65535), scriptName: hostAppAlias.optional(), path: hostAppAlias.optional(), preserveHost: z.boolean().default(false) }).strict();
 const hostAppSchema = z.object({
   name: hostAppName, alias: hostAppAlias, root: confPath.optional(), proxy: hostAppProxy.optional(), php: z.boolean().default(true),
   access: z.enum(['all', 'local', 'list']).default('all'), allowFrom: z.array(ipOrCidr).max(50).default([]),
@@ -1106,12 +1109,13 @@ const hostAppRequire = (a, indent = '  ') => (a.access === 'local' ? [`${indent}
 // mod_proxy's 60 s failure cache.
 export function renderHostProxyApp(a, alias, meta) {
   const scriptName = a.proxy.scriptName ? (a.proxy.scriptName.length > 1 ? a.proxy.scriptName.replace(/\/+$/, '') : a.proxy.scriptName) : alias;
-  const target = `http://127.0.0.1:${a.proxy.port}/`;
+  const upstream = a.proxy.path && a.proxy.path.length > 1 ? `${a.proxy.path.replace(/\/+$/, '')}/` : '/';
+  const target = `http://127.0.0.1:${a.proxy.port}${upstream}`;
   const base = alias === '/' ? '/' : `${alias}/`;
   const lines = [`${MANAGED} (server hostname site: application "${a.name}", reverse proxy). Rendered from a structured spec; manual changes are overwritten.`, `${HOST_APP_MARK}${JSON.stringify({ ...meta, proxy: { port: a.proxy.port, scriptName, target } })}`, ''];
   if (alias !== '/') lines.push(`RedirectMatch 301 "^${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$" ${q(base)}`);
   lines.push('<IfModule proxy_http_module>', '  ProxyRequests Off', `  ProxyPass ${q(base)} ${q(target)} retry=0`, `  ProxyPassReverse ${q(base)} ${q(target)}`);
-  lines.push(`  <Location ${q(base)}>`, ...hostAppRequire(a, '    '), '    <IfModule headers_module>', `      RequestHeader set X-Script-Name ${q(scriptName)}`, '      RequestHeader set X-Forwarded-Proto "https" env=HTTPS', '    </IfModule>', '  </Location>', '</IfModule>');
+  lines.push(`  <Location ${q(base)}>`, ...hostAppRequire(a, '    '), ...(a.proxy.preserveHost ? ['    ProxyPreserveHost On'] : []), '    <IfModule headers_module>', `      RequestHeader set X-Script-Name ${q(scriptName)}`, '      RequestHeader set X-Forwarded-Proto "https" env=HTTPS', '    </IfModule>', '  </Location>', '</IfModule>');
   return `${lines.join('\n')}\n`;
 }
 

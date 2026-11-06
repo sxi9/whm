@@ -699,6 +699,13 @@ export function createAccountFunctionsService(ctx) {
           } catch (err) { web = { applied: false, reason: err.message, ok: false }; }
           jobCtx.log(web.applied ? 'Virtual hosts rewritten and the web server reloaded' : `Virtual hosts ${web.ok ? 'recorded' : 'NOT rewritten'} (${web.reason || 'not applied'})`, web.ok ? (web.applied ? 'info' : 'warn') : 'error');
         }
+        // The Web Disk unit bakes the home into its paths (contract §71).
+        if (ctx.panelWebdisk?.rewrite) {
+          try {
+            const r = await ctx.panelWebdisk.rewrite(username, null);
+            if (r.rewritten) jobCtx.log(r.started ? `Web Disk unit ${r.unit} rewritten for ${to} and restarted` : `Web Disk unit ${r.unit} rewritten for ${to} but did not start; switch it off and on from the account panel`, r.started ? 'info' : 'warn');
+          } catch (err) { jobCtx.log(`The Web Disk unit could not be rewritten for ${to}: ${err.message}; switch Web Disk off and on from the account panel`, 'warn'); }
+        }
       } catch (err) {
         await rollback(err);
         await unlock();

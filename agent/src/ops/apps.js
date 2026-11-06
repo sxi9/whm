@@ -1,10 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
-import { accountPath, assertManaged, asUser, failureOf, lastLine } from './as-user.js';
+import { accountPath, assertManaged, asUser, failureOf } from './as-user.js';
+import { APPS_DIR, MANAGED_PREFIX, appsDir, requireSystemd, unitStatus, installUnit, removeUnit, controlUnit } from './unit-helpers.js';
+
+export { APPS_DIR, parseShow } from './unit-helpers.js';
 
 // Application Manager (contract §65): an account's Node.js or Python program runs
 // as a systemd service under the account's own uid and is reached by Apache over
@@ -12,9 +14,9 @@ import { accountPath, assertManaged, asUser, failureOf, lastLine } from './as-us
 // from a fixed template — never from text the panel sends — into
 // /etc/whm/apps/<username>/keel-app-<username>.<name>.service and linked into systemd with
 // `systemctl link`; nothing under /etc/systemd/system is written by this module.
-// Dependency installs (npm, pip) run as the account, never as root.
+// Dependency installs (npm, pip) run as the account, never as root. The unit
+// file/link/enable/restart machinery is shared with webdisk.js (unit-helpers.js).
 
-export const APPS_DIR = '/etc/whm/apps';
 export const NODE_DIR = '/opt/keel/node';
 export const UNIT_PREFIX = 'keel-app';
 export const APP_TYPES = ['node', 'python'];
@@ -31,9 +33,8 @@ export const PORT_MAX = 65535;
 export const LOGS_MAX_LINES = 500;
 export const DEPS_TIMEOUT_MS = 20 * 60_000;
 export const RESERVED_ENV = new Set(['PORT', 'HOME', 'USER', 'LOGNAME', 'PATH']);
-const MANAGED = '# Managed by Keel (Application Manager). Edit through the panel; manual changes are overwritten.';
+const MANAGED = `${MANAGED_PREFIX} (Application Manager). Edit through the panel; manual changes are overwritten.`;
 
-const appsDir = () => process.env.WHM_APPS_DIR || APPS_DIR;
 const nodeDir = () => process.env.WHM_NODE_DIR || NODE_DIR;
 
 // "." separates the two parts because neither a username nor an app name may
@@ -59,17 +60,6 @@ const appSchema = z.object({
   if (!re.test(a.runtime)) ctx.addIssue({ code: 'custom', path: ['runtime'], message: a.type === 'node' ? 'A Node.js major such as 22, or "system"' : 'A Python minor such as 3.12, or "system"' });
 });
 const unitRef = z.object({ username: arg.username, name: appName }).strict();
-
-// The unit carries the account's own variables (keys, passwords): only root
-// reads the directory and the file; systemd runs as root and `systemctl link`
-// needs nothing more than the path.
-function writeAtomic(file, content, mode = 0o600) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = `${file}.whm-tmp-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
-  fs.writeFileSync(tmp, content, { mode });
-  fs.chmodSync(tmp, mode);
-  fs.renameSync(tmp, file);
-}
 
 // systemd reads Environment= values inside double quotes with backslash escapes
 // and expands %-specifiers (%h, %u, …) in them, so a literal % is doubled; the
@@ -150,51 +140,6 @@ export function parseUnitMeta(text) {
   try { return JSON.parse(line.slice('# whm-app '.length)); } catch { return null; }
 }
 
-function requireSystemd() {
-  if (!hasBinary('systemctl')) throw new OpError('capability_missing', 'systemd is not available on this host');
-}
-
-async function systemctl(argv, { allowFailure = false, timeoutMs = 120_000 } = {}) {
-  return exec('systemctl', argv, { allowFailure, timeoutMs });
-}
-
-const systemLink = (unit) => path.join('/etc/systemd/system', `${unit}.service`);
-
-function linkedTo(unit) {
-  try {
-    const st = fs.lstatSync(systemLink(unit));
-    return st.isSymbolicLink() ? fs.readlinkSync(systemLink(unit)) : false;
-  } catch { return null; }
-}
-
-export function parseShow(stdout) {
-  const kv = {};
-  for (const line of String(stdout || '').split('\n')) {
-    const i = line.indexOf('=');
-    if (i > 0) kv[line.slice(0, i)] = line.slice(i + 1);
-  }
-  const installed = Boolean(kv.LoadState) && kv.LoadState !== 'not-found';
-  return {
-    installed,
-    active: kv.ActiveState === 'active',
-    state: installed ? kv.ActiveState || 'unknown' : 'absent',
-    subState: kv.SubState || null,
-    enabled: kv.UnitFileState === 'enabled' || kv.UnitFileState === 'linked',
-    unitFileState: kv.UnitFileState || null,
-    pid: Number(kv.MainPID) || null,
-    startedAt: kv.ExecMainStartTimestamp || null,
-    memoryBytes: /^\d+$/.test(kv.MemoryCurrent || '') ? Number(kv.MemoryCurrent) : null,
-    restarts: Number(kv.NRestarts) || 0,
-    result: kv.Result || null,
-  };
-}
-
-async function unitStatus(unit) {
-  const props = ['ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'ExecMainStartTimestamp', 'MemoryCurrent', 'NRestarts', 'LoadState', 'Result'];
-  const { stdout } = await systemctl(['show', `${unit}.service`, '--no-pager', `--property=${props.join(',')}`], { allowFailure: true });
-  return { unit, ...parseShow(stdout) };
-}
-
 // The account's app directory and entry file, resolved through as-user.js
 // (home from /etc/passwd, symlinks confined to the home) and required to exist.
 function appDirOf(username, dir, entry, ctx) {
@@ -223,21 +168,8 @@ defineOp('apps.unit.write', {
     const file = ctx.assertAllowedPath(unitFile(a.username, a.name), 'write');
     const venv = a.type === 'python' && app.venv;
     const content = renderUnit({ ...a, home: app.home, gid: app.info.gid, execBin: interp.bin, venv });
-    const previous = (() => { try { return fs.readFileSync(file, 'utf8'); } catch { return null; } })();
-    if (previous != null && !previous.startsWith(MANAGED)) throw new OpError('refused', `${file} was not written by the panel; refusing to overwrite it`);
-    const link = linkedTo(unit);
-    if (link !== file && link != null) throw new OpError('refused', `${systemLink(unit)} exists and is not the panel's link`);
-    writeAtomic(file, content);
-    if (link !== file) {
-      const r = await systemctl(['link', file], { allowFailure: true });
-      if (r.code !== 0) throw new OpError('command_failed', `systemctl link: ${lastLine(r)}`);
-    }
-    await systemctl(['daemon-reload'], { allowFailure: true });
-    const en = await systemctl(['enable', `${unit}.service`], { allowFailure: true });
-    if (en.code !== 0) throw new OpError('command_failed', `systemctl enable: ${lastLine(en)}`);
-    const start = await systemctl(['restart', `${unit}.service`], { allowFailure: true });
-    const status = await unitStatus(unit);
-    return { unit, path: file, bytes: Buffer.byteLength(content), interpreter: interp.bin, venv, started: start.code === 0, startError: start.code === 0 ? null : lastLine(start), status };
+    const r = await installUnit({ unit, file, content });
+    return { ...r, interpreter: interp.bin, venv };
   },
 });
 
@@ -248,18 +180,8 @@ defineOp('apps.unit.remove', {
   schema: unitRef,
   run: async ({ username, name }, ctx) => {
     requireSystemd();
-    const unit = unitName(username, name);
     const file = ctx.assertAllowedPath(unitFile(username, name), 'write');
-    const existed = fs.existsSync(file);
-    if (existed && !fs.readFileSync(file, 'utf8').startsWith(MANAGED)) throw new OpError('refused', `${file} was not written by the panel; refusing to delete it`);
-    await systemctl(['disable', '--now', `${unit}.service`], { allowFailure: true });
-    // `disable` drops the link that `systemctl link` created; a stale one left by hand is reported, not forced.
-    const link = linkedTo(unit);
-    if (link === file) { try { fs.unlinkSync(systemLink(unit)); } catch { /* raced */ } }
-    if (existed) fs.unlinkSync(file);
-    await systemctl(['daemon-reload'], { allowFailure: true });
-    await systemctl(['reset-failed', `${unit}.service`], { allowFailure: true });
-    return { unit, path: file, removed: existed };
+    return removeUnit({ unit: unitName(username, name), file });
   },
 });
 
@@ -268,15 +190,7 @@ defineOp('apps.unit.control', {
   destructive: true,
   timeoutMs: 120_000,
   schema: unitRef.extend({ action: z.enum(['start', 'stop', 'restart']) }).strict(),
-  run: async ({ username, name, action }) => {
-    requireSystemd();
-    const unit = unitName(username, name);
-    const status = await unitStatus(unit);
-    if (!status.installed) throw new OpError('not_found', `${unit} is not installed`);
-    const r = await systemctl([action, `${unit}.service`], { allowFailure: true });
-    if (r.code !== 0) throw new OpError('command_failed', `systemctl ${action}: ${lastLine(r)}`);
-    return { unit, action, status: await unitStatus(unit) };
-  },
+  run: async ({ username, name, action }) => controlUnit(unitName(username, name), action),
 });
 
 defineOp('apps.unit.status', {

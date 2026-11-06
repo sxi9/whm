@@ -857,12 +857,26 @@ writes the three files; `POST …/logrotate/:name/run`. **Needs:** `logrotate`.
 
 #### 7.3 Web Disk Configuration
 
-WebDAV service settings. **Who:** root.
-*Enable Web Disk*, *Plain port* (2077), *SSL port* (2078), idle timeout, maximum upload, *Who
-may use Web Disk*, **Security** (*Require SSL*, *Allow Digest authentication*, *Answer
-unauthenticated OPTIONS/PROPFIND*). **Server:** settings only (`PUT /api/service-config/webdisk`).
-**Gotchas:** the panel does not ship a WebDAV daemon yet; the values are stored for a service
-that does not run — the page says so.
+The accounts' Web Disks and the legacy WebDAV settings. **Who:** root.
+**Web Disks of the accounts** lists every account that set up Web Disk (*Files › Web Disk* in
+the account panel): login, state (*On*, *Off*, *Not running*, *No password*), loopback port and
+public address. There is no shared WebDAV listener: each enabled account runs its own
+`rclone serve webdav` **as the account** (unit `keel-webdisk-<account>`, file under
+`/etc/whm/apps/<account>/`, `NoNewPrivileges`, `ProtectSystem=strict`, only the home writable,
+bound to `127.0.0.1:<port>` from the application port pool) and the server hostname site
+proxies `https://<hostname>/webdisk/<account>/` to it (`keel-host.d/webdisk-<account>.conf`,
+prefix kept upstream, `ProxyPreserveHost On`, `X-Script-Name`). The password is hashed by the
+panel and written as the account into `~/.keel/webdisk.htpasswd` (0600); the first enable on a
+host installs `rclone` through a job and enables `proxy`, `proxy_http` and `headers`.
+Below it, *Enable Web Disk*, *Plain port* (2077), *SSL port* (2078), idle timeout, maximum
+upload, *Who may use Web Disk* and **Security** are **stored only** (`PUT
+/api/service-config/webdisk`) — nothing listens on those ports. **Server:**
+`GET /api/service-config/webdisk` → `{ settings, disks, live, hostname, apache }`. **Needs:**
+Apache and a fully qualified hostname for any account to switch its disk on. **Gotchas:** a
+disk shown *Not running* has a unit that failed to start — `journalctl -u
+keel-webdisk-<account>` tells why (usually `rclone` missing after a reinstall, or a home the
+account cannot write); the account can switch it off and on again. Terminating an account
+removes its unit and drop-in.
 
 #### 7.4 Panel Web Services Configuration
 
