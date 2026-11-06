@@ -5,6 +5,7 @@ import { useAuth } from '../auth/AuthContext.jsx';
 import { useCollapsedSections } from '../hooks/useCollapsedSections.js';
 import { Card, StatusPill, Loading, formatMb, formatDate } from '../components/Common.jsx';
 import { ErrorBanner } from '../components/Form.jsx';
+import { Collapse } from '../components/Collapse.jsx';
 import { useT } from '../i18n/useT.js';
 import { fill, untranslated } from '../i18n/fill.js';
 import { PANEL_BASE, PANEL_FUNCTION_BY_KEY, panelId, searchPanelFunctions, visibleCategories } from './nav.js';
@@ -93,13 +94,16 @@ export function DomainsList({ account, ssl = {} }) {
   );
 }
 
-function ToolCard({ fn, favorite, onToggle, label, description }) {
+function ToolCard({ fn, icon: Icon, color, favorite, onToggle, label, description }) {
   const { t } = useT();
   return (
     <div className="tool-card">
       <Link to={fn.path} className="tool-link">
-        <strong>{label}</strong>
-        <small>{description}</small>
+        <span className="nav-tile tool-tile" style={{ '--tile': color }} aria-hidden="true"><Icon size={20} strokeWidth={2} /></span>
+        <span className="tool-text">
+          <strong>{label}</strong>
+          <small>{description}</small>
+        </span>
       </Link>
       <button className={`icon-button favorite ${favorite ? 'active' : ''}`} onClick={onToggle} aria-label={favorite ? t('panel.home.unpin', 'Unpin') : t('panel.home.pin', 'Pin to favorites')}>
         <Star size={14} fill={favorite ? 'currentColor' : 'none'} />
@@ -157,6 +161,7 @@ export function PanelHome({ header = null }) {
   const greeting = t(`panel.home.${greetingKey}`, GREETINGS[greetingKey]);
   const favoritesOpen = sections.isOpen(FAVORITES_KEY);
   const slugs = categories.map((c) => c.slug);
+  const iconOf = (fn) => panelIconFor(categories.find((c) => c.slug === fn.categorySlug)?.icon);
 
   return (
     <div className="panel-home">
@@ -183,14 +188,16 @@ export function PanelHome({ header = null }) {
           </Card>
 
           {favoriteFns.length > 0 && !matches && (
-            <Card title={t('panel.shell.favorites', 'Favorites')} subtitle={t('panel.home.pinned', 'Your pinned tools')} className={favoritesOpen ? '' : 'collapsed'} actions={(
+            <Card title={t('panel.shell.favorites', 'Favorites')} subtitle={t('panel.home.pinned', 'Your pinned tools')} className={`collapsible ${favoritesOpen ? '' : 'collapsed'}`} actions={(
               <button type="button" className="icon-button section-toggle" onClick={() => sections.toggle(FAVORITES_KEY)} aria-expanded={favoritesOpen} aria-controls="panel-tools-favorites" aria-label={favoritesOpen ? t('panel.home.collapse_section', 'Collapse section') : t('panel.home.expand_section', 'Expand section')}>
                 <ChevronDown size={16} />
               </button>
             )}>
-              <div id="panel-tools-favorites" className="tool-grid" hidden={!favoritesOpen}>
-                {favoritesOpen && favoriteFns.map((f) => <ToolCard key={f.key} fn={f} favorite onToggle={() => toggle(f.key)} label={label(f)} description={description(f)} />)}
-              </div>
+              <Collapse id="panel-tools-favorites" open={favoritesOpen}>
+                <div className="tool-grid">
+                  {favoriteFns.map((f) => <ToolCard key={f.key} fn={f} icon={iconOf(f)} color={panelColorFor(f.categorySlug)} favorite onToggle={() => toggle(f.key)} label={label(f)} description={description(f)} />)}
+                </div>
+              </Collapse>
             </Card>
           )}
 
@@ -216,14 +223,16 @@ export function PanelHome({ header = null }) {
                   <h3>
                     <button type="button" className="tool-section-head" onClick={() => sections.toggle(cat.slug)} aria-expanded={open} aria-controls={gridId} disabled={Boolean(matches)}>
                       <ChevronDown size={16} aria-hidden="true" />
-                      <span className="nav-tile" style={{ '--tile': panelColorFor(cat.slug) }}><Icon size={14} strokeWidth={2.25} /></span>
+                      <span className="nav-tile" style={{ '--tile': panelColorFor(cat.slug) }}><Icon size={16} strokeWidth={2.25} /></span>
                       <span>{t(`panel-category.${cat.slug}`, cat.label)}</span>
                       <span className="count">{fns.length}</span>
                     </button>
                   </h3>
-                  <div id={gridId} className="tool-grid" hidden={!open}>
-                    {open && fns.map((f) => <ToolCard key={f.key} fn={f} favorite={favorites.includes(f.key)} onToggle={() => toggle(f.key)} label={label(f)} description={description(f)} />)}
-                  </div>
+                  <Collapse id={gridId} open={open}>
+                    <div className="tool-grid">
+                      {fns.map((f) => <ToolCard key={f.key} fn={f} icon={Icon} color={panelColorFor(cat.slug)} favorite={favorites.includes(f.key)} onToggle={() => toggle(f.key)} label={label(f)} description={description(f)} />)}
+                    </div>
+                  </Collapse>
                 </section>
               );
             })}

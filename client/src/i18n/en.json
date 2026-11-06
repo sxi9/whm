@@ -1511,6 +1511,7 @@
   "panel.shell.scope_required_title": "Choose an account to view",
   "panel.shell.search": "Search",
   "panel.shell.search_tools": "Search tools",
+  "panel.shell.show_sidebar": "Show sidebar",
   "panel.shell.sign_out": "Sign out",
   "panel.shell.signed_in_as": "Signed in as {user}",
   "panel.shell.support": "Support",

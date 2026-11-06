@@ -20,6 +20,7 @@ const { PanelHome } = await import('../src/panel/PanelHome.jsx');
 const { PanelSidebar } = await import('../src/panel/PanelSidebar.jsx');
 const { visibleCategories } = await import('../src/panel/nav.js');
 const { writeSections } = await import('../src/hooks/useCollapsedSections.js');
+const { panelColorFor } = await import('../src/panel/icons.js');
 
 React.useLayoutEffect = React.useEffect;
 
@@ -44,14 +45,27 @@ describe('PanelHome sections', () => {
     expect(html).toContain('Expand all');
     expect(html).toContain(`aria-controls="panel-tools-${first.slug}"`);
     expect(html).toContain(`href="${first.functions[0].path}"`);
+    expect(html).toContain(`id="panel-tools-${first.slug}" class="collapse" data-open="true"`);
+  });
+
+  it('every tool card carries the group icon tile in the group colour', () => {
+    const html = render(h(PanelHome));
+    const cards = (html.match(/class="tool-card"/g) || []).length;
+    expect(cards).toBe(groups.reduce((n, g) => n + g.functions.length, 0));
+    expect((html.match(/class="nav-tile tool-tile"/g) || []).length).toBe(cards);
+    const card = html.slice(html.indexOf('class="tool-card"'), html.indexOf('class="tool-card"') + 2500);
+    expect(card).toContain(`class="nav-tile tool-tile" style="--tile:${panelColorFor(first.slug)}" aria-hidden="true"><svg`);
+    expect(card).toContain('width="20" height="20"');
+    expect(card).toContain('<span class="tool-text"><strong>');
   });
 
   it('a collapsed group hides its tiles under aria-expanded="false" and the rest stay open', () => {
     writeSections(KEY, { [first.slug]: false });
     const html = render(h(PanelHome));
     expect((html.match(/aria-expanded="false"/g) || []).length).toBe(1);
-    expect(html).toContain(`id="panel-tools-${first.slug}" class="tool-grid" hidden=""`);
-    expect(html).not.toContain(`href="${first.functions[0].path}"`);
+    expect(html).toContain(`id="panel-tools-${first.slug}" class="collapse" data-open="false" data-settled="false"><div class="collapse-inner" inert="" aria-hidden="true">`);
+    expect(html).toContain(`href="${first.functions[0].path}"`);
+    expect((html.match(/inert=""/g) || []).length).toBe(1);
     expect(html).toContain(`href="${groups[1].functions[0].path}"`);
     expect(html).toContain(`data-group="${first.slug}"`);
   });
@@ -71,6 +85,8 @@ describe('PanelSidebar', () => {
     writeSections('whm.panel.sidebar.open', { [first.slug]: true });
     html = render(h(PanelSidebar, { collapsed: false, onToggle: () => {} }));
     expect(html).toContain('nav-category open');
+    expect(html).toContain(`id="panel-nav-${first.slug}" class="collapse" data-open="true"`);
     expect(html).toContain(`href="${first.functions[0].path}"`);
+    expect(html).toContain(`id="panel-nav-${groups[1].slug}" class="collapse" data-open="false" data-settled="false"><div class="collapse-inner" inert="" aria-hidden="true"></div>`);
   });
 });

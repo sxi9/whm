@@ -6,8 +6,9 @@ import { useSearch } from '../hooks/usePluginNav.js';
 import { useBranding } from '../pages/cpanel/branding.js';
 import { Brand } from './Brand.jsx';
 import { Menu } from './Menu.jsx';
+import { SidebarExpand } from './SidebarExpand.jsx';
 
-export function TopBar({ onMenu }) {
+export function TopBar({ onMenu, sidebarCollapsed = false, onShowSidebar }) {
   const { user, hostname, logout } = useAuth();
   const branding = useBranding();
   const navigate = useNavigate();
@@ -30,6 +31,7 @@ export function TopBar({ onMenu }) {
   return (
     <header className="topbar">
       <button className="icon-button topbar-menu" onClick={onMenu} aria-label="Toggle navigation"><MenuIcon size={20} /></button>
+      {sidebarCollapsed && onShowSidebar && <SidebarExpand onClick={onShowSidebar} className="icon-button topbar-sidebar" size={20} />}
       <Brand withText={false} />
       <div className="topbar-search" role="search">
         <Search size={16} />

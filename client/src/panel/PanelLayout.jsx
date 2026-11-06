@@ -1,4 +1,4 @@
-import { Suspense, useEffect, useState } from 'react';
+import { Suspense, useEffect, useRef, useState } from 'react';
 import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext.jsx';
 import { Loading } from '../components/Common.jsx';
@@ -7,7 +7,8 @@ import { useT } from '../i18n/useT.js';
 import { ShellContext, PANEL_SHELL } from './ShellContext.js';
 import { PanelContext, usePanelMeLoader } from './hooks/usePanel.js';
 import { PanelPluginProvider } from './hooks/usePanelPlugins.js';
-import { PanelSidebar } from './PanelSidebar.jsx';
+import { SidebarExpand } from '../components/SidebarExpand.jsx';
+import { PanelSidebar, PANEL_SIDEBAR_ID } from './PanelSidebar.jsx';
 import { PanelTopBar } from './PanelTopBar.jsx';
 import { PanelBanners } from './PanelBanners.jsx';
 import { PanelDisabledPage } from './PanelDisabled.jsx';
@@ -47,14 +48,23 @@ export function PanelShell({ me, children }) {
   const { t } = useT();
   const [collapsed, setCollapsed] = useState(() => { try { return localStorage.getItem(COLLAPSED_KEY) === '1'; } catch { return false; } });
   const [mobileOpen, setMobileOpen] = useState(false);
+  // The control the user activates unmounts with the toggle, so focus moves to its counterpart.
+  const refocus = useRef(false);
+  const setSidebar = (next) => { refocus.current = true; setCollapsed(next); };
   useEffect(() => { try { localStorage.setItem(COLLAPSED_KEY, collapsed ? '1' : '0'); } catch { /* storage unavailable */ } }, [collapsed]);
+  useEffect(() => {
+    if (!refocus.current) return;
+    refocus.current = false;
+    document.querySelector(collapsed ? '.sidebar-expand' : `#${PANEL_SIDEBAR_ID} .sidebar-collapse`)?.focus();
+  }, [collapsed]);
   useEffect(() => { setMobileOpen(false); }, [location.pathname]);
   return (
     <div className={`app panel-app ${collapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'mobile-open' : ''}`} data-shell="panel">
-      <PanelSidebar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />
+      <PanelSidebar collapsed={collapsed} onToggle={() => setSidebar(!collapsed)} />
+      {collapsed && <SidebarExpand onClick={() => setSidebar(false)} label={t('panel.shell.show_sidebar', 'Show sidebar')} controls={PANEL_SIDEBAR_ID} />}
       {mobileOpen && <div className="sidebar-scrim" onClick={() => setMobileOpen(false)} />}
       <div className="app-main">
-        <PanelTopBar onMenu={() => setMobileOpen((o) => !o)} />
+        <PanelTopBar onMenu={() => setMobileOpen((o) => !o)} sidebarCollapsed={collapsed} onShowSidebar={() => setSidebar(false)} />
         <main className="content" id="main">
           <PanelBanners />
           <Suspense fallback={<Loading />}>

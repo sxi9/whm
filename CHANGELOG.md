@@ -9,6 +9,8 @@ not for the commit log.
 ## [Unreleased]
 
 ### Added
+- **Shell and dashboard: a collapsed sidebar comes back, sections animate, tool cards carry icon tiles.** The expand control now lives outside the aside (a floating button above the footer and a *Show sidebar* button beside the brand in both top bars, `components/SidebarExpand.jsx`) because the aside's backdrop filter trapped the old fixed button inside its zero-width box; the sidebar slides shut and open (0.22 s, content width held by `.sidebar-inner`); home tool groups, the Favorites card and the sidebar categories open and close through `components/Collapse.jsx` (grid-row transition, inert while closed, honours reduced motion); dashboard tool cards in both shells gain the category's coloured icon tile with 15 px titles and 13 px descriptions on a 260 px grid.
+- **Shell: collapsing or expanding the sidebar keeps keyboard focus, and open sections no longer clip card hover and focus rings.** Focus moves to the counterpart control (floating or in-aside) on every toggle in both shells; an animated section stops clipping once its open transition has settled (`data-settled`), so tool-card lifts, shadows and focus outlines show again.
 - **PHP version updater: a packaged PHP with an advisory no package fixes is updated from php.net.** PHP Version Manager
   and Install Software no longer show *Up to date* beside an advisory badge: when the distribution's PHP (8.5.4 on
   Ubuntu 26.04) is affected and php.net's release of that branch is newer, the Updates column reads *Security update ·

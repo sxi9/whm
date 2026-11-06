@@ -10,6 +10,7 @@ import { useFavorites } from '../hooks/useFavorites.js';
 import { useCollapsedSections } from '../hooks/useCollapsedSections.js';
 import { Card, KeyValue, StatusPill, Loading, formatBytes, formatDuration } from '../components/Common.jsx';
 import { ErrorBanner } from '../components/Form.jsx';
+import { Collapse } from '../components/Collapse.jsx';
 import { NewsBanner } from './cpanel/NewsBanner.jsx';
 import { MarketplaceUpdatesNotice } from './cpanel/MarketplaceTab.jsx';
 import { UpdatesBanner } from './home/UpdatesBanner.jsx';
@@ -27,6 +28,7 @@ export function HomePage() {
   const matches = useMemo(() => (q.trim() ? new Set(searchFunctions(q).map((f) => f.key)) : null), [q, searchFunctions]);
   const favoriteFns = favorites.map((k) => FUNCTION_BY_KEY[k]).filter(Boolean);
   const favoritesOpen = sections.isOpen(FAVORITES_KEY);
+  const iconOf = (fn) => iconFor(CATEGORIES.find((c) => c.slug === fn.categorySlug)?.icon);
   const server = status?.server;
   const mem = server?.memory;
   const rootDisk = server?.disks?.find((d) => d.mountpoint === '/') || server?.disks?.[0];
@@ -46,14 +48,16 @@ export function HomePage() {
         <MarketplaceUpdatesNotice />
         <UpdatesBanner />
         {favoriteFns.length > 0 && (
-          <Card title="Favorites" subtitle="Your pinned tools" className={favoritesOpen ? '' : 'collapsed'} actions={(
+          <Card title="Favorites" subtitle="Your pinned tools" className={`collapsible ${favoritesOpen ? '' : 'collapsed'}`} actions={(
             <button type="button" className="icon-button section-toggle" onClick={() => sections.toggle(FAVORITES_KEY)} aria-expanded={favoritesOpen} aria-controls="tools-favorites" aria-label={favoritesOpen ? 'Collapse Favorites' : 'Expand Favorites'}>
               <ChevronDown size={16} />
             </button>
           )}>
-            <div id="tools-favorites" className="tool-grid" hidden={!favoritesOpen}>
-              {favoritesOpen && favoriteFns.map((f) => <ToolCard key={f.key} fn={f} favorite onToggle={() => toggle(f.key)} />)}
-            </div>
+            <Collapse id="tools-favorites" open={favoritesOpen}>
+              <div className="tool-grid">
+                {favoriteFns.map((f) => <ToolCard key={f.key} fn={f} icon={iconOf(f)} color={colorFor(f.categorySlug)} favorite onToggle={() => toggle(f.key)} />)}
+              </div>
+            </Collapse>
           </Card>
         )}
 
@@ -79,14 +83,16 @@ export function HomePage() {
                 <h3>
                   <button type="button" className="tool-section-head" onClick={() => sections.toggle(cat.slug)} aria-expanded={open} aria-controls={gridId} disabled={Boolean(matches)}>
                     <ChevronDown size={16} aria-hidden="true" />
-                    <span className="nav-tile" style={{ '--tile': colorFor(cat.slug) }}><Icon size={14} strokeWidth={2.25} /></span>
+                    <span className="nav-tile" style={{ '--tile': colorFor(cat.slug) }}><Icon size={16} strokeWidth={2.25} /></span>
                     <span>{cat.label}</span>
                     <span className="count">{fns.length}</span>
                   </button>
                 </h3>
-                <div id={gridId} className="tool-grid" hidden={!open}>
-                  {open && fns.map((f) => <ToolCard key={f.key} fn={f} favorite={favorites.includes(f.key)} onToggle={() => toggle(f.key)} />)}
-                </div>
+                <Collapse id={gridId} open={open}>
+                  <div className="tool-grid">
+                    {fns.map((f) => <ToolCard key={f.key} fn={f} icon={Icon} color={colorFor(cat.slug)} favorite={favorites.includes(f.key)} onToggle={() => toggle(f.key)} />)}
+                  </div>
+                </Collapse>
               </section>
             );
           })}
@@ -135,12 +141,15 @@ export function HomePage() {
   );
 }
 
-function ToolCard({ fn, favorite, onToggle }) {
+function ToolCard({ fn, icon: Icon, color, favorite, onToggle }) {
   return (
     <div className="tool-card">
       <Link to={fn.path} className="tool-link">
-        <strong>{fn.label}</strong>
-        <small>{fn.description}</small>
+        <span className="nav-tile tool-tile" style={{ '--tile': color }} aria-hidden="true"><Icon size={20} strokeWidth={2} /></span>
+        <span className="tool-text">
+          <strong>{fn.label}</strong>
+          <small>{fn.description}</small>
+        </span>
       </Link>
       <button className={`icon-button favorite ${favorite ? 'active' : ''}`} onClick={onToggle} aria-label={favorite ? 'Unpin' : 'Pin to favorites'}>
         <Star size={14} fill={favorite ? 'currentColor' : 'none'} />

@@ -3,6 +3,7 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
 import { CATEGORIES } from '../src/nav.js';
+import { colorFor } from '../src/icons.js';
 
 // The node test environment has no localStorage: a map-backed stand-in lets the
 // hook read a persisted state and lets the tests inspect what it would write.
@@ -40,7 +41,7 @@ describe('Home tool sections', () => {
     const html = render(<HomePage />);
     for (const slug of slugs) {
       expect(html).toContain(`aria-controls="tools-${slug}"`);
-      expect(html).toContain(`id="tools-${slug}" class="tool-grid"`);
+      expect(html).toContain(`id="tools-${slug}" class="collapse" data-open="true"`);
     }
     expect(html).not.toContain('aria-expanded="false"');
     expect(html).not.toContain('class="tool-section collapsed"');
@@ -48,6 +49,19 @@ describe('Home tool sections', () => {
     expect(html).toContain('Collapse all');
     expect(html).toContain('Expand all');
     expect(html).toContain(`href="${CATEGORIES[0].functions[0].path}"`);
+    expect(html).not.toContain('inert=""');
+  });
+
+  it('every tool card carries its category icon tile and the same colour as the sidebar', () => {
+    const html = render(<HomePage />);
+    const cards = html.match(/class="tool-card"/g) || [];
+    expect(cards.length).toBe(CATEGORIES.reduce((n, c) => n + c.functions.length, 0));
+    expect((html.match(/class="nav-tile tool-tile"/g) || []).length).toBe(cards.length);
+    const card = html.slice(html.indexOf('class="tool-card"'), html.indexOf('class="tool-card"') + 2500);
+    expect(card).toContain(`class="nav-tile tool-tile" style="--tile:${colorFor(CATEGORIES[0].slug)}" aria-hidden="true"><svg`);
+    expect(card).toContain('width="20" height="20"');
+    expect(card).toContain(`<span class="tool-text"><strong>${CATEGORIES[0].functions[0].label}</strong>`);
+    expect(card).toContain('class="icon-button favorite "');
   });
 
   it('a collapsed slug hides its tiles and reports aria-expanded="false"', () => {
@@ -56,10 +70,12 @@ describe('Home tool sections', () => {
     const section = html.slice(html.indexOf(`aria-controls="tools-${first}"`) - 200, html.indexOf(`id="tools-${first}"`) + 60);
     expect(section).toContain('aria-expanded="false"');
     expect(section).toContain('class="tool-section-head"');
-    expect(html).toContain(`id="tools-${first}" class="tool-grid" hidden=""`);
-    expect(html).not.toContain(`href="${CATEGORIES[0].functions[0].path}"`);
+    // The tiles stay mounted for the close animation, inert and hidden from assistive technology.
+    expect(html).toContain(`id="tools-${first}" class="collapse" data-open="false" data-settled="false"><div class="collapse-inner" inert="" aria-hidden="true">`);
+    expect(html).toContain(`href="${CATEGORIES[0].functions[0].path}"`);
+    expect((html.match(/inert=""/g) || []).length).toBe(1);
     // The other categories stay open.
-    expect(html).toContain(`href="${CATEGORIES[1].functions[0].path}"`);
+    expect(html).toContain(`id="tools-${slugs[1]}" class="collapse" data-open="true" data-settled="true"><div class="collapse-inner">`);
     expect((html.match(/aria-expanded="false"/g) || []).length).toBe(1);
   });
 
@@ -80,7 +96,8 @@ describe('Home tool sections', () => {
     expect(JSON.parse(store.get(KEY))).toEqual(Object.fromEntries(slugs.map((s) => [s, false])));
     const html = render(<HomePage />);
     expect((html.match(/aria-expanded="false"/g) || []).length).toBe(slugs.length);
-    expect(html).not.toContain('class="tool-card"');
+    expect((html.match(/data-open="false"/g) || []).length).toBe(slugs.length);
+    expect(html).not.toContain('data-open="true"');
 
     const expanded = expandedAll(slugs);
     expect(expanded).toEqual({});
@@ -105,7 +122,8 @@ describe('Home tool sections', () => {
     writeSections(KEY, { __favorites: false });
     html = render(<HomePage />);
     expect(html).toContain('aria-label="Expand Favorites"');
-    expect(html).toContain('id="tools-favorites" class="tool-grid" hidden=""');
+    expect(html).toContain('id="tools-favorites" class="collapse" data-open="false"');
+    expect(html).toContain('class="card collapsible collapsed"');
   });
 });
 
@@ -118,7 +136,10 @@ describe('Sidebar categories', () => {
     writeSections('whm.sidebar.open', { [first]: true });
     html = render(<Sidebar collapsed={false} onToggle={() => {}} />);
     expect(html).toContain('nav-category open');
+    expect(html).toContain(`id="nav-${first}" class="collapse" data-open="true"`);
     expect(html).toContain(`href="${CATEGORIES[0].functions[0].path}"`);
+    // A closed list is not rendered on first paint (it mounts only to animate a close).
+    expect(html).toContain(`id="nav-${slugs[1]}" class="collapse" data-open="false" data-settled="false"><div class="collapse-inner" inert="" aria-hidden="true"></div>`);
     expect(html).not.toContain(`href="${CATEGORIES[1].functions[0].path}"`);
   });
 

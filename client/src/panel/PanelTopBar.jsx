@@ -7,11 +7,13 @@ import { Brand } from '../components/Brand.jsx';
 import { useT } from '../i18n/useT.js';
 import { PANEL_BASE, PANEL_PATHS, panelId, searchPanelFunctions } from './nav.js';
 import { usePanelMe } from './hooks/usePanel.js';
+import { SidebarExpand } from '../components/SidebarExpand.jsx';
+import { PANEL_SIDEBAR_ID } from './PanelSidebar.jsx';
 
 // Search over the panel functions (Alt /), the account chip, and the user menu
 // (password, two-factor, help links, sign out). No audit-log link, no bell: a
 // customer has neither.
-export function PanelTopBar({ onMenu }) {
+export function PanelTopBar({ onMenu, sidebarCollapsed = false, onShowSidebar }) {
   const { user, logout } = useAuth();
   const { me } = usePanelMe();
   const branding = useBranding();
@@ -51,6 +53,7 @@ export function PanelTopBar({ onMenu }) {
   return (
     <header className="topbar panel-topbar">
       <button className="icon-button topbar-menu" onClick={onMenu} aria-label={t('panel.shell.toggle_navigation', 'Toggle navigation')}><Menu size={20} /></button>
+      {sidebarCollapsed && onShowSidebar && <SidebarExpand onClick={onShowSidebar} label={t('panel.shell.show_sidebar', 'Show sidebar')} controls={PANEL_SIDEBAR_ID} className="icon-button topbar-sidebar" size={20} />}
       <Brand to={PANEL_BASE} withText={false} />
       <div className="topbar-search" role="search">
         <Search size={16} />

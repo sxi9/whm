@@ -1,8 +1,9 @@
-import { Suspense, useEffect, useState } from 'react';
+import { Suspense, useEffect, useRef, useState } from 'react';
 import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext.jsx';
 import { TopBar } from './TopBar.jsx';
 import { Sidebar } from './Sidebar.jsx';
+import { SidebarExpand, SIDEBAR_ID } from './SidebarExpand.jsx';
 import { Loading } from './Common.jsx';
 import { PluginNavProvider } from '../hooks/usePluginNav.js';
 import { useBranding, useBrandingLoader } from '../pages/cpanel/branding.js';
@@ -16,8 +17,16 @@ export function Layout() {
   useBrandingLoader(user?.id ?? null);
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('whm.sidebar.collapsed') === '1');
   const [mobileOpen, setMobileOpen] = useState(false);
+  // The control the user activates unmounts with the toggle, so focus moves to its counterpart.
+  const refocus = useRef(false);
+  const setSidebar = (next) => { refocus.current = true; setCollapsed(next); };
 
   useEffect(() => { localStorage.setItem('whm.sidebar.collapsed', collapsed ? '1' : '0'); }, [collapsed]);
+  useEffect(() => {
+    if (!refocus.current) return;
+    refocus.current = false;
+    document.querySelector(collapsed ? '.sidebar-expand' : `#${SIDEBAR_ID} .sidebar-collapse`)?.focus();
+  }, [collapsed]);
   useEffect(() => { setMobileOpen(false); }, [location.pathname]);
 
   if (!ready) return <div className="app-loading"><Loading text="Starting…" /></div>;
@@ -31,10 +40,11 @@ export function Layout() {
   return (
     <PluginNavProvider enabled={!user.mustChangePassword && !user.mustEnroll2fa}>
     <div className={`app ${collapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'mobile-open' : ''}`}>
-      <Sidebar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />
+      <Sidebar collapsed={collapsed} onToggle={() => setSidebar(!collapsed)} />
+      {collapsed && <SidebarExpand onClick={() => setSidebar(false)} />}
       {mobileOpen && <div className="sidebar-scrim" onClick={() => setMobileOpen(false)} />}
       <div className="app-main">
-        <TopBar onMenu={() => setMobileOpen((o) => !o)} />
+        <TopBar onMenu={() => setMobileOpen((o) => !o)} sidebarCollapsed={collapsed} onShowSidebar={() => setSidebar(false)} />
         <main className="content" id="main">
           <LicenseBanner license={user.license} />
           <RevocationBanner />

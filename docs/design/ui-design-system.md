@@ -34,7 +34,7 @@ motion. The goal is a product that looks hand-made and specific, not generic.
   30 categories as rows with a coloured icon tile (`.nav-tile`) and a count. Active items are
   filled with `--chrome-active`.
 - Top bar (translucent `--glass`): global search with `Alt /`, hostname chip, audit log, bell, user
-  menu. The brand appears here only on phones.
+  menu. The brand appears here only on phones and on desktop while the sidebar is collapsed (next to the Show sidebar control).
 - Content column: max 1320 px, 24/32 px padding; `.page-header` with breadcrumbs, large title,
   favourite star, description, and actions on the right.
 
