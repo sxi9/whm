@@ -554,40 +554,107 @@ describe('pkg.php.remove', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('on Debian lists the php<ver>-* packages with dpkg-query and removes exactly those', async () => {
+  // apt's dry run names what the transaction would remove; the version's own packages only here.
+  const aptSim = (names) => ok(names.map((n) => `Remv ${n} [1.0]`).join('\n') + '\n');
+  const SIM_ARGV = ['-s', '-q', '-o', 'Debug::NoLocking=true', 'remove', '--', 'php8.2-cli', 'php8.2-fpm', 'php8.2-common'];
+  const REMOVE_ARGV = ['remove', '-y', '-q', '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold', '--', 'php8.2-cli', 'php8.2-fpm', 'php8.2-common'];
+
+  it('on Debian lists the php<ver>-* packages with dpkg-query, simulates, then removes exactly those', async () => {
     phpDiscovery.discover = () => PHP_SET('8.3');
     hasBinary.mockImplementation((name) => name === 'apt-get' || name === 'dpkg-query');
     exec.mockImplementation(async (bin, argv) => {
       if (bin === 'dpkg-query') { expect(argv).toEqual(['-W', '-f', '${binary:Package}\n', 'php8.2-*']); return ok('php8.2-cli\nphp8.2-fpm\nphp8.2-common:amd64\nphp-common\n\n'); }
+      if (bin === 'apt-get' && argv[0] === '-s') return aptSim(['php8.2-cli', 'php8.2-fpm', 'php8.2-common']);
       if (bin === 'apt-get') return ok('Removing php8.2-cli');
       throw new Error(`unexpected ${bin}`);
     });
     const r = await runOp('pkg.php.remove', { version: '8.2' }, ctx);
-    expect(r).toMatchObject({ version: '8.2', manager: 'apt', packages: ['php8.2-cli', 'php8.2-fpm', 'php8.2-common'], purge: false, background: false, code: 0 });
-    const apt = exec.mock.calls.find((c) => c[0] === 'apt-get');
-    expect(apt[1]).toEqual(['remove', '-y', '-q', '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold', '--', 'php8.2-cli', 'php8.2-fpm', 'php8.2-common']);
-    expect(apt[2].env).toMatchObject({ DEBIAN_FRONTEND: 'noninteractive' });
+    expect(r).toMatchObject({ version: '8.2', manager: 'apt', packages: ['php8.2-cli', 'php8.2-fpm', 'php8.2-common'], purge: false, forced: false, extra: [], background: false, code: 0 });
+    const apts = exec.mock.calls.filter((c) => c[0] === 'apt-get');
+    expect(apts.map((c) => c[1])).toEqual([SIM_ARGV, REMOVE_ARGV]);
+    expect(apts[1][2].env).toMatchObject({ DEBIAN_FRONTEND: 'noninteractive' });
     exec.mockClear();
     exec.mockImplementation(async (bin) => (bin === 'dpkg-query' ? ok('php-common\n') : ok()));
     expect((await opError(runOp('pkg.php.remove', { version: '8.2' }, ctx))).code).toBe('not_found');
     expect(exec.mock.calls.map((c) => c[0])).toEqual(['dpkg-query']);
     exec.mockClear();
-    exec.mockImplementation(async (bin) => (bin === 'dpkg-query' ? ok('php8.2-cli\n') : ok()));
+    exec.mockImplementation(async (bin, argv) => (bin === 'dpkg-query' ? ok('php8.2-cli\n') : argv[0] === '-s' ? aptSim(['php8.2-cli']) : ok()));
     expect((await runOp('pkg.php.remove', { version: '8.2', purge: true }, ctx)).packages).toEqual(['php8.2-cli']);
-    expect(exec.mock.calls.find((c) => c[0] === 'apt-get')[1][0]).toBe('purge');
+    expect(exec.mock.calls.filter((c) => c[0] === 'apt-get').map((c) => c[1][0] === '-s' ? c[1][4] : c[1][0])).toEqual(['purge', 'purge']);
   });
 
-  it('on EL lists rpm names under the layout glob and removes them with the package manager', async () => {
+  it('refuses a removal that would take packages outside php<ver>-* with it (roundcube-core, phpmyadmin) unless forced; dry only simulates', async () => {
+    phpDiscovery.discover = () => PHP_SET('8.3');
+    hasBinary.mockImplementation((name) => name === 'apt-get' || name === 'dpkg-query');
+    // The version's own metapackage, its Apache module and Debian's php-defaults
+    // metapackages (php, php-fpm, php-mysql: no payload, depend on php8.2-*) are
+    // the version's own, never collateral.
+    let sim = ['php8.2-cli', 'php8.2-fpm', 'php8.2-common', 'php8.2-mysql', 'php8.2', 'php', 'php-fpm', 'php-mysql', 'libapache2-mod-php8.2', 'roundcube-core', 'phpmyadmin', 'php8.2-opcache'];
+    exec.mockImplementation(async (bin, argv) => {
+      if (bin === 'dpkg-query') return ok('php8.2-cli\nphp8.2-fpm\nphp8.2-common\n');
+      if (bin === 'apt-get' && argv[0] === '-s') return aptSim(sim);
+      if (bin === 'apt-get') return ok('Removing roundcube-core');
+      throw new Error(`unexpected ${bin}`);
+    });
+    // dry: the simulated list and the packages outside the version's own set, nothing removed.
+    const dry = await runOp('pkg.php.remove', { version: '8.2', dry: true }, ctx);
+    expect(dry).toEqual({ version: '8.2', layout: 'debian', manager: 'apt', packages: ['php8.2-cli', 'php8.2-fpm', 'php8.2-common'], purge: false, dry: true, remove: sim, extra: ['roundcube-core', 'phpmyadmin'], output: sim.map((n) => `Remv ${n} [1.0]`) });
+    expect(exec.mock.calls.filter((c) => c[0] === 'apt-get').map((c) => c[1])).toEqual([SIM_ARGV]);
+    // A versionless php-<ext> package whose php8.2-<ext> is not in the transaction is a real extra.
+    sim = [...sim, 'php-imagick'];
+    expect((await runOp('pkg.php.remove', { version: '8.2', dry: true }, ctx)).extra).toEqual(['roundcube-core', 'phpmyadmin', 'php-imagick']);
+    sim = sim.slice(0, -1);
+    // Without force the removal is refused and apt-get remove never runs.
+    exec.mockClear();
+    const err = await opError(runOp('pkg.php.remove', { version: '8.2' }, ctx));
+    expect(err.code).toBe('refused');
+    expect(err.message).toBe('Removing PHP 8.2 would also remove roundcube-core, phpmyadmin; move what depends on it to another version first, or force the removal');
+    expect(err.details).toEqual({ version: '8.2', packages: ['php8.2-cli', 'php8.2-fpm', 'php8.2-common'], extra: ['roundcube-core', 'phpmyadmin'] });
+    expect(exec.mock.calls.filter((c) => c[0] === 'apt-get').map((c) => c[1])).toEqual([SIM_ARGV]);
+    // force is bound to the collateral the caller confirmed: a fresh simulation naming more is refused again.
+    exec.mockClear();
+    const unconfirmed = await opError(runOp('pkg.php.remove', { version: '8.2', force: true }, ctx));
+    expect(unconfirmed.code).toBe('refused');
+    expect(unconfirmed.message).toBe('the removal would now also take roundcube-core, phpmyadmin; confirm again');
+    expect(unconfirmed.details).toEqual({ version: '8.2', packages: ['php8.2-cli', 'php8.2-fpm', 'php8.2-common'], extra: ['roundcube-core', 'phpmyadmin'], confirmed: [], unexpected: ['roundcube-core', 'phpmyadmin'] });
+    const partial = await opError(runOp('pkg.php.remove', { version: '8.2', force: true, extra: ['roundcube-core'] }, ctx));
+    expect(partial.code).toBe('refused');
+    expect(partial.details.unexpected).toEqual(['phpmyadmin']);
+    expect(exec.mock.calls.filter((c) => c[0] === 'apt-get').map((c) => c[1])).toEqual([SIM_ARGV, SIM_ARGV]);
+    // force with the confirmed list: the same argv as before (only the version's own packages are named; apt takes the dependants).
+    exec.mockClear();
+    const forced = await runOp('pkg.php.remove', { version: '8.2', force: true, extra: ['roundcube-core', 'phpmyadmin'] }, ctx);
+    expect(forced).toMatchObject({ version: '8.2', packages: ['php8.2-cli', 'php8.2-fpm', 'php8.2-common'], forced: true, extra: ['roundcube-core', 'phpmyadmin'], confirmed: ['roundcube-core', 'phpmyadmin'], code: 0 });
+    expect(exec.mock.calls.filter((c) => c[0] === 'apt-get').map((c) => c[1])).toEqual([SIM_ARGV, REMOVE_ARGV]);
+    // The confirmed list takes package names only.
+    for (const bad of [{ extra: 'roundcube-core' }, { extra: ['a;b'] }, { extra: ['../x'] }]) expect((await opError(runOp('pkg.php.remove', { version: '8.2', force: true, ...bad }, ctx))).code, JSON.stringify(bad)).toBe('invalid_args');
+    // A simulation apt cannot run (broken dependencies) is an error, not a removal.
+    exec.mockClear();
+    exec.mockImplementation(async (bin, argv) => (bin === 'dpkg-query' ? ok('php8.2-cli\n') : argv[0] === '-s' ? { stdout: '', stderr: 'E: Unable to correct problems', code: 100 } : ok()));
+    expect((await opError(runOp('pkg.php.remove', { version: '8.2', force: true }, ctx))).code).toBe('command_failed');
+    expect(exec.mock.calls.filter((c) => c[0] === 'apt-get')).toHaveLength(1);
+    // The flags are booleans only.
+    for (const bad of [{ force: 'yes' }, { dry: 1 }, { force: null }]) expect((await opError(runOp('pkg.php.remove', { version: '8.2', ...bad }, ctx))).code, JSON.stringify(bad)).toBe('invalid_args');
+  });
+
+  it('on EL lists rpm names under the layout glob, simulates with dnf --assumeno and removes them with the package manager', async () => {
     phpDiscovery.discover = () => ({ versions: [{ id: 'php83', binary: '/opt/remi/php83/root/usr/bin/php', layout: 'remi' }, { id: 'ea-php82', binary: '/opt/cpanel/ea-php82/root/usr/bin/php', layout: 'ea4' }], defaultId: null, defaultBinary: null });
     hasBinary.mockImplementation((name) => name === 'dnf' || name === 'rpm');
+    const table = ['Removing:', ' ea-php82-php-cli    x86_64   8.2.20-1   @ea4', ' ea-php82-runtime    x86_64   8.2.20-1   @ea4', 'Removing dependent packages:', ' roundcubemail       noarch   1.6.9-1    @epel', 'Transaction Summary', 'Operation aborted.'].join('\n');
     exec.mockImplementation(async (bin, argv) => {
       if (bin === 'rpm') { expect(argv).toEqual(['-qa', '--qf', '%{NAME}\n', 'ea-php82-*']); return ok('ea-php82-php-cli\nea-php82-runtime\n'); }
+      if (bin === 'dnf' && argv.includes('--assumeno')) return { stdout: table, stderr: '', code: 1 };
       if (bin === 'dnf') return ok();
       throw new Error(`unexpected ${bin}`);
     });
-    const r = await runOp('pkg.php.remove', { version: 'ea-php82' }, ctx);
-    expect(r).toMatchObject({ manager: 'dnf', packages: ['ea-php82-php-cli', 'ea-php82-runtime'] });
-    expect(exec.mock.calls.find((c) => c[0] === 'dnf')[1]).toEqual(['-y', '-q', 'remove', '--', 'ea-php82-php-cli', 'ea-php82-runtime']);
+    const refused = await opError(runOp('pkg.php.remove', { version: 'ea-php82' }, ctx));
+    expect(refused.code).toBe('refused');
+    expect(refused.details.extra).toEqual(['roundcubemail']);
+    expect(exec.mock.calls.filter((c) => c[0] === 'dnf').map((c) => c[1])).toEqual([['-q', 'remove', '--assumeno', '--', 'ea-php82-php-cli', 'ea-php82-runtime']]);
+    exec.mockClear();
+    const r = await runOp('pkg.php.remove', { version: 'ea-php82', force: true, extra: ['roundcubemail'] }, ctx);
+    expect(r).toMatchObject({ manager: 'dnf', packages: ['ea-php82-php-cli', 'ea-php82-runtime'], forced: true, extra: ['roundcubemail'] });
+    expect(exec.mock.calls.filter((c) => c[0] === 'dnf').map((c) => c[1])).toEqual([['-q', 'remove', '--assumeno', '--', 'ea-php82-php-cli', 'ea-php82-runtime'], ['-y', '-q', 'remove', '--', 'ea-php82-php-cli', 'ea-php82-runtime']]);
     expect(phpPackageGlob({ id: 'php83', layout: 'remi' })).toBe('php83-php-*');
     expect(phpPackageGlob({ id: '8.3', layout: 'debian' })).toBe('php8.3-*');
     expect(phpPackageGlob({ id: 'system', layout: 'unknown' })).toBeNull();
@@ -1095,7 +1162,10 @@ describe('php-build.sh over a live prefix (update of a Keel build)', () => {
     expect(buildScript).toMatch(/^if \[ \$fresh = 1 \]; then rm -f "\$KEEL_PHP_PREFIX\/\.keel-build-ok"; fi$/m);
     expect(buildScript).not.toMatch(/^rm -f "\$KEEL_PHP_PREFIX\/\.keel-build-ok"/m);
     expect(buildScript).toMatch(/^\[ -e "\$KEEL_PHP_PREFIX\/lib\/php\.ini" \] \|\| install -m 0644 php\.ini-production "\$KEEL_PHP_PREFIX\/lib\/php\.ini"$/m);
-    expect(buildScript).toMatch(/^\[ -e "\$KEEL_PHP_PREFIX\/lib\/conf\.d\/10-opcache\.ini" \] \|\| printf 'zend_extension=opcache\\n' > "\$KEEL_PHP_PREFIX\/lib\/conf\.d\/10-opcache\.ini"$/m);
+    // The opcache snippet is seeded only when the build produced opcache.so (php-config --extension-dir), and never reset.
+    expect(buildScript).toMatch(/^extdir="\$\("\$KEEL_PHP_PREFIX\/bin\/php-config" --extension-dir 2>\/dev\/null \|\| true\)"$/m);
+    expect(buildScript).toMatch(/^if \[ -n "\$extdir" \] && \[ -e "\$extdir\/opcache\.so" \]; then\n  \[ -e "\$KEEL_PHP_PREFIX\/lib\/conf\.d\/10-opcache\.ini" \] \|\| printf 'zend_extension=opcache\\n' > "\$KEEL_PHP_PREFIX\/lib\/conf\.d\/10-opcache\.ini"\nelse/m);
+    expect(buildScript.match(/10-opcache\.ini/g)).toHaveLength(3);
     expect(buildScript.match(/php\.ini-production/g)).toHaveLength(1);
     // php-fpm.conf and keel-idle.conf stay panel-owned and are regenerated on every run; the marker is still written last.
     expect(buildScript).toMatch(/^mv "\$fpmconf\.tmp" "\$fpmconf"$/m);
@@ -1126,9 +1196,11 @@ describe('php-build.sh over a live prefix (update of a Keel build)', () => {
       'if [ -e "$KEEL_TEST_FAIL" ]; then echo "make: simulated failure" >&2; exit 2; fi',
       'if [ -e "$KEEL_PHP_PREFIX/.keel-build-ok" ]; then echo present >> "$KEEL_TEST_LOG"; else echo absent >> "$KEEL_TEST_LOG"; fi',
       'if [ "$1" = install ]; then',
-      '  mkdir -p "$KEEL_PHP_PREFIX/bin" "$KEEL_PHP_PREFIX/sbin" "$KEEL_PHP_PREFIX/lib"',
+      '  mkdir -p "$KEEL_PHP_PREFIX/bin" "$KEEL_PHP_PREFIX/sbin" "$KEEL_PHP_PREFIX/lib/php/extensions/no-debug-non-zts"',
       '  printf \'#!/bin/sh\\necho "== built PHP 8.4.28"\\n\' > "$KEEL_PHP_PREFIX/bin/php"; chmod 755 "$KEEL_PHP_PREFIX/bin/php"',
       '  printf \'#!/bin/sh\\nexit 0\\n\' > "$KEEL_PHP_PREFIX/sbin/php-fpm"; chmod 755 "$KEEL_PHP_PREFIX/sbin/php-fpm"',
+      '  printf \'#!/bin/sh\\n[ "$1" = --extension-dir ] && echo "%s/lib/php/extensions/no-debug-non-zts"\\n\' "$KEEL_PHP_PREFIX" > "$KEEL_PHP_PREFIX/bin/php-config"; chmod 755 "$KEEL_PHP_PREFIX/bin/php-config"',
+      '  if [ -z "$KEEL_TEST_NO_OPCACHE" ]; then : > "$KEEL_PHP_PREFIX/lib/php/extensions/no-debug-non-zts/opcache.so"; fi',
       'fi',
       'exit 0',
       '',
@@ -1143,6 +1215,15 @@ describe('php-build.sh over a live prefix (update of a Keel build)', () => {
       expect(fs.readFileSync(path.join(prefix, 'lib', 'php.ini'), 'utf8')).toBe('memory_limit = 128M\n');
       expect(fs.readFileSync(path.join(prefix, 'lib', 'conf.d', '10-opcache.ini'), 'utf8')).toBe('zend_extension=opcache\n');
       expect(fs.readFileSync(log, 'utf8').trim().split('\n')).toEqual(['absent', 'absent']);
+      // A build without the opcache extension gets no 10-opcache.ini (php-fpm would log "Failed loading Zend extension 'opcache'" on every start).
+      const noOpcache = path.join(keelRoot, `.no-opcache-test-${process.pid}`);
+      try {
+        const bare = await run({ ...env, KEEL_PHP_PREFIX: noOpcache, KEEL_TEST_NO_OPCACHE: '1' });
+        expect(bare.code, bare.stderr).toBe(0);
+        expect(fs.existsSync(path.join(noOpcache, 'lib', 'conf.d', '10-opcache.ini'))).toBe(false);
+        expect(bare.stdout).toMatch(/opcache\.so not found/);
+        expect(fs.existsSync(path.join(noOpcache, '.keel-build-ok'))).toBe(true);
+      } finally { fs.rmSync(noOpcache, { recursive: true, force: true }); }
       // The operator edited both files; the rebuild must keep them and the marker must stay for the whole run.
       fs.writeFileSync(path.join(prefix, 'lib', 'php.ini'), 'memory_limit = 512M\n');
       fs.writeFileSync(path.join(prefix, 'lib', 'conf.d', '10-opcache.ini'), 'zend_extension=opcache\nopcache.memory_consumption=256\n');

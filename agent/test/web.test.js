@@ -797,6 +797,7 @@ describe('server hostname site: its own PHP-FPM pool (keel-host)', () => {
   });
 
   it('web.host.pool.write / remove validate the version before anything runs; a version with no tree is capability_missing, never a write', async () => {
+    exec.mockClear();
     for (const args of [{}, { version: '8.3; rm -rf /' }, { version: '../8.3' }, { version: 'php83' }, { version: '8.3', user: 'alice' }, { version: '8.3', reload: 'yes' }]) {
       expect((await opError(runOp('web.host.pool.write', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
       expect((await opError(runOp('web.host.pool.remove', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
@@ -809,6 +810,7 @@ describe('server hostname site: its own PHP-FPM pool (keel-host)', () => {
   });
 
   it('web.host.ensure and web.host.app.write take the handler socket as a parameter, pinned to a socket path under /run', async () => {
+    exec.mockClear();
     const APP = { name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html' };
     for (const phpSocket of ['/etc/passwd', '/run/php/x.sock; id', 'relative.sock', '/run/php/../../etc/x.sock', '/tmp/x.sock', '/run/php/php8.3-fpm-keel-host']) {
       expect((await opError(runOp('web.host.ensure', { hostname: 'nova.example.com', phpSocket }, ctx))).code, phpSocket).toBe('invalid_args');

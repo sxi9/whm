@@ -664,6 +664,78 @@ Nothing is ever added to customer vhosts; the distro's global aliases (`conf-ena
   `error` = the warning on a failing answer); `ctx.databases.phpmyadmin.status()` carries the same two fields.
   `WebmailPublishCard` shows the *Answers* row and the state `Published but answering <status>`.
 
+### 41.2 Amendment: the hostname site runs on its own PHP-FPM pool (`keel-host`)
+The site's PHP handler is no longer the distro www pool (`wwwPoolSocket()`, `/run/php/php8.5-fpm.sock`): that
+socket disappears with the distro PHP, and a Keel source build has no www pool at all. Service-configuration now
+owns one pool for the site, written in the tree of the **effective default** PHP version.
+- **Agent (`agent/src/ops/web.js`):**
+  - `web.host.pool.write { version, reload=true }` → `{ version, flavor, user, path, socket, others[{ version, flavor,
+    path, socket }], bytes, changed, validated, reloaded, unit }`. Renders `renderHostPool(tree)` (through `renderPhpPool`
+    with `name: 'keel-host'`) into `<poolDir>/keel-host.conf` of that version's `phpLayout()` tree (Debian
+    `/etc/php/<ver>/fpm/pool.d`, Remi `/etc/opt/remi/php<nn>/php-fpm.d`, RHEL `/etc/php-fpm.d`, Keel build
+    `/opt/keel/php/<ver>/etc/php-fpm.d`): `[keel-host]`, `user`/`group` = the tree's `listenOwner` (`www-data`, `apache`
+    on RHEL), `listen = <socketDir>/php<ver>-fpm-keel-host.sock` (`/run/php`, `/run/keel-php`, `/run/php-fpm`, Remi's
+    `/var/opt/remi/...`; `php-fpm-keel-host.sock` for the RHEL `system` tree), `pm = ondemand`, `max_children 10`,
+    uploads/sessions/`sys_temp_dir` under `HOST_POOL.stateDir` = `/var/lib/whm/keel-host/tmp` (0700, owned by the pool
+    user; a symlink or a foreign owner there is `refused`), `error_log /var/lib/whm/keel-host/php-error.log`, no
+    `open_basedir` (Roundcube/phpMyAdmin live under `/usr/share`, `/var/lib`, `/etc`). Tested with `php-fpm -t`
+    (`--fpm-config` for a Keel build, like `web.phpfpm.pool.write`), restored on rejection (`config_invalid`), then
+    that version's unit is reloaded. Idempotent (`changed:false`, no test, no reload). `capability_missing` when the
+    version has no tree. `others` lists every other tree that still carries `keel-host.conf` (`hostPools()`), so the
+    caller can drop them.
+  - `web.host.pool.remove { version, reload=true }` (destructive) → `{ version, path, socket, removed, reloaded, unit }`;
+    `removed:false` with `path:null` for a version with no tree.
+  - `web.host.ensure` and `web.host.app.write` take an optional `phpSocket` (an absolute `*.sock` path under `/run`,
+    `/var/run` or `/var/opt`) and render the handler from it. Without it the agent falls back to the newest tree's
+    `keel-host` pool and only then to the distro www pool, so an old caller keeps working. `web.host.status` adds
+    `pools[{ version, flavor, path, socket, units }]` and reports `phpSocket` from the site's own meta line.
+- **Service (`ctx.web`):**
+  - `ctx.web.hostname.ensure()` resolves the version first — Apache Configuration's pinned `defaultPhpVersion`, else
+    `ctx.software.php.systemDefault().effective`, else the stored `php.default_version`, and the newest detected tree
+    when the chosen one has none (the same order `resolvePhpVersion` uses for inherited domains) — writes the pool
+    (`web.host.pool.write`), records
+    `service_config_applies.hostname_php_pool` (`{ version, socket, path, flavor, user }`; a failed pool write is a
+    failed apply and the 422/501 of the op, the site is left untouched), audits `hostname_php_pool.write` when the pool
+    changed or one was removed, and passes `php: true, phpSocket` to `web.host.ensure`. **Order when the socket moves
+    (amendment 2026-11-06):** the previous socket is the one of the last *successful* site apply
+    (`service_config_applies.hostname_vhost.summary.phpSocket`, ignored when that apply recorded `appErrors`), so a
+    failed apply forces the re-render; `web.host.ensure` is then called with `reload: false`, the drop-ins are
+    re-rendered, Apache is reloaded once (`web.reload`), and only afterwards are the pools `others` names removed
+    (`web.host.pool.remove`, each failure only logged) — the running Apache proxies to the old socket until that
+    reload. A rejected `web.host.ensure`, a drop-in re-render error, or a move the caller asked not to reload
+    (`reload:false`) keeps the stale pools (`removed: []`, removed on the next apply). The result adds `removed:
+    string[]`; the pool audit carries `removed`. `pkg.php.remove` (§52 amendment): `php.hostAppsPhpVersion` reads the
+    live `ctx.web.hostname.status().phpSocket` first (`/php<ver>-fpm.sock` and `/php<ver>-fpm-<pool>.sock`, so the
+    keel-host socket of a distro tree or a Keel build resolves), then `ctx.web.hostApps.phpVersion()`, then the
+    distribution default; `software.php.setSystemDefault` calls `resyncPhpDefault` before `queueDefaultResync` and
+    answers `{ version, cli, web, host, job }` (`host` = the seam's answer, `null` without it, `{ applied:false, error }`
+    when it threw; audit args add `hostApplied`, `hostSocket`, `hostError`). The agent op takes `extra?: pkgName[]`
+    (≤200), the collateral confirmed at request time: with `force` a fresh simulation naming a package outside
+    `requested ∪ own ∪ extra` is `refused` ("the removal would now also take …; confirm again", details `{ extra,
+    confirmed, unexpected }`); the job params carry `{ version, force, extra }`. "Own" packages (never collateral):
+    `php<ver>-*`, `php<ver>`, `libapache2-mod-php<ver>` and, on Debian, `php` and any `php-<ext>` whose `php<ver>-<ext>`
+    is in the same transaction (a versionless `php-imagick` stays an honest extra). With no PHP-FPM installed the
+    site is rendered with `php:false` and the result carries warning `php_missing`. Whenever the socket differs from the
+    previously recorded one (first apply after this change, default moved) every panel-managed drop-in is re-rendered
+    from its spec marker with the new socket (`reload:false` each, one `web.reload` at the end when the site itself was
+    not reloaded); the result adds `phpVersion`, `apps[{ name, changed, phpSocket }]`. `hostApps.publish` passes
+    `phpSocket` from the ensured site to `web.host.app.write` (not for `php:false` specs). `status()` adds `phpVersion`,
+    `pools`, `phpPool` (the last pool apply).
+  - `ctx.web.hostApps.phpVersion()` (synchronous) → `{ version, socket, path }` from the last successful pool apply, or
+    `null` before the site was ever applied. **PHP Version Manager removal guard (`software.php.removeBlocker`):**
+    refuse `pkg.php.remove` for that `version` ("the server hostname site runs on it; change the default first"), the
+    way it refuses the Apache web default and pinned domains.
+  - `ctx.web.hostApps.resyncPhpDefault(version, req)` → `{ hostname, applied, version, socket, changed, reloaded, apps,
+    warnings, requested }` (never throws for a bare hostname or a missing Apache: `applied:false` with `reason`). **The
+    seam for `PUT /api/software/php/default`:** `software.php.setSystemDefault()` calls it (tolerating absence:
+    `await ctx.web?.hostApps?.resyncPhpDefault?.(version, req)`) right after `settings.set('php.default_version')`, before
+    or beside `queueDefaultResync`, so changing the default moves the host apps too — including when no domain inherits
+    the default and no job is queued. It is not hooked from service-configuration: `queueDefaultResync` lives in
+    `software.js`.
+- **Operator view:** `GET /api/service-config/hostname` shows `phpVersion`/`phpSocket`/`pools`; the pool file is
+  `keel-host.conf` beside the tenant `whm-<user>.conf` pools; `pkg.php.remove` of a version other than the host one
+  leaves nothing behind because `ensure` already dropped that tree's copy.
+
 ## 42. Customer panel: DNS delegation awareness (`ctx.panelDns.delegation`)
 Public DNS for a hosted domain may be served elsewhere (the live host's zones are at Cloudflare while BIND answers only
 locally), so a record written here is not published. `services/panel-dns.js` owns the check; nothing else resolves NS sets
@@ -1324,6 +1396,36 @@ Reports are the account's own files, rendered and read back as the account; noth
   `runtimes.remove` stays Node.js-only and points PHP to this manager.
 - **Routes (`/api/software`, all `requireRoot`):** `GET /php/catalog`, `GET /php/usage`, `PUT /php/offered { versions:
   phpVersionId[] (≤50) | null }`, `POST /php/remove { version }` → 202 `{ job, version }`.
+- **Amendment 2026-11-06 (removal guards; a live host lost webmail and phpMyAdmin when the distribution's PHP 8.5 was
+  removed, since apt removed the dependants `roundcube-core` and `phpmyadmin` with `php8.5-*`):**
+  - *Agent* `pkg.php.remove { version, purge?, force?: false, dry?: false, wait? }`: for a packaged layout the removal
+    is simulated first through the same helper as `pkg.remove_simulate` (`apt-get -s -q -o Debug::NoLocking=true
+    remove|purge -- <pkgs>` / `dnf|yum -q remove --assumeno -- <pkgs>`); every simulated package that is neither a
+    requested one nor under the version's own prefix is `extra`. `dry: true` → `{ version, layout, manager, packages,
+    purge, dry: true, remove: string[], extra: string[], output }` and removes nothing (a Keel build answers `extra: []`).
+    `extra.length && !force` → `OpError('refused', 'Removing PHP x.y would also remove a, b; …', { version, packages,
+    extra })` (422). With `force: true` the argv is unchanged (only the version's packages are named; the package
+    manager takes the dependants) and the result adds `{ forced: true, extra }`.
+  - *Service* `php.removeBlocker(version)` also refuses the version the hostname site's applications run on:
+    `php.hostAppsOn(version, versions, defaultId)` lists the PHP apps of `ctx.web.hostApps.list()` (`php !== false`,
+    `managed !== false`; labels `webmail`, `phpMyAdmin`) when `php.hostAppsPhpVersion(versions, defaultId)` equals the
+    version — that is `ctx.web.hostApps.phpVersion()` when service-configuration exposes it, else the version whose
+    socket `ctx.web.hostname.status().phpSocket` names (`/run/php/php<ver>-fpm.sock`, or a socket path containing
+    `/<id>/`), else the distribution default (`pkg.php.versions` `defaultId`). `php.remove(version, user, req, { force })`
+    then calls `pkg.php.remove { version, dry: true }` and answers 422 `{ message: 'Removing PHP x.y would also remove
+    a, b — move webmail and phpMyAdmin to another version first, or force the removal', fields: { version: [...],
+    extra: string[] } }` (`php.collateralMessage`) unless `force`; the job gets `{ version, force? }`, passes `force`
+    to the agent, logs a warning, and its result adds `{ extra, forced: true }`. Audit `software.php.remove` args carry
+    `{ force, forced, extra }`. Response: `{ job, version, extra, forced }`.
+  - *Route* `POST /php/remove { version, force?: boolean }` (root only).
+  - *Catalog/install:* `resolveInstall(input, family, { method, installed })` takes the `detectedVersion()` answer for
+    the minor: an existing Keel build (`source`/`layout: 'keel'`) → 422 "already installed as a Keel build" for any
+    method; a distribution tree with `method: 'source'` → 422 "PHP x.y is installed from packages; remove those packages
+    first if you want a Keel build". `runtimes.install` runs `pkg.runtime.detect` once per request for PHP, defaults an
+    installed distro minor to `method: 'package'` even when the repository probe says unsupported, and the catalog row
+    of such a minor stays `state: 'installed', method: 'package'` (never a source offer).
+  - *Build script* `php-build.sh` writes `lib/conf.d/10-opcache.ini` only when `<php-config --extension-dir>/opcache.so`
+    exists after `make install`.
 - **Account panel (`ctx.panelPhp`):** `versions(scope)` filters by the plan's `php_versions` AND the root's offered list; a
   version pinned on one of the account's web domains stays listed with `legacy: true` (never selectable); each entry carries
   `usage` (this account's domains on it) and the answer adds `offered: bool` (a root list exists), `usage: { [id]: n }`,

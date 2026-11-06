@@ -9,6 +9,23 @@ not for the commit log.
 ## [Unreleased]
 
 ### Added
+- **The server hostname site runs on its own PHP-FPM pool.** `https://<hostname>/` (webmail, phpMyAdmin, the signon
+  script) no longer borrows the distribution's `www` pool socket: the panel writes a `keel-host` pool
+  (`keel-host.conf`, user `www-data`/`apache`, `pm = ondemand`, uploads and sessions under `/var/lib/whm/keel-host`)
+  in the pool directory of the effective default PHP version — a distro tree or a Keel source build — and renders the
+  site and every `keel-host.d/*.conf` drop-in against `php<ver>-fpm-keel-host.sock`. Removing the distro PHP or making
+  a source build the default no longer leaves the site pointing at a socket that is gone; changing the default moves
+  the pool, the site and the drop-ins (pools left in other versions are removed) and the PHP Version Manager refuses to
+  remove the version the hostname site runs on. **Set default** in PHP Version Manager (`PUT /api/software/php/default`)
+  moves the hostname site itself (the answer and the audit carry `host`), and the move is ordered so webmail and
+  phpMyAdmin never answer 503 in between: the site and the drop-ins are written against the new socket, Apache is
+  reloaded once, and only then is the previous version's pool removed; a rejected site write or drop-in keeps the old
+  pool. The removal guard reads the live site's socket first (`php<ver>-fpm-keel-host.sock` included), so a failed
+  apply cannot make the version serving webmail removable. A forced removal (`force: true`) is bound to the collateral
+  confirmed at request time: when the package manager's fresh simulation in the job names anything beyond it the job
+  is refused again, and Debian's `php`, `php-fpm`, `php-<ext>`, `php<ver>` and `libapache2-mod-php<ver>` metapackages
+  no longer count as collateral. `GET /api/service-config/hostname` reports `phpVersion`, `phpSocket`,
+  `pools`; agent ops `web.host.pool.write` / `web.host.pool.remove`; contract §41.2.
 - **phpMyAdmin for administrators, per account.** Database Services › phpMyAdmin opens phpMyAdmin signed in as the
   administrator (**Open phpMyAdmin (all databases)**: the hidden `keel_pma_admin@localhost` user, recreated at every
   sign-on with a fresh password and `ALL PRIVILEGES ON *.* WITH GRANT OPTION`, or without the option when the profile's
@@ -259,6 +276,7 @@ not for the commit log.
 - `scripts/install.sh` installs every workspace with one root `npm ci` and prunes dev dependencies last.
 
 ### Fixed
+- **Removing a PHP version no longer takes webmail and phpMyAdmin down.** PHP Version Manager › Remove simulates the package removal first (`apt-get -s remove` / `dnf remove --assumeno`, agent `pkg.php.remove { dry: true }`) and refuses with `422` naming the packages when the package manager would remove anything outside `php<ver>-*` (on the live host `apt-get remove php8.5-*` took `roundcube-core` and `phpmyadmin` with it); the confirm lists them and root may **Remove anyway** (`POST /api/software/php/remove { version, force: true }`, audited as forced). The version the server-hostname site's webmail / phpMyAdmin run on is refused outright, a source build is never offered for a minor the distribution already provides (`422` "installed from packages"), installing over an existing Keel build answers `422` before any job, and `php-build.sh` writes `10-opcache.ini` only when the build produced `opcache.so` (no more "Failed loading Zend extension 'opcache'" on every start). Manual §22.5, contract §52 amendment.
 - Row "more actions" (⋯) menus and the admin shell's user menu closed as soon as the pointer moved
   onto them (the floating menu sat outside the wrapper whose `mouseleave` closed it). Every popover
   menu now shares `useMenu` / `Menu`: opens on click, closes on an outside press, Escape (focus

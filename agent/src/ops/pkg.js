@@ -958,8 +958,8 @@ defineOp('pkg.php.remove', {
   description: 'Remove every package of one installed PHP version (or the prefix, unit and link of a Keel source build); refuses the CLI default, the last remaining version and a removal that would take other packages with it (unless force), keeps /etc/php/<ver> unless purge; dry only simulates',
   destructive: true,
   timeoutMs: LONG,
-  schema: z.object({ version: phpVersionId, purge: z.boolean().default(false), force: z.boolean().default(false), dry: z.boolean().default(false), wait }).strict(),
-  run: async ({ version, purge, force, dry, wait: waitFor }, ctx) => {
+  schema: z.object({ version: phpVersionId, purge: z.boolean().default(false), force: z.boolean().default(false), extra: z.array(pkgName).max(200).default([]), dry: z.boolean().default(false), wait }).strict(),
+  run: async ({ version, purge, force, extra: confirmed, dry, wait: waitFor }, ctx) => {
     const { versions, defaultId } = phpDiscovery.discover();
     const v = versions.find((x) => x.id === version);
     if (!v) throw new OpError('not_found', `PHP version "${version}" is not installed on this server`);
@@ -988,15 +988,27 @@ defineOp('pkg.php.remove', {
     // apt removes the reverse dependencies of the version packages with them
     // (roundcube-core and phpmyadmin went with php8.5-* on a live host): the
     // transaction is simulated first and anything outside the version's own
-    // prefix refuses the removal unless the caller forces it.
+    // packages refuses the removal unless the caller forces it. The version's
+    // own set also covers its metapackage (php8.5), libapache2-mod-php8.5 and
+    // Debian's php-defaults metapackages (php, php-fpm, php-mysql...), which
+    // carry nothing but depend on php<ver>-<ext>: a php-<ext> name is "own"
+    // exactly when the matching php<ver>-<ext> is in the same transaction, so
+    // a real versionless package (php-imagick) stays an honest extra.
     const requested = new Set(packages);
     const sim = await simulateRemoval(pm, packages, purge);
     const remove = sim.removed.map((p) => p.name);
-    const extra = remove.filter((p) => !requested.has(p) && !p.startsWith(prefix));
+    const bare = prefix.slice(0, -1);
+    const own = (p) => p.startsWith(prefix) || p === bare || p === `libapache2-mod-${bare}` || (pm.family === 'debian' && (p === 'php' || (p.startsWith('php-') && remove.includes(p.replace(/^php-/, prefix)))));
+    const extra = remove.filter((p) => !requested.has(p) && !own(p));
     if (dry) return { version, layout: v.layout, manager: pm.manager, packages, purge, dry: true, remove, extra, output: sim.output };
     if (extra.length && !force) throw new OpError('refused', `Removing PHP ${version} would also remove ${extra.join(', ')}; move what depends on it to another version first, or force the removal`, { version, packages, extra });
+    // A forced removal is bound to the collateral the caller confirmed at
+    // request time: a dependant that appeared since (an install that queued
+    // behind it) is refused again instead of removed unseen.
+    const unexpected = extra.filter((p) => !confirmed.includes(p));
+    if (force && unexpected.length) throw new OpError('refused', `the removal would now also take ${unexpected.join(', ')}; confirm again`, { version, packages, extra, confirmed, unexpected });
     const argv = pm.family === 'debian' ? [purge ? 'purge' : 'remove', '-y', '-q', ...APT_DPKG_OPTS, '--', ...packages] : ['-y', '-q', 'remove', '--', ...packages];
-    return { version, manager: pm.manager, packages, purge, forced: Boolean(force && extra.length), extra, ...finished(await runLong({ kind: 'remove', bin: pm.binary, argv, env: APT_ENV, wait: waitFor }, ctx)) };
+    return { version, manager: pm.manager, packages, purge, forced: Boolean(force && extra.length), extra, confirmed, ...finished(await runLong({ kind: 'remove', bin: pm.binary, argv, env: APT_ENV, wait: waitFor }, ctx)) };
   },
 });
 

@@ -939,9 +939,14 @@ export function createSoftwareService(ctx) {
       let cli = { applied: false, note: null };
       try { cli = { applied: true, ...(await op('pkg.php.default.set', { version }, req)) }; } catch (err) { cli = { applied: false, note: err.message }; }
       settings.set('php.default_version', version);
+      // The hostname site (webmail, phpMyAdmin) follows the default at once
+      // through service-configuration's seam (contract §41.2), before the
+      // inherited-domain job is queued so the order of the two cannot matter.
+      let host = null;
+      try { host = await ctx.web?.hostApps?.resyncPhpDefault?.(version, req) ?? null; } catch (err) { logger.warn({ err, version }, 'hostname site PHP resync failed'); host = { applied: false, error: err.message }; }
       const web = php.queueDefaultResync(version, user);
-      req?.audit?.({ action: 'software.php.default', target: version, args: { cliApplied: cli.applied, web: web.state, domains: web.domains, jobId: web.job?.id ?? null } });
-      return { version, cli, web, job: web.job ?? null };
+      req?.audit?.({ action: 'software.php.default', target: version, args: { cliApplied: cli.applied, web: web.state, domains: web.domains, jobId: web.job?.id ?? null, hostApplied: host?.applied ?? null, hostSocket: host?.socket ?? null, hostError: host?.error ?? null } });
+      return { version, cli, web, host, job: web.job ?? null };
     },
     queueDefaultResync(version, user) {
       if (typeof ctx.web?.setPhpVersion !== 'function') return { state: 'not-loaded', domains: 0, job: null, detail: 'Service Configuration is not loaded; the web handler is unchanged.' };
@@ -1120,21 +1125,25 @@ export function createSoftwareService(ctx) {
       if (apps.length) return [`PHP ${version} runs the hostname site's ${apps.join(' and ')} (webmail and phpMyAdmin are served on the PHP-FPM socket of the version the hostname site renders); publish them on another version first`, `${apps.join(' and ')} run on this version`];
       return null;
     },
-    // The PHP version the hostname site's applications run on: the
-    // service-configuration helper when it has one, else the version whose
-    // PHP-FPM socket the site renders, else the distribution default.
+    // The PHP version the hostname site's applications run on: the version
+    // whose PHP-FPM socket the live site renders (the distro www socket or the
+    // keel-host pool's php<ver>-fpm-keel-host.sock), else the
+    // service-configuration helper's last recorded pool apply (a failed apply
+    // overwrites it, so the live socket is asked first), else the distribution
+    // default.
     async hostAppsPhpVersion(versions, defaultId) {
-      if (typeof ctx.web?.hostApps?.phpVersion === 'function') {
-        try { const v = await ctx.web.hostApps.phpVersion(); if (v) return v; } catch (err) { logger.warn({ err }, 'host apps PHP version lookup failed'); }
-      }
       let socket = null;
       if (typeof ctx.web?.hostname?.status === 'function') {
         try { socket = (await ctx.web.hostname.status())?.phpSocket ?? null; } catch (err) { logger.warn({ err }, 'hostname site status failed'); }
       }
       if (socket) {
-        const debian = /\/php(\d+\.\d+)-fpm\.sock$/.exec(socket)?.[1];
+        const debian = /\/php(\d+\.\d+)-fpm(?:-[A-Za-z0-9-]+)?\.sock$/.exec(socket)?.[1];
         const hit = versions.find((v) => v.id === debian) ?? versions.find((v) => v.id && socket.includes(`/${v.id}/`));
         if (hit) return hit.id;
+      }
+      if (typeof ctx.web?.hostApps?.phpVersion === 'function') {
+        // { version, socket } | null (service-configuration), or a bare id.
+        try { const v = await ctx.web.hostApps.phpVersion(); const id = typeof v === 'string' ? v : v?.version ?? null; if (id) return id; } catch (err) { logger.warn({ err }, 'host apps PHP version lookup failed'); }
       }
       return defaultId ?? null;
     },
@@ -1166,17 +1175,19 @@ export function createSoftwareService(ctx) {
       const extra = Array.isArray(sim?.extra) ? sim.extra : [];
       if (extra.length && !force) throw unprocessable(php.collateralMessage(version, extra), { version: [`Removing it also removes ${extra.join(', ')}`], extra });
       const forced = Boolean(force && extra.length);
-      const job = enqueue('software.php.remove', { version, ...(force ? { force: true } : {}) }, user);
+      // The confirmed collateral travels with the job: the agent refuses a forced
+      // removal whose fresh simulation names anything beyond it.
+      const job = enqueue('software.php.remove', { version, ...(force ? { force: true, extra } : {}) }, user);
       req?.audit?.({ action: 'software.php.remove', target: version, args: { jobId: job.id, force: Boolean(force), forced, extra } });
       return { job, version, extra, forced };
     },
     async removeJob(job) {
-      const { version, force = false } = job.params;
+      const { version, force = false, extra: confirmed = [] } = job.params;
       const blocker = await php.removeBlocker(version);
       if (blocker) throw new Error(`Removal of PHP ${version} refused: ${blocker[0]}`);
-      if (force) job.log(`forced: packages outside PHP ${version}'s own prefix that depend on it are removed as well`, 'warn');
+      if (force) job.log(`forced: packages outside PHP ${version}'s own prefix that depend on it are removed as well${confirmed.length ? ` (confirmed: ${confirmed.join(', ')})` : ''}`, 'warn');
       job.progress(5, `removing PHP ${version}`);
-      const result = await runLongOp(job, 'pkg.php.remove', { version, ...(force ? { force: true } : {}) }, `PHP ${version} removal`);
+      const result = await runLongOp(job, 'pkg.php.remove', { version, ...(force ? { force: true, extra: confirmed } : {}) }, `PHP ${version} removal`);
       job.progress(90, 're-detecting capabilities');
       await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after PHP removal failed'); job.log(`capability re-detection failed: ${err.message}`, 'warn'); });
       const offered = php.offeredVersions();

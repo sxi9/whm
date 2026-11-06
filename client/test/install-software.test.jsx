@@ -20,7 +20,8 @@ const { ConfirmProvider } = await import('../src/components/Modal.jsx');
 const { FUNCTION_BY_KEY } = await import('../src/nav.js');
 const { default: InstallSoftware, readDeepLink, TABS } = await import('../src/pages/fn/software/install-distro-packages.jsx');
 const { default: ModuleInstallers, installerPackages } = await import('../src/pages/fn/software/module-installers.jsx');
-const { default: MultiPhpManager, removeBlocker, toggleOffered, updateState, phpUpdateBody, phpUpdateMessage, checkForUpdates } = await import('../src/pages/fn/software/multiphp-manager.jsx');
+const { default: MultiPhpManager, removeBlocker, removalExtras, removeConfirm, toggleOffered, updateState, phpUpdateBody, phpUpdateMessage, checkForUpdates } = await import('../src/pages/fn/software/multiphp-manager.jsx');
+const { ApiError } = await import('../src/api/client.js');
 const { generatorPackages } = await import('../src/pages/fn/server-configuration/statistics-software-configuration.jsx');
 const { quotaPackages } = await import('../src/pages/fn/server-configuration/initial-quota-setup.jsx');
 const { InstallPackages, installPackagesBody, normalizePackages } = await import('../src/components/InstallPackages.jsx');
@@ -410,6 +411,29 @@ describe('pages that used to link to the package search', () => {
     expect(toggleOffered(phpCatalog, '8.2', true)).toEqual(['8.3', '8.2']);
     expect(toggleOffered(phpCatalog, '8.3', false)).toEqual([]);
     expect(toggleOffered({ ...phpCatalog, offered: null }, '8.3', false)).toEqual(['8.2', '7.4']);
+  });
+
+  it('PHP Version Manager shows the simulated extra packages of a refused removal and offers "Remove anyway"', () => {
+    const refused = new ApiError(422, { error: { code: 'validation_failed', message: 'Removing PHP 8.5 would also remove roundcube-core, phpmyadmin — move webmail and phpMyAdmin to another version first, or force the removal', fields: { version: ['Removing it also removes roundcube-core, phpmyadmin'], extra: ['roundcube-core', 'phpmyadmin'] } } });
+    expect(removalExtras(refused)).toEqual(['roundcube-core', 'phpmyadmin']);
+    expect(removalExtras(new ApiError(422, { error: { code: 'validation_failed', message: 'PHP 8.5 is the system default', fields: { version: ['Change the system default first'] } } }))).toBeNull();
+    expect(removalExtras(new ApiError(422, { error: { fields: { extra: [] } } }))).toBeNull();
+    expect(removalExtras(new ApiError(500, { error: { fields: { extra: ['x'] } } }))).toBeNull();
+    expect(removalExtras(new Error('network'))).toBeNull();
+    const v = { id: '8.5', label: 'PHP 8.5', installed: true, source: false };
+    const plain = removeConfirm(v);
+    expect(plain).toMatchObject({ title: 'Remove PHP 8.5?', confirmLabel: 'Remove', danger: true });
+    expect(plain.message).toContain('Removes every php8.5-* package');
+    expect(plain.message).toContain('simulated first');
+    expect(removeConfirm({ id: '8.4', label: 'PHP 8.4 (Keel build)', source: true }).message).toContain('keel-php8.4-fpm');
+    const anyway = removeConfirm(v, ['roundcube-core', 'phpmyadmin']);
+    expect(anyway).toMatchObject({ title: 'Remove PHP 8.5 anyway?', confirmLabel: 'Remove anyway', danger: true });
+    const html = renderToStaticMarkup(anyway.message);
+    expect(html).toContain('<code style="white-space:nowrap">roundcube-core</code>');
+    expect(html).toContain('<code style="white-space:nowrap">phpmyadmin</code>');
+    expect(html).toContain('webmail and phpMyAdmin on the server hostname site would stop answering');
+    expect(html).toContain('audited as forced');
+    expect(renderToStaticMarkup(removeConfirm(v, ['libfoo']).message)).not.toContain('hostname site');
   });
 
   it('picks packages by host family for statistics generators and quota tools', () => {

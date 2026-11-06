@@ -1726,28 +1726,36 @@ export function createServiceConfigService(ctx) {
     return trees[trees.length - 1].version;
   }
   const hostPoolApply = () => { const a = lastApply('hostname_php_pool'); return a?.ok && a.summary?.version ? { version: a.summary.version, socket: a.summary.socket ?? null, path: a.summary.path ?? null } : null; };
-  // Writes the pool for the effective default and drops the ones left in other
-  // versions; { socket: null } with a php_missing warning when no PHP-FPM is installed.
+  // Writes the pool for the effective default and names the ones left in other
+  // versions (`others`) for the caller to drop once nothing points at their
+  // socket any more; { socket: null } with a php_missing warning when no
+  // PHP-FPM is installed.
   async function ensureHostPool(req) {
     const version = await hostPhpVersion();
     if (!version) {
       recordApply('hostname_php_pool', false, { version: null }, 'no PHP-FPM is installed');
-      return { version: null, socket: null, changed: false, removed: [], warnings: [{ code: 'php_missing', message: 'No PHP-FPM version is installed; PHP applications under the hostname site are not executed until one is (Software › PHP Version Manager).' }] };
+      return { version: null, socket: null, path: null, changed: false, reloaded: false, user: null, others: [], warnings: [{ code: 'php_missing', message: 'No PHP-FPM version is installed; PHP applications under the hostname site are not executed until one is (Software › PHP Version Manager).' }] };
     }
     try {
       const r = await op('web.host.pool.write', { version }, req);
-      const removed = [];
-      for (const other of r.others || []) {
-        try { removed.push({ version: other.version, ...(await op('web.host.pool.remove', { version: other.version }, req)) }); } catch (err) { logger.warn({ err, version: other.version }, 'web: stale hostname pool removal failed'); }
-      }
       recordApply('hostname_php_pool', true, { version, socket: r.socket, path: r.path, flavor: r.flavor ?? null, user: r.user ?? null });
-      if (r.changed || removed.length) audit(req, { action: 'hostname_php_pool.write', target: version, args: { path: r.path, socket: r.socket, user: r.user ?? null, reloaded: Boolean(r.reloaded), removed: removed.map((x) => x.version) } });
-      return { version, socket: r.socket, path: r.path, changed: Boolean(r.changed), removed, warnings: [] };
+      return { version, socket: r.socket, path: r.path, changed: Boolean(r.changed), reloaded: Boolean(r.reloaded), user: r.user ?? null, others: r.others || [], warnings: [] };
     } catch (err) {
       recordApply('hostname_php_pool', false, { version }, err.message);
       throw err;
     }
   }
+  // Removes the pools other versions still carry; each failure is only logged.
+  async function removeStaleHostPools(others, req) {
+    const removed = [];
+    for (const other of others) {
+      try { removed.push({ version: other.version, ...(await op('web.host.pool.remove', { version: other.version }, req)) }); } catch (err) { logger.warn({ err, version: other.version }, 'web: stale hostname pool removal failed'); }
+    }
+    return removed;
+  }
+  const auditHostPool = (req, pool, removed) => {
+    if (pool.version && (pool.changed || removed.length)) audit(req, { action: 'hostname_php_pool.write', target: pool.version, args: { path: pool.path, socket: pool.socket, user: pool.user, reloaded: pool.reloaded, removed: removed.map((x) => x.version) } });
+  };
   const hostAppSpecFromMeta = (m) => {
     const spec = { name: m.name, alias: m.alias, root: m.root, php: m.php !== false };
     for (const k of ['access', 'allowFrom', 'options', 'directoryIndex', 'allowOverride', 'denyDirs']) if (m[k] != null) spec[k] = m[k];
@@ -1785,25 +1793,42 @@ export function createServiceConfigService(ctx) {
         return { hostname: host, written: false, changed: false, reloaded: false, reason: 'capability_missing', warnings: [{ code: 'capability_missing', message: 'Apache is not installed on this server.' }] };
       }
       const ports = listenPorts();
-      const previousSocket = hostPoolApply()?.socket ?? null;
+      // What the site and its drop-ins were last rendered against: the last
+      // successful site apply (a failed one, or one whose drop-ins failed,
+      // leaves them on an unknown socket and forces the re-render).
+      const previousSocket = (() => { const a = lastApply('hostname_vhost'); return a?.ok && !a.summary?.appErrors?.length ? a.summary?.phpSocket ?? null : null; })();
       const pool = await ensureHostPool(req);
-      const args = { hostname: host, port: ports.http, sslPort: ports.https, panelPort: panelPort(), ips: hostnameSiteIps(), php: Boolean(pool.socket), reload };
+      // A pool that moved to another version leaves the site and the drop-ins
+      // on the old socket: the site is written without a reload, the drop-ins
+      // follow, Apache is reloaded once, and only then are the pools of the
+      // other versions removed (their socket is still what the running Apache
+      // proxies to until that reload).
+      const moving = Boolean(pool.socket) && previousSocket !== pool.socket;
+      const args = { hostname: host, port: ports.http, sslPort: ports.https, panelPort: panelPort(), ips: hostnameSiteIps(), php: Boolean(pool.socket), reload: reload && !moving };
       if (pool.socket) args.phpSocket = pool.socket;
       if (ports.bind) args.bind = ports.bind;
+      let r;
       try {
-        const r = await op('web.host.ensure', args, req);
-        const warnings = [...pool.warnings, ...(r.warnings || [])];
-        // A pool that moved to another version leaves the drop-ins on the old socket.
-        const apps = pool.socket && previousSocket !== pool.socket ? await rerenderHostApps(pool.socket, req) : [];
-        let reloaded = Boolean(r.reloaded);
-        if (reload && !reloaded && apps.some((a) => a.changed)) reloaded = Boolean((await reloadAfter(true, req)).reloaded);
-        recordApply('hostname_vhost', true, { hostname: host, path: r.path, ssl: r.ssl, changed: r.changed, phpVersion: pool.version, phpSocket: r.phpSocket ?? null, warnings: warnings.map((w) => w.code) });
-        if (r.changed) audit(req, { action: 'hostname_vhost.ensure', target: host, args: { path: r.path, ssl: r.ssl, phpVersion: pool.version, phpSocket: r.phpSocket, reloaded, warnings: warnings.map((w) => w.code) } });
-        return { hostname: host, url: `https://${host}/`, written: true, changed: Boolean(r.changed) || apps.some((a) => a.changed), reloaded, validated: r.validated ?? null, ssl: Boolean(r.ssl), path: r.path, docroot: r.docroot, phpVersion: pool.version, phpSocket: r.phpSocket ?? null, apps, warnings };
+        r = await op('web.host.ensure', args, req);
       } catch (err) {
+        auditHostPool(req, pool, []);
         recordApply('hostname_vhost', false, { hostname: host }, err.message);
         throw err;
       }
+      const warnings = [...pool.warnings, ...(r.warnings || [])];
+      const apps = moving ? await rerenderHostApps(pool.socket, req) : [];
+      let reloaded = Boolean(r.reloaded);
+      if (reload && !reloaded && (r.changed || apps.some((a) => a.changed))) reloaded = Boolean((await reloadAfter(true, req)).reloaded);
+      let removed = [];
+      if (pool.others.length) {
+        if (apps.some((a) => a.error)) logger.warn({ apps: apps.filter((a) => a.error).map((a) => a.name) }, 'web: stale hostname pools kept, a drop-in still names the old socket');
+        else if (moving && !reloaded && (r.changed || apps.some((a) => a.changed))) logger.warn({ versions: pool.others.map((o) => o.version) }, 'web: stale hostname pools kept until Apache is reloaded');
+        else removed = await removeStaleHostPools(pool.others, req);
+      }
+      auditHostPool(req, pool, removed);
+      recordApply('hostname_vhost', true, { hostname: host, path: r.path, ssl: r.ssl, changed: r.changed, phpVersion: pool.version, phpSocket: r.phpSocket ?? null, appErrors: apps.filter((a) => a.error).map((a) => a.name), warnings: warnings.map((w) => w.code) });
+      if (r.changed) audit(req, { action: 'hostname_vhost.ensure', target: host, args: { path: r.path, ssl: r.ssl, phpVersion: pool.version, phpSocket: r.phpSocket, reloaded, warnings: warnings.map((w) => w.code) } });
+      return { hostname: host, url: `https://${host}/`, written: true, changed: Boolean(r.changed) || apps.some((a) => a.changed), reloaded, validated: r.validated ?? null, ssl: Boolean(r.ssl), path: r.path, docroot: r.docroot, phpVersion: pool.version, phpSocket: r.phpSocket ?? null, apps, removed: removed.map((x) => x.version), warnings };
     },
     async status() {
       await capabilities.ensureFresh();

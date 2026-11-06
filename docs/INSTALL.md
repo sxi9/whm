@@ -430,7 +430,9 @@ site, validates and reloads Apache, then runs `a2disconf phpmyadmin`. The accoun
 *phpMyAdmin single sign-on* (optional, Panel › Customization › Account panel › phpMyAdmin): needs the publication
 above, `php-curl` and the Keel signon script in the deployed tree — `install.sh` rsyncs `deploy/` into `/opt/whm`, so
 `/opt/whm/deploy/phpmyadmin/pma-signon.php` exists after every deploy and is served as `https://<hostname>/keel/`
-by the hostname site's PHP-FPM www pool (the tree must stay world-readable). The switch writes
+by the hostname site's own PHP-FPM pool (`keel-host.conf` in the pool directory of the default PHP version — distro
+tree or Keel source build — running as `www-data`/`apache` on `php<ver>-fpm-keel-host.sock`; it follows *Software ›
+PHP Version Manager › Set default* and the tree must stay world-readable). The switch writes
 `/etc/phpmyadmin/conf.d/keel-signon.php` (Debian's `config.inc.php` globs `conf.d/*.php`; on another layout create the
 include yourself); verify with `php -l /etc/phpmyadmin/conf.d/keel-signon.php` and
 `curl -sI https://<hostname>/keel/pma-signon.php` (200). Customers keep the cookie login as phpMyAdmin server 2. The

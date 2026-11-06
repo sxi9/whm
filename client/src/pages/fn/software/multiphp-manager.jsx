@@ -52,6 +52,32 @@ export function removeBlocker(v, installedCount = 2) {
   return null;
 }
 
+// The packages a refused removal would have taken with the version (422 with
+// fields.extra from POST /software/php/remove); null for any other error.
+export function removalExtras(err) {
+  const extra = err?.status === 422 ? err?.fields?.extra : null;
+  return Array.isArray(extra) && extra.length ? extra.filter((p) => typeof p === 'string') : null;
+}
+
+// The Remove confirm: the plain removal, or, with the simulated extra
+// packages, the "Remove anyway" step a root may take after the refusal.
+export function removeConfirm(v, extra = null) {
+  const label = v.label || `PHP ${v.id}`;
+  if (extra?.length) {
+    const apps = [...new Set(extra.map((p) => (/^roundcube/.test(p) ? 'webmail' : /^phpmyadmin/i.test(p) ? 'phpMyAdmin' : null)).filter(Boolean))];
+    return {
+      title: `Remove ${label} anyway?`,
+      message: <>The package manager would also remove <CodeList names={extra} />{apps.length ? <> — {apps.join(' and ')} on the server hostname site would stop answering until published on another version</> : null}. Move what depends on PHP {v.id} to another version first, or remove it anyway (the removal is audited as forced).</>,
+      confirmLabel: 'Remove anyway',
+      danger: true,
+    };
+  }
+  const message = v.source
+    ? `Stops and removes the keel-php${v.id}-fpm service, the php${v.id} link in /usr/local/bin and the whole build under ${PHP_SOURCE_PREFIX}/${v.id}. Nothing runs on it (no domain is pinned to it and it is not the system default).`
+    : `Removes every php${v.id}-* package; /etc/php/${v.id} is kept. Nothing runs on it (no domain is pinned to it and it is not the system default). The removal is simulated first and refused when other packages (webmail, phpMyAdmin) would go with it.`;
+  return { title: `Remove ${label}?`, message, confirmLabel: 'Remove', danger: true };
+}
+
 // The offered list after toggling one version; null (= every installed version)
 // is expanded to the installed ids so the server gets an explicit list.
 export function toggleOffered(catalog, id, on) {
@@ -200,11 +226,17 @@ export default function MultiPhpManager({ fn }) {
     runner.start(() => api.post('/software/runtimes/install', runtimeInstallBody('php', v.id, source ? 'source' : undefined)), `Install ${versionLabel(v)}`);
   };
   const remove = async (v) => {
-    const message = v.source
-      ? `Stops and removes the keel-php${v.id}-fpm service, the php${v.id} link in /usr/local/bin and the whole build under ${PHP_SOURCE_PREFIX}/${v.id}. Nothing runs on it (no domain is pinned to it and it is not the system default).`
-      : `Removes every php${v.id}-* package; /etc/php/${v.id} is kept. Nothing runs on it (no domain is pinned to it and it is not the system default).`;
-    if (!(await confirm({ title: `Remove ${versionLabel(v)}?`, message, confirmLabel: 'Remove', danger: true }))) return;
-    runner.start(() => api.post('/software/php/remove', { version: v.id }), `Remove ${versionLabel(v)}`);
+    if (!(await confirm(removeConfirm(v)))) return;
+    // The server simulates the removal first: when the package manager would
+    // take other packages with the version (roundcube-core, phpmyadmin) the
+    // request answers 422 with them, and only root may force it.
+    let extra = null;
+    const started = await runner.start(async () => {
+      try { return await api.post('/software/php/remove', { version: v.id }); } catch (err) { extra = isRoot ? removalExtras(err) : null; throw err; }
+    }, `Remove ${versionLabel(v)}`);
+    if (started || !extra) return;
+    if (!(await confirm(removeConfirm(v, extra)))) return;
+    runner.start(() => api.post('/software/php/remove', { version: v.id, force: true }), `Remove ${versionLabel(v)} (forced)`);
   };
   // Direct update of an installed version (contract §63): the row's `update`
   // comes from the same list as the Home banner; null means nothing newer.

@@ -651,24 +651,24 @@ describe('Install Software (one-click runtimes and tools)', () => {
     app.agent.set('pkg.run.status', ({ id, offset }) => ({ id, output: failing.slice(offset), offset: failing.length, done: true, status: 'finished', code: 2 }));
     app.agent.calls.length = 0;
     try {
-      const job = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.1', method: 'source' })).body.data.job.id);
+      const job = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.5', method: 'source' })).body.data.job.id);
       expect(job.status).toBe('failed');
-      expect(job.error).toMatch(/PHP 8\.1 build exited with status 2: configure: error: Package requirements \(libzip/);
+      expect(job.error).toMatch(/PHP 8.5 build exited with status 2: configure: error: Package requirements \(libzip/);
       expect(app.agent.callsTo('pkg.php.build.finish')).toHaveLength(0);
       expect(app.agent.callsTo('pkg.runtime.detect')).toHaveLength(1);
       expect(job.logs.some((l) => l.line === failing[1])).toBe(true);
       // An op-level refusal (bad checksum) surfaces the agent's own message.
-      app.agent.fail('pkg.php.build', 'checksum_mismatch', 'sha256 mismatch for php-8.1.31.tar.xz');
+      app.agent.fail('pkg.php.build', 'checksum_mismatch', 'sha256 mismatch for php-8.5.31.tar.xz');
       app.agent.calls.length = 0;
-      const bad = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.1', method: 'source' })).body.data.job.id);
+      const bad = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.5', method: 'source' })).body.data.job.id);
       expect(bad.status).toBe('failed');
-      expect(bad.error).toMatch(/sha256 mismatch for php-8\.1\.31\.tar\.xz/);
+      expect(bad.error).toMatch(/sha256 mismatch for php-8.5.31\.tar\.xz/);
       expect(app.agent.callsTo('pkg.php.build.finish')).toHaveLength(0);
       // A build log longer than the job keeps still ends with its last 40 lines when it fails.
       const long = Array.from({ length: 2100 }, (_, i) => `make line ${i + 1}`);
       app.agent.set('pkg.php.build', ({ minor }) => ({ minor, background: true, run: { id: 'run-long', pid: 4244, logPath: '/var/log/whm/runs/run-long.log' } }));
       app.agent.set('pkg.run.status', ({ id, offset }) => ({ id, output: long.slice(offset), offset: long.length, done: true, status: 'finished', code: 1 }));
-      const tail = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.1', method: 'source' })).body.data.job.id);
+      const tail = await waitForJob(app.ctx, (await post('/api/software/runtimes/install', { runtime: 'php', version: '8.5', method: 'source' })).body.data.job.id);
       expect(tail.status).toBe('failed');
       expect(tail.logs.some((l) => /last 40 lines/.test(l.line))).toBe(true);
       expect(tail.logs.filter((l) => l.line === 'make line 2100')).toHaveLength(1);
@@ -1013,6 +1013,83 @@ describe('MultiPHP Manager', () => {
       expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'software.php.default'").get().n).toBeGreaterThanOrEqual(4);
     } finally { app.ctx.web = prevWeb; }
   });
+
+  it('moves the hostname site (webmail, phpMyAdmin) with the default through ctx.web.hostApps.resyncPhpDefault even when no domain inherits and nothing is pinned', async () => {
+    const prevWeb = app.ctx.web;
+    const resyncs = [];
+    let answer = () => ({ hostname: 'nova.example.test', applied: true, version: '8.2', socket: '/run/php/php8.2-fpm-keel-host.sock', changed: true, reloaded: true, apps: [{ name: 'webmail', changed: true, phpSocket: '/run/php/php8.2-fpm-keel-host.sock' }], warnings: [], requested: '8.2' });
+    app.ctx.web = { setPhpVersion: async () => {}, apache: { settings: () => ({ defaultPhpVersion: null }) }, hostApps: { resyncPhpDefault: async (version, req) => { resyncs.push([version, Boolean(req)]); return answer(version); } } };
+    try {
+      await put('/api/software/php/domains', { domains: ['alice.com', 'bob.com'], version: '8.3' });
+      const res = await put('/api/software/php/default', { version: '8.2' });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.data.web).toMatchObject({ state: 'applied', domains: 0 });
+      expect(res.body.data.job).toBeNull();
+      expect(resyncs).toEqual([['8.2', true]]);
+      expect(res.body.data.host).toMatchObject({ applied: true, version: '8.2', socket: '/run/php/php8.2-fpm-keel-host.sock', reloaded: true });
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted AS args FROM audit_log WHERE action = 'software.php.default' ORDER BY id DESC LIMIT 1").get().args)).toMatchObject({ hostApplied: true, hostSocket: '/run/php/php8.2-fpm-keel-host.sock', hostError: null });
+      // A failing resync never fails the default change: it is reported and audited.
+      answer = () => { throw new Error('php-fpm rejected the pool'); };
+      const failed = await put('/api/software/php/default', { version: '8.3' });
+      expect(failed.status).toBe(200);
+      expect(failed.body.data.host).toEqual({ applied: false, error: 'php-fpm rejected the pool' });
+      expect(resyncs).toEqual([['8.2', true], ['8.3', true]]);
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted AS args FROM audit_log WHERE action = 'software.php.default' ORDER BY id DESC LIMIT 1").get().args)).toMatchObject({ hostApplied: false, hostSocket: null, hostError: 'php-fpm rejected the pool' });
+      // Without the seam (service-configuration not loaded) the answer carries host: null.
+      app.ctx.web = undefined;
+      expect((await put('/api/software/php/default', { version: '8.3' })).body.data.host).toBeNull();
+    } finally {
+      app.ctx.web = prevWeb;
+      await put('/api/software/php/domains', { domains: ['alice.com', 'bob.com'], version: null });
+    }
+  });
+
+  it('PUT /php/default writes the keel-host pool and re-renders the site through the real service-configuration seam, so the removal guard follows the default', async () => {
+    const prevHostname = app.ctx.settings.get('basic.hostname');
+    const HOST_SOCKET = (v) => `/run/php/php${v}-fpm-keel-host.sock`;
+    let siteSocket = null;
+    const pools = new Set();
+    app.agent.set('web.detect', () => ({ apache: { installed: true, flavor: 'debian', root: '/etc/apache2', bin: 'apache2ctl', units: ['apache2'] }, nginx: { installed: false }, php: { installed: true, versions: [{ version: '8.2', flavor: 'debian', poolDir: '/etc/php/8.2/fpm/pool.d', bin: 'php-fpm8.2', units: ['php8.2-fpm'] }, { version: '8.3', flavor: 'debian', poolDir: '/etc/php/8.3/fpm/pool.d', bin: 'php-fpm8.3', units: ['php8.3-fpm'] }] }, ftp: { daemons: [] }, dovecot: { installed: false }, exim: { installed: false }, systemd: true, logrotate: false }));
+    app.agent.set('web.host.pool.write', ({ version }) => { const changed = !pools.has(version); pools.add(version); return { version, flavor: 'debian', user: 'www-data', path: `/etc/php/${version}/fpm/pool.d/keel-host.conf`, socket: HOST_SOCKET(version), others: [...pools].filter((v) => v !== version).map((v) => ({ version: v, flavor: 'debian', path: `/etc/php/${v}/fpm/pool.d/keel-host.conf`, socket: HOST_SOCKET(v) })), bytes: 400, changed, validated: changed ? true : null, reloaded: changed, unit: changed ? `php${version}-fpm` : null }; });
+    app.agent.set('web.host.pool.remove', ({ version }) => ({ version, path: `/etc/php/${version}/fpm/pool.d/keel-host.conf`, socket: HOST_SOCKET(version), removed: pools.delete(version), reloaded: true, unit: `php${version}-fpm` }));
+    app.agent.set('web.host.ensure', ({ hostname, reload = true, phpSocket = null }) => { const changed = siteSocket !== phpSocket; siteSocket = phpSocket; return { hostname, path: '/etc/apache2/sites-available/keel-host.conf', link: '/etc/apache2/sites-enabled/keel-host.conf', docroot: '/var/www/keel-host', appsDir: '/etc/apache2/keel-host.d', phpSocket, ssl: true, certificate: { present: true }, changed, validated: changed ? true : null, reloaded: changed && reload, unit: changed && reload ? 'apache2' : null, warnings: [] }; });
+    app.agent.set('web.host.status', () => ({ installed: true, exists: true, enabled: true, managed: true, hostname: 'nova.example.test', meta: {}, ssl: true, certificate: null, docroot: '/var/www/keel-host', docrootExists: true, phpSocket: siteSocket, appsDir: '/etc/apache2/keel-host.d', apps: [] }));
+    const webmail = { name: 'webmail', path: '/etc/apache2/keel-host.d/webmail.conf', managed: true, alias: '/webmail', root: '/usr/share/roundcube', php: true, meta: { name: 'webmail', alias: '/webmail', root: '/usr/share/roundcube', php: true, phpSocket: siteSocket }, mtime: '2026-11-05T00:00:00.000Z' };
+    app.agent.set('web.host.app.list', () => ({ installed: true, appsDir: '/etc/apache2/keel-host.d', vhostPresent: true, apps: [webmail] }));
+    app.agent.set('web.host.app.write', ({ name, alias, root, phpSocket }) => ({ name, alias, root, phpSocket: phpSocket ?? null, path: `/etc/apache2/keel-host.d/${name}.conf`, changed: true, validated: true, reloaded: false, warnings: [] }));
+    app.agent.set('web.reload', () => ({ validated: true, reloaded: true, unit: 'apache2' }));
+    app.ctx.settings.set('basic.hostname', 'nova.example.test');
+    app.ctx.web.detect?.(true);
+    try {
+      await put('/api/software/php/domains', { domains: ['alice.com', 'bob.com'], version: '8.3' });
+      await app.ctx.web.hostname.ensure(null);
+      expect(siteSocket).toBe(HOST_SOCKET('8.3'));
+      expect(await app.ctx.software.php.hostAppsOn('8.3', [PHP, PHP82], '8.3')).toEqual(['webmail']);
+      app.agent.calls.length = 0;
+      const res = await put('/api/software/php/default', { version: '8.2' });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.data.host).toMatchObject({ hostname: 'nova.example.test', applied: true, version: '8.2', socket: HOST_SOCKET('8.2'), changed: true, reloaded: true, requested: '8.2' });
+      const names = app.agent.calls.map((c) => c.name).filter((n) => n.startsWith('web.host') || n === 'web.reload');
+      expect(names).toEqual(['web.host.pool.write', 'web.host.ensure', 'web.host.app.list', 'web.host.app.write', 'web.reload', 'web.host.pool.remove']);
+      expect(app.agent.callsTo('web.host.pool.write')[0].args).toEqual({ version: '8.2' });
+      expect(app.agent.callsTo('web.host.ensure')[0].args).toMatchObject({ hostname: 'nova.example.test', php: true, phpSocket: HOST_SOCKET('8.2'), reload: false });
+      expect(app.agent.callsTo('web.host.app.write')[0].args).toMatchObject({ name: 'webmail', phpSocket: HOST_SOCKET('8.2'), reload: false });
+      expect([...pools]).toEqual(['8.2']);
+      // The guard follows: 8.3 no longer runs the host apps, 8.2 does.
+      expect(await app.ctx.software.php.hostAppsOn('8.3', [PHP, PHP82], '8.3')).toEqual([]);
+      expect(await app.ctx.software.php.hostAppsOn('8.2', [PHP, PHP82], '8.3')).toEqual(['webmail']);
+      // Back to 8.3: the pool, the site and the drop-in move again and 8.2 is free.
+      const back = await put('/api/software/php/default', { version: '8.3' });
+      expect(back.body.data.host).toMatchObject({ applied: true, version: '8.3', socket: HOST_SOCKET('8.3') });
+      expect([...pools]).toEqual(['8.3']);
+      expect(await app.ctx.software.php.hostAppsOn('8.2', [PHP, PHP82], '8.3')).toEqual([]);
+    } finally {
+      for (const name of ['web.detect', 'web.host.pool.write', 'web.host.pool.remove', 'web.host.ensure', 'web.host.status', 'web.host.app.list', 'web.host.app.write', 'web.reload']) app.agent.reset(name);
+      app.ctx.settings.set('basic.hostname', prevHostname);
+      app.ctx.web.detect?.(true);
+      await put('/api/software/php/domains', { domains: ['alice.com', 'bob.com'], version: null });
+    }
+  });
 });
 
 describe('PHP Version Manager', () => {
@@ -1237,12 +1314,13 @@ describe('PHP Version Manager', () => {
       app.agent.calls.length = 0;
       const forced = await post('/api/software/php/remove', { version: '8.2', force: true });
       expect(forced.status, JSON.stringify(forced.body)).toBe(202);
-      expect(forced.body.data).toMatchObject({ version: '8.2', extra: ['roundcube-core', 'phpmyadmin'], forced: true, job: { type: 'software.php.remove', params: { version: '8.2', force: true } } });
+      // The collateral confirmed at request time travels with the job to the agent, which refuses a forced removal that grew since.
+      expect(forced.body.data).toMatchObject({ version: '8.2', extra: ['roundcube-core', 'phpmyadmin'], forced: true, job: { type: 'software.php.remove', params: { version: '8.2', force: true, extra: ['roundcube-core', 'phpmyadmin'] } } });
       const job = await waitForJob(app.ctx, forced.body.data.job.id);
       expect(job.status, job.error).toBe('done');
       expect(job.result).toEqual({ version: '8.2', packages: ['php8.2-cli', 'php8.2-fpm'], removed: true, extra: ['roundcube-core', 'phpmyadmin'], forced: true });
-      expect(job.logs.some((l) => l.level === 'warn' && /forced: packages outside PHP 8\.2/.test(l.line))).toBe(true);
-      expect(app.agent.callsTo('pkg.php.remove').map((c) => c.args)).toEqual([{ version: '8.2', dry: true }, { version: '8.2', force: true, wait: false }]);
+      expect(job.logs.some((l) => l.level === 'warn' && /forced: packages outside PHP 8\.2.*confirmed: roundcube-core, phpmyadmin/.test(l.line))).toBe(true);
+      expect(app.agent.callsTo('pkg.php.remove').map((c) => c.args)).toEqual([{ version: '8.2', dry: true }, { version: '8.2', force: true, extra: ['roundcube-core', 'phpmyadmin'], wait: false }]);
       expect(removals).toEqual([{ version: '8.2', force: true }]);
       const audit = app.ctx.db.prepare("SELECT args_redacted AS args FROM audit_log WHERE action = 'software.php.remove' AND target = '8.2' ORDER BY id DESC LIMIT 1").get();
       expect(JSON.parse(audit.args)).toMatchObject({ force: true, forced: true, extra: ['roundcube-core', 'phpmyadmin'], jobId: job.id });
@@ -1274,18 +1352,39 @@ describe('PHP Version Manager', () => {
       socket = null;
       expect(await app.ctx.software.php.hostAppsPhpVersion([PHP, PHP82], '8.3')).toBe('8.3');
       expect(await app.ctx.software.php.removeBlocker('8.2')).toBeNull();
+      // The site's own keel-host pool socket (distro tree or Keel build) names the version like the www socket does.
+      socket = '/run/php/php8.2-fpm-keel-host.sock';
+      expect(await app.ctx.software.php.hostAppsPhpVersion([PHP, PHP82], '8.3')).toBe('8.2');
+      expect((await post('/api/software/php/remove', { version: '8.2' })).status).toBe(422);
+      socket = '/run/keel-php/php8.4-fpm-keel-host.sock';
+      expect(await app.ctx.software.php.hostAppsPhpVersion([PHP, PHP82, { id: '8.4', layout: 'keel' }], '8.3')).toBe('8.4');
+      socket = '/run/php-fpm/php-fpm-keel-host.sock';
+      expect(await app.ctx.software.php.hostAppsPhpVersion([PHP, PHP82], '8.3')).toBe('8.3');
       // A static application (php: false) never pins a version; a Remi socket maps through its id.
       socket = '/var/opt/remi/php82/run/php-fpm/www.sock';
       expect(await app.ctx.software.php.hostAppsPhpVersion([{ id: 'php82' }, PHP], '8.3')).toBe('php82');
       apps = [{ name: 'docs', alias: '/docs', root: '/srv/docs', php: false, managed: true, path: '/etc/apache2/keel-host.d/docs.conf' }];
       socket = '/run/php/php8.2-fpm.sock';
       expect(await app.ctx.software.php.hostAppsOn('8.2', [PHP, PHP82], '8.3')).toEqual([]);
-      // service-configuration's own helper wins when it exists.
+      // service-configuration's own helper (the last recorded pool apply) decides when the live site names no socket.
       const prevWeb = app.ctx.web;
-      app.ctx.web = { ...prevWeb, hostApps: { ...prevWeb.hostApps, phpVersion: async () => '8.2' } };
       apps = [{ name: 'webmail', alias: '/webmail', root: '/usr/share/roundcube', php: true, managed: true, path: '/etc/apache2/keel-host.d/webmail.conf' }];
-      socket = '/run/php/php8.3-fpm.sock';
+      socket = null;
+      // Its { version, socket } answer (the keel-host pool last applied) or a bare id; null falls back to the distribution default.
+      for (const answer of [{ version: '8.2', socket: '/run/php/php8.2-fpm-keel-host.sock', path: '/etc/php/8.2/fpm/pool.d/keel-host.conf' }, '8.2']) {
+        app.ctx.web = { ...prevWeb, hostApps: { ...prevWeb.hostApps, phpVersion: () => answer } };
+        try { expect(await app.ctx.software.php.hostAppsOn('8.2', [PHP, PHP82], '8.3')).toEqual(['webmail']); } finally { app.ctx.web = prevWeb; }
+      }
+      app.ctx.web = { ...prevWeb, hostApps: { ...prevWeb.hostApps, phpVersion: () => null } };
+      try { expect(await app.ctx.software.php.hostAppsOn('8.2', [PHP, PHP82], '8.3')).toEqual([]); } finally { app.ctx.web = prevWeb; }
+      // The live socket wins over a stale apply record (a failed pool apply overwrites the record while the site still runs the old version).
+      socket = '/run/php/php8.3-fpm-keel-host.sock';
+      app.ctx.web = { ...prevWeb, hostApps: { ...prevWeb.hostApps, phpVersion: () => ({ version: '8.2', socket: '/run/php/php8.2-fpm-keel-host.sock' }) } };
+      try { expect(await app.ctx.software.php.hostAppsOn('8.2', [PHP, PHP82], '8.3')).toEqual([]); } finally { app.ctx.web = prevWeb; }
+      socket = '/run/php/php8.2-fpm-keel-host.sock';
+      app.ctx.web = { ...prevWeb, hostApps: { ...prevWeb.hostApps, phpVersion: () => null } };
       try { expect(await app.ctx.software.php.hostAppsOn('8.2', [PHP, PHP82], '8.3')).toEqual(['webmail']); } finally { app.ctx.web = prevWeb; }
+      socket = null;
       expect(await app.ctx.software.php.hostAppsOn('8.2', [PHP, PHP82], '8.3')).toEqual([]);
     } finally {
       app.agent.reset('web.host.status');
@@ -1296,16 +1395,16 @@ describe('PHP Version Manager', () => {
   it('never offers a source build over a distribution tree and never installs over an existing Keel build', async () => {
     // detectedVersion() feeds resolveInstall: 8.2 comes from packages here.
     const fromPackages = { installed: true, id: '8.2', version: '8.2.6', source: false, layout: null };
-    const keel = { installed: true, id: '8.1', version: '8.1.33', source: true, layout: 'keel' };
+    const keel = { installed: true, id: '8.5', version: '8.5.33', source: true, layout: 'keel' };
     expect(() => resolveInstall({ runtime: 'php', version: '8.2' }, 'debian', { method: 'source', installed: fromPackages })).toThrow(/PHP 8\.2 is installed from packages; remove those packages first if you want a Keel build/);
     expect(resolveInstall({ runtime: 'php', version: '8.2' }, 'debian', { method: 'package', installed: fromPackages })).toMatchObject({ installer: null, packages: RUNTIMES.php.debian('8.2') });
-    expect(() => resolveInstall({ runtime: 'php', version: '8.1' }, 'debian', { method: 'source', installed: keel })).toThrow(/already installed as a Keel build under \/opt\/keel\/php\/8\.1/);
-    expect(() => resolveInstall({ runtime: 'php', version: '8.1' }, 'debian', { method: 'package', installed: keel })).toThrow(/already installed as a Keel build/);
-    expect(() => resolveInstall({ runtime: 'php', version: '8.1' }, 'debian', { method: 'source', installed: { installed: false, version: null } })).not.toThrow();
+    expect(() => resolveInstall({ runtime: 'php', version: '8.5' }, 'debian', { method: 'source', installed: keel })).toThrow(/already installed as a Keel build under \/opt\/keel\/php\/8.5/);
+    expect(() => resolveInstall({ runtime: 'php', version: '8.5' }, 'debian', { method: 'package', installed: keel })).toThrow(/already installed as a Keel build/);
+    expect(() => resolveInstall({ runtime: 'php', version: '8.5' }, 'debian', { method: 'source', installed: { installed: false, version: null } })).not.toThrow();
     expect(() => resolveInstall({ runtime: 'nodejs', version: '22' }, 'debian', { installed: keel })).not.toThrow();
     repoState.php = 'unsupported';
-    keelBuilds = ['8.1'];
-    app.agent.set('pkg.php.versions', () => ({ ...stockVersions(), versions: [PHP, PHP82, keelVersion('8.1')] }));
+    keelBuilds = ['8.5'];
+    app.agent.set('pkg.php.versions', () => ({ ...stockVersions(), versions: [PHP, PHP82, keelVersion('8.5')] }));
     app.agent.calls.length = 0;
     try {
       // 8.2 is installed from packages and the PPA has no series: a source build may not replace the distro tree.
@@ -1313,17 +1412,17 @@ describe('PHP Version Manager', () => {
       expect(explicit.status, JSON.stringify(explicit.body)).toBe(422);
       expect(explicit.body.error.message).toBe('PHP 8.2 is installed from packages; remove those packages first if you want a Keel build');
       expect(explicit.body.error.fields.method).toEqual(['package']);
-      const twice = await post('/api/software/runtimes/install', { runtime: 'php', version: '8.1', method: 'source' });
+      const twice = await post('/api/software/runtimes/install', { runtime: 'php', version: '8.5', method: 'source' });
       expect(twice.status).toBe(422);
-      expect(twice.body.error.message).toMatch(/PHP 8\.1 is already installed as a Keel build under \/opt\/keel\/php\/8\.1/);
-      expect((await post('/api/software/runtimes/install', { runtime: 'php', version: '8.1' })).status).toBe(422);
+      expect(twice.body.error.message).toMatch(/PHP 8.5 is already installed as a Keel build under \/opt\/keel\/php\/8.5/);
+      expect((await post('/api/software/runtimes/install', { runtime: 'php', version: '8.5' })).status).toBe(422);
       expect(app.agent.callsTo('pkg.php.build')).toHaveLength(0);
       expect(app.agent.callsTo('pkg.install')).toHaveLength(0);
       expect(app.ctx.jobs.list({ limit: 5 }).some((j) => j.type === 'software.runtime.install' && j.status === 'queued')).toBe(false);
       // The catalog shows both as installed with their method; neither row is offered as a source build.
       const rows = (await get('/api/software/php/catalog')).body.data.versions;
       expect(rows.find((v) => v.id === '8.2')).toMatchObject({ state: 'installed', method: 'package', source: false });
-      expect(rows.find((v) => v.id === '8.1')).toMatchObject({ state: 'installed', method: 'source', source: true });
+      expect(rows.find((v) => v.id === '8.5')).toMatchObject({ state: 'installed', method: 'source', source: true });
     } finally {
       repoState.php = 'present';
       keelBuilds = [];

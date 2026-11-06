@@ -998,11 +998,12 @@ describe('server hostname site (contract §41)', () => {
     expect(res.body.data).toMatchObject({ hostname: 'panel.example.com', url: 'https://panel.example.com/', written: true, changed: true, reloaded: true, ssl: true, path: '/etc/apache2/sites-available/keel-host.conf', warnings: [] });
     const call = app.agent.callsTo('web.host.ensure').pop().args;
     // The site's handler is its own keel-host pool in the effective default's tree (8.3: the newest tree while nothing is configured), never the distro www pool.
-    expect(call).toMatchObject({ hostname: 'panel.example.com', port: 80, sslPort: 443, reload: true, ips: ['203.0.113.5'], php: true, phpSocket: '/run/php/php8.3-fpm-keel-host.sock' });
+    // The first apply moves the site onto the pool socket: the site is written without a reload, the drop-ins follow, then one reload.
+    expect(call).toMatchObject({ hostname: 'panel.example.com', port: 80, sslPort: 443, reload: false, ips: ['203.0.113.5'], php: true, phpSocket: '/run/php/php8.3-fpm-keel-host.sock' });
     expect(call.panelPort).toEqual(expect.any(Number));
     expect(call.bind).toBeUndefined();
     // The first pool write re-renders the drop-ins (they may still name the distro socket); the stock list carries no spec, so nothing is written.
-    expect(app.agent.calls.map((c) => c.name).filter((n) => n.startsWith('web.host'))).toEqual(['web.host.pool.write', 'web.host.ensure', 'web.host.app.list']);
+    expect(app.agent.calls.map((c) => c.name).filter((n) => n.startsWith('web.host') || n === 'web.reload')).toEqual(['web.host.pool.write', 'web.host.ensure', 'web.host.app.list', 'web.reload']);
     expect(app.agent.callsTo('web.host.pool.write')[0].args).toEqual({ version: '8.3' });
     expect(res.body.data).toMatchObject({ phpVersion: '8.3', phpSocket: '/run/php/php8.3-fpm-keel-host.sock' });
     expect(app.ctx.web.hostApps.phpVersion()).toEqual({ version: '8.3', socket: '/run/php/php8.3-fpm-keel-host.sock', path: '/etc/php/8.3/fpm/pool.d/keel-host.conf' });
@@ -1078,6 +1079,8 @@ describe('server hostname site (contract §41)', () => {
   });
 
   it('hostApps.publish ensures the site first, writes the drop-in from the structured spec and returns the URL; unpublish and list', async () => {
+    // The failed apply above left the site's socket unknown; a clean apply first so publish has nothing to re-render.
+    await post('/api/service-config/hostname/apply', {}).expect(200);
     app.agent.calls.length = 0;
     const audited = [];
     const req = { audit: (e) => audited.push(e) };
@@ -1130,9 +1133,13 @@ describe('server hostname site: its own PHP-FPM pool (contract §41 amendment)',
       app.agent.calls.length = 0;
       const moved = await app.ctx.web.hostApps.resyncPhpDefault('8.1', req);
       expect(moved).toMatchObject({ hostname: 'panel.example.com', applied: true, version: '8.1', socket: '/run/php/php8.1-fpm-keel-host.sock', changed: true, reloaded: true, requested: '8.1' });
-      expect(hostOps()).toEqual(['web.host.pool.write', 'web.host.pool.remove', 'web.host.ensure', 'web.host.app.list', 'web.host.app.write', 'web.host.app.write']);
+      // The old pool's socket is what the running Apache proxies to until the reload: the site and the
+      // drop-ins are written first, Apache is reloaded once, and only then is the stale pool removed.
+      expect(hostOps()).toEqual(['web.host.pool.write', 'web.host.ensure', 'web.host.app.list', 'web.host.app.write', 'web.host.app.write', 'web.reload', 'web.host.pool.remove']);
+      expect(app.agent.callsTo('web.reload')).toHaveLength(1);
       expect(app.agent.callsTo('web.host.pool.remove').pop().args).toEqual({ version: '8.3' });
-      expect(app.agent.callsTo('web.host.ensure').pop().args).toMatchObject({ php: true, phpSocket: '/run/php/php8.1-fpm-keel-host.sock', reload: true });
+      expect(app.agent.callsTo('web.host.ensure').pop().args).toMatchObject({ php: true, phpSocket: '/run/php/php8.1-fpm-keel-host.sock', reload: false });
+      expect(moved.apps.every((a) => !a.error)).toBe(true);
       const writes = app.agent.callsTo('web.host.app.write').map((c) => c.args);
       expect(writes[0]).toEqual({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, access: 'all', allowFrom: [], options: ['-Indexes', '+FollowSymLinks'], allowOverride: 'All', denyDirs: ['config', 'temp'], phpSocket: '/run/php/php8.1-fpm-keel-host.sock', reload: false });
       expect(writes[1]).toEqual({ name: 'static', alias: '/static', root: '/usr/share/phpmyadmin', php: false, access: 'local', allowFrom: [], options: ['None'], directoryIndex: ['index.html'], allowOverride: 'None', denyDirs: [], reload: false });
@@ -1180,6 +1187,38 @@ describe('server hostname site: its own PHP-FPM pool (contract §41 amendment)',
       const res = await post('/api/service-config/hostname/apply', {}).expect(200);
       expect(res.body.data).toMatchObject({ written: true, phpVersion: '8.3' });
     } finally { app.agent.set('web.host.pool.remove', HOST_POOL_REMOVE); hostPools.clear(); }
+  });
+
+  it('a site write or a drop-in re-render that fails after the pool moved keeps the old pool: Apache still proxies to its socket', async () => {
+    hostPools.clear();
+    app.ctx.settings.set('php.default_version', null);
+    await post('/api/service-config/hostname/apply', {}).expect(200);
+    expect([...hostPools]).toEqual(['8.3']);
+    const hadSoftware = app.ctx.software;
+    app.ctx.software = { php: { systemDefault: async () => ({ configured: '8.1', detected: '8.3', effective: '8.1' }) } };
+    app.agent.fail('web.host.ensure', 'config_invalid', 'apache2ctl configtest failed');
+    try {
+      app.agent.calls.length = 0;
+      const res = await post('/api/service-config/hostname/apply', {});
+      expect(res.status).toBe(422);
+      expect(hostOps()).toEqual(['web.host.pool.write', 'web.host.ensure']);
+      expect(app.agent.callsTo('web.host.pool.remove')).toHaveLength(0);
+      expect([...hostPools].sort()).toEqual(['8.1', '8.3']);
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'hostname_php_pool.write' AND target = '8.1'").get().n).toBeGreaterThan(0);
+    } finally { app.agent.set('web.host.ensure', HOST_ENSURE); }
+    // The site is written but one drop-in cannot be re-rendered: the stale pool stays too, and the result names the error.
+    app.agent.set('web.host.app.list', () => ({ installed: true, appsDir: '/etc/apache2/keel-host.d', vhostPresent: true, apps: [
+      { name: 'webmail', path: '/etc/apache2/keel-host.d/webmail.conf', managed: true, alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, meta: { name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, phpSocket: '/run/php/php8.3-fpm-keel-host.sock' }, mtime: '2026-11-05T00:00:00.000Z' },
+    ] }));
+    app.agent.fail('web.host.app.write', 'config_invalid', 'drop-in rejected');
+    try {
+      app.agent.calls.length = 0;
+      const res = await post('/api/service-config/hostname/apply', {}).expect(200);
+      expect(res.body.data.apps).toEqual([{ name: 'webmail', changed: false, error: 'drop-in rejected' }]);
+      expect(res.body.data.removed).toEqual([]);
+      expect(hostOps()).toEqual(['web.host.pool.write', 'web.host.ensure', 'web.host.app.list', 'web.host.app.write', 'web.reload']);
+      expect([...hostPools].sort()).toEqual(['8.1', '8.3']);
+    } finally { app.agent.set('web.host.app.write', HOST_APP_WRITE); app.agent.reset('web.host.app.list'); app.ctx.software = hadSoftware; hostPools.clear(); }
   });
 
   it('with no PHP-FPM installed the site is rendered without a handler and warns php_missing; hostApps.phpVersion() is null before any apply', async () => {

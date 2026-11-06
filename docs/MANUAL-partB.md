@@ -734,8 +734,16 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   `POST /software/runtimes/install { runtime: 'php', version, method? }` starts either flow;
   `PUT /php/offered { versions | null }`
   stores `php.offered_versions` (`null` = every installed version; a version is always kept selectable for a
-  domain already on it); `POST /php/remove { version }` → `202` job `software.php.remove` → agent
-  `pkg.php.remove` (refused for the system default, the only installed version or a version domains use;
+  domain already on it); `POST /php/remove { version, force? }` → `202` job `software.php.remove` → agent
+  `pkg.php.remove` (refused for the system default, the only installed version, a version domains use or the
+  version the server-hostname site's webmail / phpMyAdmin run on — their PHP-FPM socket is the one the hostname
+  site renders, the distribution default otherwise; **the package removal is simulated first** (`apt-get -s remove` /
+  `dnf remove --assumeno`, agent `pkg.php.remove { dry: true }`) and refused with `422` naming the packages when the
+  package manager would take anything outside `php<ver>-*` with it — on Debian/Ubuntu removing the distribution's
+  PHP takes `roundcube-core` and `phpmyadmin` with it, and webmail and phpMyAdmin go down; the confirm then shows
+  those packages and root may **Remove anyway** (`force: true`, audited as forced). A source build is never offered
+  for a minor the distribution already provides (`Install … method: 'source'` answers `422` "installed from packages;
+  remove those packages first"), and Install for a minor whose Keel build exists answers `422` before any job;
   `/etc/php/<ver>` is kept for a package version; a Keel build loses its unit, link and prefix); `PUT /php/domains` calls `ctx.web.setPhpVersion` per domain (a job when
   more than one domain); `PUT /php/default` updates the default and FPM. Audit `software.php.offered`,
   `software.php.remove`. Contract §52. `POST /php/update { version }` → `202` job `software.php.update`
