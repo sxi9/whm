@@ -9,6 +9,41 @@ not for the commit log.
 ## [Unreleased]
 
 ### Added
+- **Account panel › Software › Application manager (P3-2).** A Node.js or Python program of the account runs as the
+  systemd service `keel-app-<account>.<name>` (fixed hardened template under `/etc/whm/apps`, the account's own uid,
+  `NoNewPrivileges`, `ProtectSystem=strict` with the home writable, private `/tmp`, journal logs) on a port from
+  `panel.app_port_range` (default 31000–31999) and is published on a path of one of the account's domains through
+  the vhost's new reverse-proxy mounts (`ProxyPass` to loopback, WebSocket upgrade optional); the panel enables
+  Apache's `proxy`, `proxy_http`, `proxy_wstunnel` and `rewrite` itself on first publish. Create / edit (runtime picker from the
+  host's Keel Node.js builds, system node and Python minors), start / stop / restart, logs, *Install dependencies*
+  as a job (`npm install --omit=dev`, or `.venv` + `pip install -r requirements.txt`, run as the account), remove
+  (files kept). `GET|POST /api/panel/apps`, `GET /api/panel/apps/runtimes`, `GET|PUT|DELETE /api/panel/apps/:id`,
+  `POST …/:id/start|stop|restart|deps`, `GET …/:id/logs`; agent `apps.unit.*`, `apps.deps.install`, `apps.port.free`,
+  `web.modules.status|enable`, `web.vhost.write { proxies }`; `ctx.web.setProxies`; feature `applicationmanager`;
+  migration `034f` (`panel_apps`, `web_vhosts.proxies_json`); contract §65, manual C §16.3.
+- **Account panel › Files › Git version control (P3-1).** Repositories under the account home (`~/repositories/<name>`
+  by default, or any home-relative folder): create an empty one, clone a public `https://` or deploy-key `ssh://`
+  repository (a 15-minute job the account follows live), adopt a folder that already holds one, *Pull* (`git pull
+  --ff-only`, job), *Deploy* (the `deployment: tasks:` list of `.keel.yml` — `cp`, `rsync`, `mkdir`, `rm`, `chmod` on
+  paths inside the home, one program per task, never a shell; *Check tasks* shows the plan), *Forget* and *Remove*
+  (the repository folder only). Every git command runs as the account with `GIT_TERMINAL_PROMPT=0`,
+  `GIT_CONFIG_NOSYSTEM=1` and only the https/ssh transports; `file:`, `ext::` and URLs with a user name or password
+  answer `422`. Feature `gitversioncontrol`, table `panel_git_repos` (migration `034f`), `ctx.panelGit`,
+  `GET|POST /api/panel/git`, `GET|DELETE /api/panel/git/:id`, `POST …/:id/pull|deploy`, agent `git.*`; contract §64,
+  manual C §5.5. Host needs `git`.
+- **PostgreSQL remote access hosts (P3-4).** On a local PostgreSQL profile, *Remote hosts* (account panel) and *Manage
+  Database Access Hosts* (console) now work: each account gets a managed block in `pg_hba.conf` (`host <its databases>
+  <its users> <address> scram-sha-256`, agent `db.pg.hba.write`, reloaded with `pg_reload_conf()`), written before the row
+  is recorded and rewritten whenever the account's databases or users change. Hosts may be IPs, networks in CIDR form
+  (`203.0.113.0/24`), `%` patterns on dotted quads (converted), host names or `.domain` suffixes; `%` alone means `all`.
+  A PostgreSQL server on another machine keeps the "not available" answer. Contract §67, manual B §20.5, manual C §7.3.
+- **Forced 2FA for account users as a core login policy.** *Security Center › Two-Factor Authentication* (and
+  *Configure Security Policies*) gain *Require two-factor authentication for account users*
+  (`security.2fa.required_for_users`): an account holder who signs in without an authenticator is flagged
+  `mustEnroll2fa` exactly like root and resellers, sees only the enrolment page until enrolled, and cannot disable it
+  afterwards. The account panel's own *Require 2FA for account users* switch keeps working; either switch enforces, the
+  panel settings card says so, `GET /api/panel/me` carries `mustEnroll2fa`, and Security Advisor reports the policy as
+  required when either is on. Contract §66, manual §4.4/§4.19, Part C C.3/C.9.1.
 - **PHP source builds — every catalog PHP version installs on every supported host.** When no repository
   carries a version for the host (Ubuntu 26.04 "resolute" and `ppa:ondrej/php`), the catalog no longer marks it
   *Not available for this OS*: it is *Available* with `method: 'source'`, and Install (PHP Version Manager or

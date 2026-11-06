@@ -80,10 +80,18 @@ function pgAgent() {
     killed: [],
     restarts: 0,
     installed: [],
+    // pg_hba.conf managed blocks by account, as db.pg.hba.write last wrote them.
+    hba: new Map(),
   };
   const fail = (code, message) => Object.assign(new Error(message), { agentError: true, code, details: {} });
   const ops = {
     'sys.binaries': ({ names }) => Object.fromEntries(names.map((n) => [n, ['psql', 'pg_dump', 'runuser', 'systemctl'].includes(n)])),
+    'db.pg.hba.write': ({ username, hosts, databases, users }) => {
+      const foreign = [...databases, ...users].filter((n) => !n.startsWith(`${username}_`));
+      if (foreign.length) throw fail('refused', `${foreign.join(', ')}: only objects prefixed "${username}_" may be opened to remote hosts`);
+      if (hosts.length && databases.length && users.length) state.hba.set(username, { hosts, databases, users }); else state.hba.delete(username);
+      return { path: '/etc/postgresql/16/main/pg_hba.conf', username, hosts, databases, users, lines: hosts.length, changed: true, reloaded: true, reloadError: null };
+    },
     'svc.list_units': () => ['postgresql', 'ssh'],
     'db.detect': () => ({ installed: false, serverInstalled: false, engine: null, binaries: { client: null, server: null, check: null, dump: null, upgradeTool: null, psql: 'psql', runuser: true }, units: ['mariadb', 'mysql', 'mysqld'], layout: { flavor: null, mainConf: null, confDirs: [], managedInclude: null, dataDir: null, rootMyCnf: false }, postgres: { installed: true, dataDirs: ['/var/lib/postgresql'] } }),
     'pg.version': () => ({ version: 'PostgreSQL 16.3 (Debian 16.3-1.pgdg120+1) on x86_64-pc-linux-gnu', major: '16.3', engine: 'postgres' }),
@@ -1027,6 +1035,7 @@ describe('Database Services API (PostgreSQL via mock agent)', () => {
   const rGet = (path) => resellerHttp.get(`/api/databases${path}`);
   const rPost = (path, body) => resellerHttp.post(`/api/databases${path}`).set('X-CSRF-Token', resellerCsrf).send(body);
   const rPut = (path, body) => resellerHttp.put(`/api/databases${path}`).set('X-CSRF-Token', resellerCsrf).send(body);
+  const rDel = (path) => resellerHttp.delete(`/api/databases${path}`).set('X-CSRF-Token', resellerCsrf);
 
   it('reports the postgres profile, capability, version and unit', async () => {
     const res = await get('/status').expect(200);
@@ -1111,10 +1120,43 @@ describe('Database Services API (PostgreSQL via mock agent)', () => {
     await expect(app.ctx.databases.setClientAddresses({ ipv4: '203.0.113.10', ipv6: null })).rejects.toMatchObject({ status: 501, capability: 'mysql' });
     expect(app.ctx.databases.clientAddresses()).toEqual({ ipv4: '203.0.113.10', ipv6: null });
     expect(app.agent.callsTo('pg.ping')).toEqual([]);
+  });
+
+  it('access hosts are pg_hba.conf blocks: converted addresses, host first, rewritten when objects change (contract §67)', async () => {
+    expect((await rGet('/access-hosts').expect(200)).body.meta).toMatchObject({ engine: 'postgres', supported: true });
     const hosts = await rPost('/access-hosts', { host: '203.0.113.5', account: 'dana' }).expect(201);
-    expect(hosts.body.data).toMatchObject({ supported: false, applied: [], failed: [] });
-    expect((await rGet('/access-hosts').expect(200)).body.meta).toMatchObject({ engine: 'postgres', supported: false });
+    expect(hosts.body.data).toMatchObject({ supported: true, address: '203.0.113.5', failed: [], applied: [{ account: 'dana', reloaded: true }] });
+    expect(app.agent.callsTo('db.pg.hba.write')[0].args).toEqual({ username: 'dana', hosts: ['203.0.113.5'], databases: ['dana_shop'], users: ['dana_app'] });
     expect(app.agent.calls.filter((c) => c.name.startsWith('db.user') || c.name.startsWith('pg.user'))).toEqual([]);
+    // Wildcards become networks; names pg_hba.conf cannot express are refused before any write.
+    const net = await rPost('/access-hosts', { host: '198.51.100.%', account: 'dana' }).expect(201);
+    expect(net.body.data.address).toBe('198.51.100.0/24');
+    await rPost('/access-hosts', { host: '10.0.0.0/8', account: 'dana' }).expect(201);
+    expect([...app.agent.state.hba.get('dana').hosts].sort()).toEqual(['10.0.0.0/8', '198.51.100.0/24', '203.0.113.5']);
+    app.agent.calls.length = 0;
+    expect((await rPost('/access-hosts', { host: 'db_.example.com', account: 'dana' }).expect(400)).body.error.message).toMatch(/pg_hba\.conf/);
+    await rPost('/access-hosts', { host: '10.0.0.0/33', account: 'dana' }).expect(400);
+    await rPost('/access-hosts', { host: 'localhost', account: 'dana' }).expect(400);
+    expect(app.agent.callsTo('db.pg.hba.write')).toEqual([]);
+    // A write that fails leaves no row behind.
+    app.agent.fail('db.pg.hba.write', 'capability_missing', 'No pg_hba.conf of a local PostgreSQL server was found');
+    await rPost('/access-hosts', { host: '192.0.2.7', account: 'dana' }).expect(501);
+    expect(app.ctx.db.prepare("SELECT 1 FROM db_access_hosts WHERE host = '192.0.2.7'").get()).toBeUndefined();
+    app.agent.set('db.pg.hba.write', app.agent.ops['db.pg.hba.write']);
+    // New objects of the account join the block; dropped ones leave it.
+    await post('/databases', { name: 'crm', account: 'dana' }).expect(201);
+    expect(app.agent.state.hba.get('dana').databases).toEqual(['dana_crm', 'dana_shop']);
+    await del('/databases/dana_crm').expect(200);
+    expect(app.agent.state.hba.get('dana').databases).toEqual(['dana_shop']);
+    // Removing the last host removes the block; a global host covers every account with objects.
+    const list = (await rGet('/access-hosts?account=dana').expect(200)).body.data;
+    for (const h of list) await rDel(`/access-hosts/${h.id}`).expect(200);
+    expect(app.agent.state.hba.has('dana')).toBe(false);
+    const global = await post('/access-hosts', { host: '%' }).expect(201);
+    expect(global.body.data).toMatchObject({ scope: 'global', address: 'all', applied: [{ account: 'dana' }] });
+    expect(app.agent.state.hba.get('dana').hosts).toEqual(['all']);
+    await del(`/access-hosts/${global.body.data.id}`).expect(200);
+    expect(app.agent.state.hba.has('dana')).toBe(false);
   });
 
   it('runs VACUUM-style checks as a job scoped to the caller', async () => {

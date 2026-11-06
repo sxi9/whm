@@ -1612,3 +1612,209 @@ already uses (§4.11 of the customer-panel design).
   100/300/500/1000 lines, follow every 10 s, one card per file with the lines newest first. Keys `panel.logs/errors.*` and
   `panel.logs.errors_*`; shared strings reuse `panel.logs.*`.
 - Tests: `server/test/panel-logs-errors.test.js`, `client/test/panel-logs-errors.test.jsx`.
+
+## 64. Customer panel: Git Version Control (`ctx.panelGit`, agent `git.*`, `.keel.yml` deployment) (P3-1)
+Repositories live under the account home (`~/repositories/<name>` by default or any home-relative folder) and are
+rows of `panel_git_repos` (migration `034f_panel-git-apps.sql`, shared with P3-2: `account_id, name, dir, url,
+created_at, last_pull_at, last_deploy_at`, unique `(account_id, name)` and `(account_id, dir)`). Feature
+`gitversioncontrol` (seeded on). Nav *Files › Git version control* (`panel:files/git`, slug `git`).
+- **Agent ops (`agent/src/ops/git.js`, no `lib.js` import):** every command runs as the account through
+  `as-user.js` (`asUser` → `setpriv`/`runuser`) with `GIT_ENV` = `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_ASKPASS=/bin/true`, `GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'` and the
+  `GIT_CONFIG_*` triple `protocol.allow=never`, `protocol.https.allow=always`, `protocol.ssh.allow=always`
+  (submodules included). `dir`/`root` are absolute paths pinned by `accountPath` (lexically and through symlinks,
+  `protectSshDir` on every writing op); the home itself and a symlinked directory are refused.
+  `git.init { username, dir }` (mkdir -p + `git init`, `exists` when `.git` is there) → info; `git.clone { username,
+  dir, url }` (`gitUrl`: `https://host[:port]/path`, `ssh://git@host[:port]/path`, `git@host:path`, no other
+  userinfo, no `file:`/`ext::`/`http:`, no `..`, ≤ 512; dir must not exist; `git clone -- url dir`, 15 min; a failed
+  clone removes the partial dir and maps to `refused` (credentials wanted), `not_found` (no such repository / host)
+  or `command_failed` with the last 20 stderr lines in `details.stderr`) → info + `url, output`; `git.list { username,
+  root }` → `{ root, rel, exists, repos: [{ path, rel, name }] }` (immediate subfolders holding `.git`, `find -P`);
+  `git.info { username, dir }` → `{ path, rel, branch, head: { sha, short, subject, date } | null, remotes: [{ name,
+  url, push }], dirty, lastPullAt (mtime of .git/FETCH_HEAD), hasKeelYml }`; `git.pull { username, dir }` (`git pull
+  --ff-only --no-rebase`, 10 min; `refused` without a remote, on a non-fast-forward or when credentials are wanted) →
+  info + `{ from, updated, output }`; `git.deploy { username, dir, dryRun }` reads `.keel.yml` as the account (regular
+  file ≤ 64 KiB), `parseKeelYml` takes only the `deployment: tasks:` block list (≤ 50 tasks), `splitTask` refuses
+  `$ \` ; | & < >` and newlines, `planTasks` pins each task to `TASK_PROGRAMS` (`cp`, `rsync`, `mkdir`, `rm`, `chmod`
+  with their option allow-lists; chmod modes without setuid/setgid) and resolves every other word with
+  `resolveTaskPath` (repository-relative, `~/` = home, absolute under the home; `..` and escapes refused; `rm`/`chmod`
+  never on the home itself), inserts `--` before the paths and runs the tasks one by one with `asUser(program,
+  argv, { cwd: repo })`, 5 min each, stopping at the first non-zero exit (`details.results` carries what ran) →
+  `{ path, rel, dryRun, tasks: [{ index, line, program, argv, ran, code, output }] }`; `git.remove { username, dir }`
+  (destructive; `rm -rf -- dir` as the account, only when `.git` is there) → `{ removed }`. `capability_missing`
+  without `git` on the host.
+- **Service `ctx.panelGit` (`server/src/services/panel-git.js`):** `list(scope, req)` → `{ data: [{ id, name, dir,
+  url, createdAt, lastPullAt, lastDeployAt, present }], meta: { total, max: 50, defaultRoot: 'repositories',
+  unregistered: [{ dir, name }] } }` (`present` from `git.list` on the default root, `null` for folders elsewhere);
+  `create(scope, { name, dir?, url?, adopt? }, req)` → `{ status: 201, data: { …row, info } }` (`git.init`, or
+  `git.info` when `adopt`) or `{ status: 202, data: { job, name, dir, url } }` (job `panel.git.clone`); the folder is
+  `resolveDir`-pinned under the home (422), may not equal, sit inside or hold another registered folder (409), names
+  are unique per account (409), 50 repositories at most (`limit_reached`); `get(scope, id, req)` → `{ …row, info |
+  null, missing }`; `pull` → job `panel.git.pull`; `deploy(scope, id, { dryRun })` → job `panel.git.deploy`;
+  `remove(scope, id, { files = true })` (`git.remove` then the row); `getJob` / `streamJob` as §49 (the account's own
+  job types only; `accountId`, `ownerId`, `abs` stripped from the view). Jobs act for the account owner read back at
+  run time (`jobScope`, as the WordPress jobs); a clone inserts the row only when git succeeded and stamps
+  `last_pull_at`; pull/deploy stamp their columns on success (a dry run stamps nothing). Audit `panel.git.init`,
+  `panel.git.adopt`, `panel.git.clone(.done|.failed)`, `panel.git.pull(.done|.failed)`, `panel.git.deploy(.done|.failed)`,
+  `panel.git.remove`.
+- **Routes (`routes/panel/git.js`, `/api/panel/git`, no `panel:*` token scope — mutations are session-only, reads
+  need `panel:read`):** `GET /`, `POST / { name: repoName, dir?: repoDir, url?: gitUrl, adopt?: boolean }` (`url`
+  and `adopt` exclusive) → 201 | 202, `GET /jobs/:id`, `GET /jobs/:id/stream`, `GET /:id`, `POST /:id/pull {}`,
+  `POST /:id/deploy { dryRun? }`, `DELETE /:id?confirm=true&files=true|false`. `gitUrl`, `repoName`
+  (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, not `.git`-suffixed) and `repoDir` (file-manager `relPath` grammar) are
+  exported by the service so the 422 happens before any job exists.
+- **Client:** `pages/panel/files/git.jsx` (list with *Open / Pull / Deploy / Forget / Remove*, *New repository*
+  sheet with name, clone URL, folder and *Use the existing folder*, detail card for `?repo=<id>` with *Pull*, *Check
+  tasks* (dry run), *Deploy*, *Remove* and a file-manager link, deployment guide with the `.keel.yml` example, job
+  modal over `ProgressLog` with `jobStreamPath = /panel/git/jobs/:id/stream`). Keys `panel.files/git.*` and
+  `panel.git.*`; client-side `nameProblem` / `urlProblem` / `dirProblem` mirror the server grammar.
+- Tests: `agent/test/git.test.js`, `server/test/panel-git.test.js`, `client/test/panel-git.test.jsx`.
+
+## 65. Customer panel: Application Manager — Node.js and Python apps (`ctx.panelApps`, agent `apps.*`, vhost `proxies`) (P3-2)
+An account's program runs as a systemd service under the account's own uid and is published on a path of one of its
+domains through an Apache reverse proxy on loopback. Feature `applicationmanager` (seeded on). Migration `034f`
+(shared with P3-1): table `panel_apps` (`account_id, name, type, dir, entry, runtime, port UNIQUE, domain, mount,
+websocket, env_json, status, error`; `UNIQUE (account_id, name)`, `UNIQUE (account_id, domain, mount)` — every lookup by
+domain or mount is scoped by `account_id`, so a row never answers for a domain another account holds later) and
+`web_vhosts.proxies_json`.
+- **Unit (agent `apps.unit.write { username, name, type: node|python, dir, entry, runtime, port, env, memoryMax? }`):**
+  name `[a-z0-9-]{2,32}`; `dir`/`entry` home-relative (`APP_REL_RE`: no leading `/` or `-`, no `..`, no spaces, quotes or
+  `%` — they go verbatim into `WorkingDirectory=`/`ExecStart=`), resolved through `as-user.js` (`assertManaged`,
+  `accountPath`, symlinks confined to the home) and both must exist (`not_found` otherwise); `runtime` is a Keel Node
+  major (`/opt/keel/node/<major>/bin/node`, `WHM_NODE_DIR` in tests), `system` (node/python3 on the agent's PATH) or a
+  Python minor (`python3.x` on PATH) and is resolved as root; `env` keys `[A-Z_][A-Z0-9_]*`, values one line ≤ 1024,
+  ≤ 64 entries, `PORT HOME USER LOGNAME PATH` refused (the panel sets them). The template is fixed
+  (`renderUnit`): `User=`/`Group=` the account, `WorkingDirectory=<home>/<dir>`, `Environment="PORT=…"`, `HOME`, a
+  `PATH` that starts with the interpreter's bin dir, `NODE_ENV=production` for node, the variables (systemd
+  double-quoted, `\` and `"` escaped, `%` doubled so no specifier is expanded), `ExecStart=<interpreter> <home>/<dir>/<entry>` or `<dir>/.venv/bin/python …`
+  when the venv exists, `Restart=on-failure`, `NoNewPrivileges=true`, `ProtectSystem=strict` + `ReadWritePaths=<home>`,
+  `PrivateTmp=true`, `ProtectKernelTunables`, `ProtectControlGroups`, `RestrictSUIDSGID`, journal output with
+  `SyslogIdentifier=keel-app-<username>.<name>` (the unit name: `.` separates the parts because `-` is legal in both a
+  username and an app name), `MemoryMax=` only when the server passes one (plan key `app_memory_mb`). The file is `/etc/whm/apps/<username>/<name>.service` (directory `0700`, file `0600`: it holds the account's variables and systemd reads it as root; allowed root `/etc/whm/apps`; a file not
+  starting with the managed header is never overwritten or deleted), linked with `systemctl link` (an existing
+  `/etc/systemd/system/<unit>.service` that is not the panel's link is `refused` before the file is written), then `daemon-reload`, `enable`,
+  `restart`; the result carries `started` / `startError` and the unit status. `/etc/systemd/system` itself is never an
+  allowed root.
+- **Other agent ops:** `apps.unit.remove { username, name }` (`disable --now`, drop the link, delete the file,
+  `daemon-reload`, `reset-failed`), `apps.unit.control { …, action: start|stop|restart }` (404 when the unit is not
+  installed), `apps.unit.status` (`systemctl show`: `installed, active, state, subState, enabled, pid, startedAt,
+  memoryBytes, restarts, result`), `apps.unit.logs { lines 1..500 }` (`journalctl -u <unit> -n N --no-pager -o cat`),
+  `apps.deps.install { username, dir, type, runtime }` (as the account via `asUser`, `nice`, 20 min: node `npm install
+  --omit=dev --no-audit --no-fund` when `package.json` exists; python `python3.x -m venv .venv` once, then
+  `.venv/bin/python -m pip install -r requirements.txt` when the file exists; returns `steps[{ step, command, code,
+  output (last 80 lines) }]` and `skipped`), `apps.port.free { port 1024..65535 }` (`ss -ltn`; `free: null,
+  checked: false` without `ss`).
+- **Vhost proxies:** `web.vhost.write` takes `proxies: [{ path, port ≥ 1024, websocket }]` (≤ 20, `PROXY_PATH_RE`: `/`
+  or `/seg(/seg)*` of `[A-Za-z0-9._-]`, no dot segments, each path once). `renderProxies` emits, inside
+  `<IfModule proxy_http_module>` in both the HTTP and the TLS block: `ProxyPreserveHost On`, `ProxyRequests Off`,
+  `ProxyPass "/.well-known/acme-challenge/" "!"` ahead of every mount (mod_proxy takes the first match, so the certbot
+  webroot stays with Apache even under a root mount), a `<IfModule proxy_wstunnel_module>` + `<IfModule rewrite_module>`
+  rewrite (`RewriteCond %{REQUEST_URI} !^/.well-known/`, `RewriteCond %{HTTP:Upgrade} websocket` → `ws://127.0.0.1:<port>/$1`
+  `[P,L]`) for mounts with `websocket`, then per mount, longest first, `RedirectMatch 301 "^/path$" "/path/"` (non-root
+  only), `ProxyPass "/path/" "http://127.0.0.1:<port>/"` and `ProxyPassReverse`. The meta line counts `proxies`; a
+  vhost without proxies renders byte for byte as before. `ctx.web.setProxies(domain, proxies, req)` stores
+  `proxies_json` on the row (kept by `specsFor`/`storeSpec` across every later sync), rewrites the vhost and audits
+  `web.proxies.set`.
+- **Apache modules:** `web.modules.status { modules? }` (read-only; `{ flavor, a2tools, modules: {name: bool},
+  missing }`) and `web.modules.enable { modules: enum[proxy, proxy_http, proxy_wstunnel, rewrite], reload }` (Debian `a2enmod -q`
+  per missing module, configtest — `a2dismod` again and `config_invalid` on failure — then reload; `capability_missing`
+  without a2enmod). Only the server calls `enable`, as root, from `panelApps.publish` before the first app of a host
+  is published; the call is audited as `web.modules.enable`.
+- **Service `ctx.panelApps`:** `list(scope, req)` → `{ data: [app…], meta: { total, sites, portRange, apache, limit } }`;
+  app = `{ id, name, type, dir, entry, runtime, port, domain, mount, websocket, env, status, error, unit, url,
+  createdAt, updatedAt, service: { state, subState, pid, startedAt, memoryBytes, restarts, enabled } | null }`
+  (`status` is the live unit state: `running` / `stopped` / `failed` / `pending` when no unit exists); `get`;
+  `runtimes(req)` (`pkg.runtime.detect`, 60 s cache: `node[{ id: '<major>'|'system', label, version, keel }]`,
+  `python[{ id: '3.x'|'system', … }]`, `portRange`); `create(scope, { name, type, dir, entry, runtime?, domain?,
+  mount?, websocket?, env? }, req)` — 422 for the grammar, 404 for a domain that is not one of the account's
+  `main|addon|sub` websites, 409 for a taken name or `(domain, mount)`, 409 `limit_reached` on plan key `max_apps`,
+  501 without Apache (checked before anything is written); the port is the lowest in `panel.app_port_range`
+  (`[min, max]` or `{ min, max }`, default 31000–31999, host-wide) no row holds and `apps.port.free` does not refuse;
+  host first: `apps.unit.write`, then the row (an insert that loses a race on the name, mount or port removes the unit
+  again and answers 409), then modules + `setProxies(domain, proxiesFor(scope, domain))` (a failed publish keeps the
+  row with `status: failed` and rethrows); `update(scope, id, patch, req)` (same pins; a move re-renders
+  the old and the new domain), `remove` (unit, row, proxy — the application files are never touched; `filesKept`),
+  `control(scope, id, start|stop|restart, req)`, `logs(scope, id, { lines })`, `deps(scope, id, req)` → job
+  `panel.apps.deps` (`runDeps` → `apps.deps.install`, each step's output in the job log), `getJob` / `streamJob` as the
+  WordPress installer. Audit `panel.apps.create|update|remove|start|stop|restart|deps(.done)` (variables never
+  appear, only their keys) and `web.modules.enable`. Seams: `countForDomain(scope, domain)` — `panelDomains.removeAddon`
+  / `removeSub` answer 409 `in_use` while it is non-zero (move or remove the apps first); `removeAccountApps(username,
+  req)` — `accounts.cleanupAccount` step `apps`, before `web`: every unit of the account is stopped, disabled and
+  unlinked and the rows deleted, so no root-level service outlives the tenant.
+- **Routes (`routes/panel/apps.js`, no token scope — reads with `panel:read`, mutations session-only):**
+  `GET /api/panel/apps`, `GET /api/panel/apps/runtimes`, `POST /api/panel/apps` → 201, `GET|PUT|DELETE
+  /api/panel/apps/:id` (`DELETE …?confirm=true`), `POST …/:id/start|stop|restart`, `POST …/:id/deps` → 202 `{ job }`,
+  `GET …/:id/logs?lines=1..500`, `GET …/jobs/:id[/stream]`.
+- **Client:** `pages/panel/software/apps.jsx` (key `panel:software/apps`, nav *Software › Application manager*, feature
+  `applicationmanager`): create card (type, folder, start file, runtime picker from `/apps/runtimes`, domain, path,
+  WebSockets switch, `KEY=value` variables), table with status pills and PID/memory, row actions Start/Stop,
+  Restart, Logs (modal over `GET …/logs`), Install dependencies (job modal over `ProgressLog` with `jobStreamPath =
+  /panel/apps/jobs/:id/stream`), Edit (sheet; saving rewrites and restarts the unit), Remove. Keys
+  `panel.software/apps.*` and `panel.apps.*`; `parseEnv` / `formProblems` mirror the server grammar.
+- **Host steps:** Apache `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrite` are enabled by the panel on first publish (a2enmod);
+  nothing else — Node.js builds come from Install Software, `python3-venv` (and `python3-pip`) must be installed for
+  Python apps.
+- Tests: `agent/test/apps.test.js`, `server/test/panel-apps.test.js`, `client/test/panel-apps.test.jsx`.
+
+## 66. Forced 2FA for account users as a core policy (`security.2fa.required_for_users`, `auth.policy().require2faForUsers`) (P3-3)
+No new agent op, table, migration, nav entry or feature flag: one seeded setting (`server/src/db/seed.js`, default
+`false`; `clusters-config.js` exports it in the `security` group) read by the core login policy.
+- **Core policy:** `ctx.security.policy()` and `ctx.auth.policy()` carry `require2faForUsers`. `needsEnrollment` in
+  `services/auth.js` flags a `role === 'user'` login without `totp_enabled` exactly as it flags root/resellers: the login
+  answer and `GET /api/auth/me` carry `mustEnroll2fa: true`, the session is flagged, and `auth.disable2fa` (the core
+  `POST /api/auth/2fa/disable`) refuses while the policy stands.
+- **Session gate:** `requireAuth` (`middleware/auth.js`) keeps answering `403 two_factor_required` to everything outside
+  `/api/auth/*` for a flagged session, **plus** `GET /api/panel/me` and `/api/panel/security/two-factor*`
+  (`PANEL_ENROLMENT_OPEN`): account users enrol through the panel's own routes, so without that opening the panel shell
+  would loop on 403 instead of landing on the enrolment page. The panel's `confirm2fa` clears the session flag as the core
+  confirm route does.
+- **Either switch enforces:** `ctx.panel.assertTwoFactor(user, path)` (§50) throws when `panel.require_2fa_for_users`
+  **or** `security.2fa.required_for_users` is on; `routes/panel/security.js` (`required`, the Disable refusal),
+  `adminReset2fa.enrollmentRequired` and `GET /api/panel/me` `policy.require2fa` follow the same OR. `GET /api/panel/me`
+  also carries `mustEnroll2fa` (session flag, or mode `user` without an authenticator under either switch), so a session
+  that was open when the switch turned on is sent to the enrolment page by the shell (`panelRedirect`) on its next load.
+- **Admin surfaces:** the switch *Require two-factor authentication for account users* sits next to the root one on
+  *Security Center › Two-Factor Authentication* (server policy card, `PUT /api/system/settings`) and next to the
+  root/reseller ones on *Configure Security Policies*. `ctx.panel.settings.get()` adds `coreRequire2faForUsers` and
+  *Panel › Customization › Account panel* states under its own toggle that the core switch exists (and that it is on);
+  Security Advisor's `panel.2fa.policy` reads `required` when either switch is on.
+- Tests: `server/test/auth-2fa-users.test.js`, `client/test/security-2fa-users.test.jsx`.
+
+## 67. PostgreSQL remote access hosts (`db_access_hosts` on a PostgreSQL profile, agent `db.pg.hba.write`) (P3-4)
+PostgreSQL has no per-host users: who may connect from where is `pg_hba.conf`. Access hosts of a PostgreSQL profile are
+therefore **managed blocks in that file**, one per account, written by the agent and reloaded with `pg_reload_conf()`.
+No new table or setting; the existing `db_access_hosts` rows (raw host as typed) are the source and the block is derived.
+- **Agent op `db.pg.hba.write { username, hosts[], databases[], users[], credentials? }`** (`agent/src/ops/db.js`):
+  `hosts` are `pg_hba.conf` addresses (`pgHbaAddress`: `all`, an IP, a CIDR network, a host name or a `.domain` suffix — never
+  `samehost`/`samenet`, never `%` patterns), `databases`/`users` are `pgName` identifiers that **must carry the
+  `<username>_` prefix** (`refused` otherwise: a block may only open the account's own objects). The file is `SHOW hba_file`
+  through the profile credentials, else the newest `/etc/postgresql/<ver>/<cluster>/pg_hba.conf` or
+  `/var/lib/pgsql[/<ver>]/data/pg_hba.conf` (allowed roots `PG_HBA_ROOTS` in `managed-paths.js`). The block
+  `# BEGIN Keel remote access: <username>` … `# END Keel remote access: <username>` holds one line per address,
+  `host <db1,db2> <user1,user2> <address> scram-sha-256` (a bare IP becomes `/32` or `/128`), appended at the **end** of the
+  file (first-match: the distribution's local/peer lines stay in front); an empty host, database or user list removes the
+  block. The rewrite keeps the file's owner, group and mode (the postgres user must still read it) and leaves a
+  `.whm-bak`. Reload: `SELECT pg_reload_conf()`, else `systemctl reload <pg unit>`; the result is
+  `{ path, username, hosts, databases, users, lines, changed, reloaded, reloadError }`. `capability_missing` when no file is
+  found, `config_invalid` on an unterminated block.
+- **Service (`ctx.databases`):** `pgHbaAddress(host)` (exported) converts a stored host: `%` → `all`, `203.0.113.%` →
+  `203.0.113.0/24` (one, two or three octets), IPs, CIDR networks, host names and `.domain` suffixes pass, anything else
+  (`_`, a `%` inside a name) is `null` → `400`. `listAccessHosts` reports `supported: true` for MySQL and for a **local**
+  PostgreSQL profile (`is_local` or a loopback host); a remote PostgreSQL profile keeps `supported: false` and
+  `addAccessHost` answers `422 unsupported`. `addAccessHost` on PostgreSQL writes the block of the account (or, for a
+  global host, of every account that owns a database or user) **before** the row is inserted (host first) and answers
+  `{ …, address, applied: [{ account, path, reloaded, lines }], failed: [{ account, error }] }`; `removeAccessHost`
+  rewrites the blocks without the row, honouring a global rule that still grants the same host, then deletes the row.
+  `createDatabase`/`dropDatabase`/`createUser`/`dropUser` call `refreshPgHba(account)` when the account has remote hosts,
+  so the block always names the current objects; a failure there is logged, never undoes the object. A CIDR host on a
+  MySQL profile is `400` (the route schema admits the `/n` suffix for both engines).
+- **Routes:** unchanged paths. Admin `POST /api/databases/access-hosts { host, account? }` and panel
+  `POST /api/panel/databases/access-hosts { host }` accept `[A-Za-z0-9.%:_-]{1,255}(/\d{1,3})?`; the panel's
+  `ctx.panelDatabases.listAccessHosts` follows the delegate's `supported` flag and `addAccessHost` passes `address` through.
+- **Client:** `pages/panel/databases/remote-hosts.jsx` reads `meta.engine`: on PostgreSQL the help names networks and the
+  `pg_hba.conf` rule, the connection card shows port `5432`, `describeHost` labels a CIDR as *network*; `supported: false`
+  (remote PostgreSQL) keeps the empty state. Keys `panel.databases.host_help_pg_*`, `host_invalid_chars_pg`, `host_network`;
+  `host_pg_title/text` and `hosts_empty_pg` reworded. Feature flag: the existing `postgres` plan feature (the page's nav
+  entry keeps `mysql`, as the whole Databases group does). No migration.
+- Tests: `agent/test/db-pg-hba.test.js`, `server/test/database-services.test.js` (PostgreSQL suite),
+  `server/test/panel-databases.test.js`, `client/test/panel-databases.test.jsx`.

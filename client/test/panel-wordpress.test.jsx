@@ -45,7 +45,7 @@ describe('nav entry of the Software group', () => {
     expect(PANEL_ICONS.Package).toBeTruthy();
     expect(panelColorFor('software')).not.toBe(panelColorFor('nothing'));
     expect(PANEL_PAGE_REGISTRY['panel:software/wordpress']).toBeTruthy();
-    expect(visibleCategories({ wordpress: false, plugins: false }).some((c) => c.slug === 'software')).toBe(false);
+    expect(visibleCategories({ wordpress: false, plugins: false, applicationmanager: false }).some((c) => c.slug === 'software')).toBe(false);
     expect(visibleCategories({}).some((c) => c.slug === 'software')).toBe(true);
     expect(jobStreamPath(12)).toBe('/panel/software/wordpress/jobs/12/stream');
   });

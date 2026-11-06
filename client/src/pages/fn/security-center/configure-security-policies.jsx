@@ -7,6 +7,7 @@ export default function ConfigureSecurityPolicies({ fn }) {
         { title: 'Two-factor authentication', fields: [
           { key: 'security.2fa.required_for_root', label: 'Require two-factor authentication for root', type: 'toggle', help: 'Root must enrol in two-factor authentication before using anything but the account pages.' },
           { key: 'security.policy.require_2fa_for_resellers', label: 'Require two-factor authentication for resellers', type: 'toggle', help: 'Resellers must enrol in two-factor authentication on their next login.' },
+          { key: 'security.2fa.required_for_users', label: 'Require two-factor authentication for account users', type: 'toggle', help: 'Account holders must enrol in two-factor authentication on their next sign-in to the account panel; until then only the enrolment page opens. The account panel setting of the same name (Panel › Customization) enforces the same rule.' },
           { key: 'security.policy.api_tokens_require_2fa', label: 'Only users with 2FA may create API tokens', type: 'toggle', help: 'API tokens of users without two-factor authentication are refused.' },
         ] },
         { title: 'Sessions', fields: [

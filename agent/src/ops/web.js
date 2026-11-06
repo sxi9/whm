@@ -368,6 +368,13 @@ const sizeSpec = z.string().regex(/^\d{1,6}[kKmMgG]?$/, 'size such as 100M');
 const logGlob = z.string().max(512).regex(/^\/(?!(?:.*\/)?\.\.(?:\/|$))[A-Za-z0-9._*\/-]+$/, 'absolute path or glob');
 const hostList = z.array(arg.hostname).max(50);
 
+// A reverse-proxy mount of the Application Manager (contract §65): a path of the
+// site handed to a loopback port; `websocket` adds the Upgrade rewrite.
+export const PROXY_PATH_RE = /^\/(?!(?:.*\/)?\.{1,2}(?:\/|$))(?:[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*)?$/;
+export const PROXY_PORT_MIN = 1024;
+const proxyMount = z.object({ path: z.string().max(200).regex(PROXY_PATH_RE, 'a site path such as / or /app'), port: z.number().int().min(PROXY_PORT_MIN).max(65535), websocket: z.boolean().default(false) }).strict();
+export const PROXY_MODULES = ['proxy', 'proxy_http', 'proxy_wstunnel', 'rewrite'];
+
 // `bind` (set while nginx fronts Apache on 127.0.0.1:<port>) replaces the
 // account IPs in the <VirtualHost> address; a null `sslPort` drops the TLS
 // block because Apache no longer listens for HTTPS.
@@ -376,8 +383,9 @@ const vhostSchema = z.object({
   ip: arg.ipv4.nullable().optional(), ipv6: arg.ipv6.nullable().optional(), bind: arg.ip.nullable().optional(), port: z.number().int().min(1).max(65535).default(80), sslPort: z.number().int().min(1).max(65535).nullable().default(443),
   phpVersion: phpVersion.nullable().optional(), ssl: sslPaths.nullable().optional(), redirects: z.array(redirect).max(100).default([]),
   customDirectives: freeText.default(''), logDir: confPath.optional(), serverAdmin: emailAddress.optional(), options: z.string().regex(/^[A-Za-z +-]{0,200}$/).optional(),
+  proxies: z.array(proxyMount).max(20).default([]),
   meta: z.record(z.string().regex(/^[A-Za-z0-9_]{1,32}$/), metaValue).prefault({}), reload: z.boolean().default(true),
-}).strict();
+}).strict().refine((v) => new Set(v.proxies.map((p) => p.path.replace(/\/$/, '') || '/')).size === v.proxies.length, { message: 'each proxy path once', path: ['proxies'] });
 
 const mpmSchema = z.object({
   module: z.enum(['prefork', 'worker', 'event']).optional(), startServers: z.number().int().min(1).max(10_000).optional(), minSpareServers: z.number().int().min(1).max(10_000).optional(), maxSpareServers: z.number().int().min(1).max(10_000).optional(),
@@ -465,6 +473,35 @@ export function renderRedirects(redirects, indent = '  ') {
   return lines;
 }
 
+// Longest mount first so /app/admin wins over /app, and "/" last. A non-root
+// mount gets the exact path redirected to its slash form so relative links
+// inside the app resolve; the WebSocket rewrite needs proxy_wstunnel and
+// mod_rewrite and sits in its own IfModule pair so a host without them still
+// proxies plain HTTP. The ACME webroot stays with Apache: mod_proxy takes the
+// first matching ProxyPass, so the "!" exception precedes every mount, and the
+// rewrite rules skip /.well-known/ too, or a root mount would swallow the
+// certbot challenge files and every renewal would fail.
+export const ACME_PATH = '/.well-known/acme-challenge/';
+export function renderProxies(proxies, indent = '  ') {
+  if (!proxies?.length) return [];
+  const mounts = proxies.map((p) => ({ ...p, base: p.path.replace(/\/$/, '') })).sort((a, b) => b.base.length - a.base.length);
+  const esc = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const ws = mounts.filter((m) => m.websocket);
+  const lines = [`${indent}<IfModule proxy_http_module>`, `${indent}  ProxyPreserveHost On`, `${indent}  ProxyRequests Off`, `${indent}  ProxyPass "${ACME_PATH}" "!"`];
+  if (ws.length) {
+    lines.push(`${indent}  <IfModule proxy_wstunnel_module>`, `${indent}    <IfModule rewrite_module>`, `${indent}      RewriteEngine On`, `${indent}      RewriteCond %{REQUEST_URI} !^/\\.well-known/`, `${indent}      RewriteCond %{HTTP:Upgrade} websocket [NC]`, `${indent}      RewriteCond %{HTTP:Connection} upgrade [NC]`);
+    for (const m of ws) lines.push(`${indent}      RewriteRule "^${esc(m.base)}/(.*)$" "ws://127.0.0.1:${m.port}/$1" [P,L]`);
+    lines.push(`${indent}    </IfModule>`, `${indent}  </IfModule>`);
+  }
+  for (const m of mounts) {
+    const target = `http://127.0.0.1:${m.port}/`;
+    if (m.base) lines.push(`${indent}  RedirectMatch 301 "^${esc(m.base)}$" "${m.base}/"`);
+    lines.push(`${indent}  ProxyPass "${m.base}/" "${target}"`, `${indent}  ProxyPassReverse "${m.base}/" "${target}"`);
+  }
+  lines.push(`${indent}</IfModule>`);
+  return lines;
+}
+
 // Addresses configured on this host's interfaces (web.vhost.write passes this as ownAddress).
 function hostHasAddress(ip) {
   return Object.values(os.networkInterfaces()).flat().some((a) => a?.address === ip);
@@ -496,13 +533,14 @@ function vhostBlock(v, { ssl, port }) {
     lines.push(`  SSLCertificateKeyFile ${q(v.ssl.key)}`);
   }
   if (v.redirects.length) lines.push('  # Redirects (Setup/Edit Domain Forwarding)', ...renderRedirects(v.redirects));
+  if (v.proxies?.length) lines.push('  # Applications (Application Manager)', ...renderProxies(v.proxies));
   if (v.customDirectives.trim()) lines.push('  # Custom directives', ...v.customDirectives.trim().split('\n').map((l) => `  ${l}`));
   lines.push('</VirtualHost>');
   return lines;
 }
 
 export function renderVhost(v) {
-  const meta = { domain: v.domain, user: v.user, docroot: v.docroot, aliases: v.aliases, ip: v.ip ?? null, ipv6: v.ipv6 ?? null, bind: v.bind ?? null, phpVersion: v.phpVersion ?? null, ssl: Boolean(v.ssl && v.sslPort), redirects: v.redirects.length, ...v.meta };
+  const meta = { domain: v.domain, user: v.user, docroot: v.docroot, aliases: v.aliases, ip: v.ip ?? null, ipv6: v.ipv6 ?? null, bind: v.bind ?? null, phpVersion: v.phpVersion ?? null, ssl: Boolean(v.ssl && v.sslPort), redirects: v.redirects.length, proxies: v.proxies?.length ?? 0, ...v.meta };
   const lines = [`${MANAGED} (virtual host ${v.domain}). Edit through the panel; manual changes are overwritten.`, `${VHOST_MARK}${JSON.stringify(meta)}`, ''];
   lines.push(...vhostBlock(v, { ssl: false, port: v.port }));
   if (v.ssl && v.sslPort) lines.push('', '<IfModule ssl_module>', ...vhostBlock(v, { ssl: true, port: v.sslPort }), '</IfModule>');
@@ -793,6 +831,54 @@ defineOp('web.vhost.write', {
     const written = await writeApacheFile(apache, file, content, { link });
     const reload = v.reload ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
     return { domain: v.domain, ...written, link, logDir, bytes: Buffer.byteLength(content), ssl: Boolean(v.ssl && v.sslPort), bind: v.bind ?? null, phpVersion: v.phpVersion ?? null, ...reload };
+  },
+});
+
+// Apache modules the Application Manager needs (contract §65). Only the three
+// proxy modules and mod_rewrite (the WebSocket upgrade rule) can be enabled;
+// `status` is read-only and lists what is loaded.
+const modulesArg = z.array(z.enum(PROXY_MODULES)).min(1).max(PROXY_MODULES.length);
+async function loadedModules(apache) {
+  const info = await apacheInfo(apache);
+  return new Set(info.modules.map((m) => m.name));
+}
+
+defineOp('web.modules.status', {
+  description: 'Whether the named Apache proxy modules are loaded (apache2ctl -M)',
+  schema: z.object({ modules: modulesArg.default(PROXY_MODULES) }).strict(),
+  run: async ({ modules }) => {
+    const apache = requireApache();
+    const loaded = await loadedModules(apache);
+    return { flavor: apache.flavor, a2tools: Boolean(apache.a2tools), modules: Object.fromEntries(modules.map((m) => [m, loaded.has(m)])), missing: modules.filter((m) => !loaded.has(m)) };
+  },
+});
+
+defineOp('web.modules.enable', {
+  description: 'Enable Apache proxy modules with a2enmod, validate the configuration (a2dismod again on failure) and reload',
+  timeoutMs: 240_000,
+  schema: z.object({ modules: modulesArg, reload: z.boolean().default(true) }).strict(),
+  run: async ({ modules, reload }) => {
+    const apache = requireApache();
+    const loaded = await loadedModules(apache);
+    const missing = modules.filter((m) => !loaded.has(m));
+    if (!missing.length) return { enabled: [], alreadyLoaded: modules, validated: true, reloaded: false, unit: null };
+    if (apache.flavor !== 'debian' || !apache.a2tools) throw new OpError('capability_missing', `Apache modules ${missing.join(', ')} are not loaded and this host has no a2enmod; load them in the Apache configuration (LoadModule) and try again`);
+    const enabled = [];
+    for (const m of missing) {
+      const r = await exec('a2enmod', ['-q', m], { allowFailure: true, timeoutMs: 60_000 });
+      if (r.code !== 0) {
+        for (const e of enabled) await exec('a2dismod', ['-q', '-f', e], { allowFailure: true, timeoutMs: 60_000 });
+        throw new OpError('command_failed', `a2enmod ${m}: ${lastLine(`${r.stdout}${r.stderr}`)}`);
+      }
+      enabled.push(m);
+    }
+    const test = await configtest(apache);
+    if (test.ok === false) {
+      for (const e of enabled) await exec('a2dismod', ['-q', '-f', e], { allowFailure: true, timeoutMs: 60_000 });
+      throw new OpError('config_invalid', `Apache rejected the configuration with ${enabled.join(', ')} enabled; they were disabled again: ${lastLine(test.output)}`, { output: test.output });
+    }
+    const result = reload ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
+    return { enabled, alreadyLoaded: modules.filter((m) => loaded.has(m)), validated: test.ok === true, ...result };
   },
 });
 

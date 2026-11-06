@@ -239,10 +239,24 @@ describe('Remote hosts page', () => {
     set('/databases/access-hosts', { error: disabled });
     expect(render(h(RemoteHosts, { fn: fn('panel:databases/remote-hosts') }), '/panel/databases/remote-hosts')).toContain('Not included in your plan');
     reset();
+    // A PostgreSQL server on another machine: its pg_hba.conf is out of reach.
     set('/databases/access-hosts', { data: [], meta: { total: 0, engine: 'postgres', supported: false } });
     const html = render(h(RemoteHosts, { fn: fn('panel:databases/remote-hosts') }), '/panel/databases/remote-hosts');
-    expect(html).toContain('Not available for PostgreSQL');
+    expect(html).toContain('Not available for this PostgreSQL server');
     expect(html).not.toContain('Allow host');
+  });
+
+  it('on a local PostgreSQL server offers networks, names the pg_hba.conf rule and shows port 5432', () => {
+    reset();
+    set('/databases/access-hosts', { data: [{ id: 3, host: '203.0.113.0/24', scope: 'account', editable: true, created_at: '2026-11-06 10:00:00' }], meta: { total: 1, engine: 'postgres', supported: true } });
+    const html = render(h(RemoteHosts, { fn: fn('panel:databases/remote-hosts') }), '/panel/databases/remote-hosts');
+    expect(html).toContain('Allow host');
+    expect(html).toContain('pg_hba.conf');
+    expect(html).toContain('<code>5432</code>');
+    expect(html).toContain('<code>203.0.113.0/24</code>');
+    expect(html).toContain('network');
+    expect(html).not.toContain('Not available for this PostgreSQL server');
+    expect(describeHost('203.0.113.0/24')).toBe('network');
   });
 
   it('describeHost', () => {

@@ -517,6 +517,7 @@ Login and session policies. **Who:** root.
 | Field | Key | Enforced by |
 |---|---|---|
 | Require 2FA for root / for resellers | `security.2fa.required_for_root`, `security.policy.require_2fa_for_resellers` | login (`mustEnroll2fa` gate) |
+| Require 2FA for account users | `security.2fa.required_for_users` | login (`mustEnroll2fa` gate; the account panel opens only `/me` and its two-factor pages until enrolled). The account panel's own switch (*Panel › Customization › Account panel*) enforces the same rule; either is enough |
 | Only users with 2FA may create API tokens | `security.policy.api_tokens_require_2fa` | token auth middleware |
 | Limit logins to verified IP addresses | `security.policy.verified_ip_login` | login (audit + `login.new_ip` notification) |
 | Idle session timeout (minutes) | `security.policy.session_timeout_minutes` | session middleware (0 = server default `sessionTtlMs` from whm.conf, 8 h) |
@@ -675,7 +676,10 @@ the server policy card is root only.
 **Your account**: status, **Set up two-factor authentication** (shows the secret and an
 `otpauth://` URI to add to Google Authenticator, Authy, 1Password…; confirm with the current
 6-digit code), **Disable**. **Server policy** (root): *Require two-factor authentication for
-the root user*. **Server:** `POST /api/auth/2fa/enroll|confirm|disable`; the secret is stored
+the root user* and *Require two-factor authentication for account users* (`security.2fa.required_for_users`:
+account holders are sent to the account panel's enrolment page at their next sign-in and cannot disable
+the authenticator afterwards; resellers are covered by Configure Security Policies).
+**Server:** `POST /api/auth/2fa/enroll|confirm|disable`; the secret is stored
 encrypted. **Gotchas:** when the policy requires 2FA for your role, this page is the only one
 you can open until you enrol.
 

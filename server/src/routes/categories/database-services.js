@@ -59,7 +59,8 @@ export async function register(ctx) {
 
   // Manage Database Access Hosts -----------------------------------------
   r.get('/access-hosts', requireReseller, validate({ query: z.object({ account: fields.username.optional() }) }), wrap((req) => dbs().listAccessHosts(req.query, req.user)));
-  r.post('/access-hosts', requireReseller, validate({ body: z.object({ host: accessHost, account: fields.username.optional() }).strict() }), wrap((req) => dbs().addAccessHost(req.body, req.user, req), 201));
+  // A CIDR suffix is for PostgreSQL (pg_hba.conf, contract §67); the service refuses it on MySQL.
+  r.post('/access-hosts', requireReseller, validate({ body: z.object({ host: z.string().trim().regex(/^[A-Za-z0-9.%:_-]{1,255}(\/\d{1,3})?$/, 'IP address, hostname, wildcard such as 203.0.113.% or a network such as 203.0.113.0/24'), account: fields.username.optional() }).strict() }), wrap((req) => dbs().addAccessHost(req.body, req.user, req), 201));
   r.delete('/access-hosts/:id', requireReseller, validate({ params: idParam }), wrap((req) => dbs().removeAccessHost(req.params.id, req.user, req)));
 
   // Manage Database Profiles ---------------------------------------------

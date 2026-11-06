@@ -1276,3 +1276,134 @@ defineOp('pg.restart', {
     return { unit, state: kv.ActiveState || 'unknown', subState: kv.SubState || null, pid: Number(kv.MainPID) || null };
   },
 });
+
+// ------------------------------------------------ PostgreSQL remote access ---
+// PostgreSQL has no per-host users: who may connect from where is pg_hba.conf.
+// Each account owns one managed block (between its own markers) that lists its
+// databases and roles explicitly — pg_hba.conf has no "<prefix>_%" wildcard, and
+// "all" would open every tenant's databases to the address.
+
+const PG_HBA_METHOD = 'scram-sha-256';
+const HBA_BEGIN = (username) => `# BEGIN Keel remote access: ${username}`;
+const HBA_END = (username) => `# END Keel remote access: ${username}`;
+
+function cidrOk(addr, family) {
+  const [ip, len] = addr.split('/');
+  const bits = Number(len);
+  return net.isIP(ip) === family && Number.isInteger(bits) && bits >= 0 && bits <= (family === 4 ? 32 : 128);
+}
+// An address column of pg_hba.conf: "all", an IPv4/IPv6 CIDR, a host name, or a
+// ".example.com" suffix. No "samehost"/"samenet" (they would include the panel's
+// own network) and no "%" patterns (the server converts those first).
+export const pgHbaAddress = z.string().max(255).refine((v) => v === 'all' || (!/^(samehost|samenet|all)$/i.test(v) && (v.includes('/') ? (cidrOk(v, 4) || cidrOk(v, 6)) : net.isIP(v) !== 0 || /^\.?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/i.test(v))), 'Address: "all", an IP address, a CIDR network, a host name or a .domain suffix');
+
+export function renderPgHbaBlock(username, { databases = [], users = [], hosts = [] } = {}) {
+  if (!databases.length || !users.length || !hosts.length) return '';
+  const lines = hosts.map((h) => {
+    const address = net.isIP(h) === 4 ? `${h}/32` : net.isIP(h) === 6 ? `${h}/128` : h;
+    return `host\t${databases.join(',')}\t${users.join(',')}\t${address}\t${PG_HBA_METHOD}`;
+  });
+  return `${HBA_BEGIN(username)}\n${lines.join('\n')}\n${HBA_END(username)}\n`;
+}
+
+// Replaces (or appends, or removes when `block` is empty) the account's block.
+// Managed blocks sit at the end of the file: pg_hba.conf is first-match and the
+// distribution's local/peer lines must stay in front of them.
+export function replacePgHbaBlock(text, username, block) {
+  const begin = HBA_BEGIN(username);
+  const end = HBA_END(username);
+  const lines = (text || '').split('\n');
+  const start = lines.indexOf(begin);
+  const stop = start >= 0 ? lines.indexOf(end, start) : -1;
+  let out;
+  if (start >= 0 && stop >= 0) out = [...lines.slice(0, start), ...(block ? block.replace(/\n$/, '').split('\n') : []), ...lines.slice(stop + 1)];
+  else if (start >= 0) throw new OpError('config_invalid', `pg_hba.conf has an unterminated managed block for ${username}`);
+  else if (!block) return text || '';
+  else {
+    const base = (text || '').replace(/\n*$/, '');
+    out = [...(base ? [base] : []), ...block.replace(/\n$/, '').split('\n')];
+  }
+  return `${out.join('\n').replace(/\n*$/, '')}\n`;
+}
+
+// Newest cluster first: /etc/postgresql/<ver>/<cluster>/pg_hba.conf (Debian), then
+// /var/lib/pgsql[/<ver>]/data/pg_hba.conf (RHEL).
+export function findPgHbaCandidates() {
+  const out = [];
+  const list = (dir) => { try { return fs.readdirSync(dir); } catch { return []; } };
+  const byVersionDesc = (a, b) => Number.parseFloat(b) - Number.parseFloat(a);
+  for (const ver of list('/etc/postgresql').filter((v) => /^\d+(\.\d+)?$/.test(v)).sort(byVersionDesc)) {
+    for (const cluster of list(`/etc/postgresql/${ver}`).sort()) {
+      const file = `/etc/postgresql/${ver}/${cluster}/pg_hba.conf`;
+      if (exists(file)) out.push(file);
+    }
+  }
+  if (exists('/var/lib/pgsql/data/pg_hba.conf')) out.push('/var/lib/pgsql/data/pg_hba.conf');
+  for (const ver of list('/var/lib/pgsql').filter((v) => /^\d+(\.\d+)?$/.test(v)).sort(byVersionDesc)) {
+    const file = `/var/lib/pgsql/${ver}/data/pg_hba.conf`;
+    if (exists(file)) out.push(file);
+  }
+  return out;
+}
+
+async function locatePgHba(creds, ctx) {
+  let file = null;
+  if (hasBinary('psql')) {
+    try { file = (await psql('SHOW hba_file', creds, { timeoutMs: 30_000 }))[0]?.[0] || null; } catch { file = null; }
+  }
+  if (!file) file = findPgHbaCandidates()[0] || null;
+  if (!file) throw new OpError('capability_missing', 'No pg_hba.conf of a local PostgreSQL server was found');
+  if (!path.isAbsolute(file) || file.split('/').includes('..')) throw new OpError('path_not_allowed', `${file} is not an absolute path`);
+  ctx.assertAllowedPath(file, 'write');
+  return file;
+}
+
+defineOp('db.pg.hba.write', {
+  description: 'Rewrite the managed pg_hba.conf block of one account (its databases and roles from the given addresses, scram-sha-256) and reload PostgreSQL',
+  schema: withCreds({
+    username: arg.username,
+    hosts: z.array(pgHbaAddress).max(100),
+    databases: z.array(pgName).max(500).default([]),
+    users: z.array(pgName).max(500).default([]),
+  }),
+  timeoutMs: 120_000,
+  run: async ({ username, hosts, databases, users, credentials: creds }, ctx) => {
+    const prefix = `${username}_`;
+    const foreign = [...databases, ...users].filter((n) => !n.startsWith(prefix));
+    if (foreign.length) throw new OpError('refused', `${foreign.join(', ')}: only objects prefixed "${prefix}" may be opened to remote hosts`);
+    const file = await locatePgHba(creds, ctx);
+    const before = readText(file);
+    if (before == null) throw new OpError('not_found', `${file} cannot be read`);
+    const block = renderPgHbaBlock(username, { databases: [...new Set(databases)].sort(), users: [...new Set(users)].sort(), hosts: [...new Set(hosts)] });
+    const after = replacePgHbaBlock(before, username, block);
+    const changed = after !== before;
+    if (changed) {
+      // The file must stay readable by the postgres system user: the atomic
+      // rename keeps the original owner, group and mode.
+      const st = fs.statSync(file);
+      const tmp = `${file}.whm-tmp-${process.pid}`;
+      fs.copyFileSync(file, `${file}.whm-bak`);
+      fs.writeFileSync(tmp, after, { mode: st.mode & 0o777 });
+      fs.chownSync(tmp, st.uid, st.gid);
+      fs.chmodSync(tmp, st.mode & 0o777);
+      fs.renameSync(tmp, file);
+    }
+    let reloaded = false;
+    let reloadError = null;
+    if (changed) {
+      try {
+        const [[ok]] = await psql('SELECT pg_reload_conf()', creds, { timeoutMs: 30_000 });
+        reloaded = ok === 't';
+      } catch (err) {
+        reloadError = err.message;
+        const unit = await resolvePgUnit();
+        if (unit) {
+          const r = await exec('systemctl', ['reload', `${unit}.service`], { allowFailure: true, timeoutMs: 60_000 });
+          reloaded = r.code === 0;
+          if (reloaded) reloadError = null;
+        }
+      }
+    }
+    return { path: file, username, hosts, databases, users, lines: block ? block.split('\n').length - 3 : 0, changed, reloaded, reloadError };
+  },
+});

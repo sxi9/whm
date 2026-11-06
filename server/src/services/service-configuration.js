@@ -14,6 +14,7 @@ import { ssoEndpoint } from '../lib/sso-endpoint.js';
 //   web.removeAccount(username, req)                -> delete the account's vhosts and PHP-FPM pool
 //   web.applySsl(domain, paths, req) / web.removeSsl(domain, req)      paths = { cert, key, chain?, fullchain? }
 //   web.setRedirects(domain, [{ from, to, type, matchWww, keepPath }], req)
+//   web.setProxies(domain, [{ path, port, websocket }], req)  -> Application Manager mounts, kept across syncs (contract §65)
 //   web.addAlias({ username, domain, alias, docroot }, req) / web.removeAlias({ username, alias }, req)
 //   web.setAccountIpv6(username, address|null, req)
 //   web.replaceIp(from, to, { accounts }, req)      -> { updated }
@@ -646,10 +647,10 @@ export function createServiceConfigService(ctx) {
     vhostsAll: db.prepare('SELECT * FROM web_vhosts ORDER BY username, type, domain'),
     vhostsByIp: db.prepare('SELECT * FROM web_vhosts WHERE ip = ?'),
     vhostsUsingPhp: db.prepare('SELECT COUNT(*) AS n FROM web_vhosts WHERE php_version = ?'),
-    upsertVhost: db.prepare(`INSERT INTO web_vhosts (domain, account_id, username, type, docroot, aliases_json, ip, ipv6, php_version, ssl_json, redirects_json, custom_directives, status)
-      VALUES (@domain, @account_id, @username, @type, @docroot, @aliases_json, @ip, @ipv6, @php_version, @ssl_json, @redirects_json, @custom_directives, 'pending')
+    upsertVhost: db.prepare(`INSERT INTO web_vhosts (domain, account_id, username, type, docroot, aliases_json, ip, ipv6, php_version, ssl_json, redirects_json, custom_directives, proxies_json, status)
+      VALUES (@domain, @account_id, @username, @type, @docroot, @aliases_json, @ip, @ipv6, @php_version, @ssl_json, @redirects_json, @custom_directives, @proxies_json, 'pending')
       ON CONFLICT (domain) DO UPDATE SET account_id = excluded.account_id, username = excluded.username, type = excluded.type, docroot = excluded.docroot, aliases_json = excluded.aliases_json, ip = excluded.ip, ipv6 = excluded.ipv6,
-        php_version = excluded.php_version, ssl_json = excluded.ssl_json, redirects_json = excluded.redirects_json, custom_directives = excluded.custom_directives, updated_at = datetime('now')`),
+        php_version = excluded.php_version, ssl_json = excluded.ssl_json, redirects_json = excluded.redirects_json, custom_directives = excluded.custom_directives, proxies_json = excluded.proxies_json, updated_at = datetime('now')`),
     setVhostStatus: db.prepare(`UPDATE web_vhosts SET status = ?, error = ?, path = COALESCE(?, path), updated_at = datetime('now') WHERE domain = ?`),
     deleteVhost: db.prepare('DELETE FROM web_vhosts WHERE domain = ?'),
     poolsByUser: db.prepare('SELECT * FROM web_php_pools WHERE username = ? ORDER BY version'),
@@ -692,7 +693,7 @@ export function createServiceConfigService(ctx) {
   // ------------------------------------------------------------- vhosts ---
 
   function shapeVhost(r) {
-    return r && { id: r.id, domain: r.domain, accountId: r.account_id, username: r.username, type: r.type, docroot: r.docroot, aliases: json.parse(r.aliases_json, []), ip: r.ip, ipv6: r.ipv6, phpVersion: r.php_version, ssl: json.parse(r.ssl_json, null), redirects: json.parse(r.redirects_json, []), customDirectives: r.custom_directives || '', path: r.path, status: r.status, error: r.error, updatedAt: r.updated_at };
+    return r && { id: r.id, domain: r.domain, accountId: r.account_id, username: r.username, type: r.type, docroot: r.docroot, aliases: json.parse(r.aliases_json, []), ip: r.ip, ipv6: r.ipv6, phpVersion: r.php_version, ssl: json.parse(r.ssl_json, null), redirects: json.parse(r.redirects_json, []), customDirectives: r.custom_directives || '', proxies: json.parse(r.proxies_json, []), path: r.path, status: r.status, error: r.error, updatedAt: r.updated_at };
   }
 
   async function phpTrees() {
@@ -717,7 +718,7 @@ export function createServiceConfigService(ctx) {
     const existing = stmts.vhostByDomain.get(account.domain);
     const base = (domain, type, docroot, extraAliases = []) => {
       const prev = stmts.vhostByDomain.get(domain);
-      return { domain, accountId: account.id, username: account.username, type, docroot, aliases: extraAliases, ip: account.ip || settings.get('basic.shared_ip') || null, ipv6: prev?.ipv6 ?? existing?.ipv6 ?? null, phpVersion: prev?.php_version ?? null, ssl: json.parse(prev?.ssl_json, null), redirects: json.parse(prev?.redirects_json, []), customDirectives: prev?.custom_directives || '', logDir: domlogDir(account.username) };
+      return { domain, accountId: account.id, username: account.username, type, docroot, aliases: extraAliases, ip: account.ip || settings.get('basic.shared_ip') || null, ipv6: prev?.ipv6 ?? existing?.ipv6 ?? null, phpVersion: prev?.php_version ?? null, ssl: json.parse(prev?.ssl_json, null), redirects: json.parse(prev?.redirects_json, []), customDirectives: prev?.custom_directives || '', proxies: json.parse(prev?.proxies_json, []), logDir: domlogDir(account.username) };
     };
     const specs = [base(account.domain, 'main', `${home}/public_html`, aliases)];
     for (const d of domains.filter((x) => ['addon', 'sub'].includes(x.type))) specs.push(base(d.domain, d.type, d.docroot || `${home}/public_html/${d.domain}`));
@@ -725,7 +726,7 @@ export function createServiceConfigService(ctx) {
   }
 
   function storeSpec(spec) {
-    stmts.upsertVhost.run({ domain: spec.domain, account_id: spec.accountId ?? null, username: spec.username, type: spec.type, docroot: spec.docroot, aliases_json: JSON.stringify(spec.aliases || []), ip: spec.ip ?? null, ipv6: spec.ipv6 ?? null, php_version: spec.phpVersion ?? null, ssl_json: spec.ssl ? JSON.stringify(spec.ssl) : null, redirects_json: JSON.stringify(spec.redirects || []), custom_directives: spec.customDirectives || '' });
+    stmts.upsertVhost.run({ domain: spec.domain, account_id: spec.accountId ?? null, username: spec.username, type: spec.type, docroot: spec.docroot, aliases_json: JSON.stringify(spec.aliases || []), ip: spec.ip ?? null, ipv6: spec.ipv6 ?? null, php_version: spec.phpVersion ?? null, ssl_json: spec.ssl ? JSON.stringify(spec.ssl) : null, redirects_json: JSON.stringify(spec.redirects || []), custom_directives: spec.customDirectives || '', proxies_json: JSON.stringify(spec.proxies || []) });
   }
 
   async function writeSpec(spec, req, { reload = true } = {}) {
@@ -733,6 +734,7 @@ export function createServiceConfigService(ctx) {
     if (!capabilities.has('apache')) { stmts.setVhostStatus.run('pending', 'Apache is not installed', null, spec.domain); return { domain: spec.domain, applied: false, reason: 'capability_missing' }; }
     try {
       const args = { domain: spec.domain, aliases: spec.aliases || [], docroot: spec.docroot, user: spec.username, redirects: spec.redirects || [], customDirectives: spec.customDirectives || '', reload, meta: { type: spec.type, account: spec.username } };
+      if (spec.proxies?.length) args.proxies = spec.proxies.map((p) => ({ path: p.path, port: p.port, websocket: Boolean(p.websocket) }));
       if (spec.ip) args.ip = spec.ip;
       if (spec.ipv6) args.ipv6 = spec.ipv6;
       if (spec.phpVersion) args.phpVersion = spec.phpVersion;
@@ -921,6 +923,18 @@ export function createServiceConfigService(ctx) {
     requireApache();
     const result = await writeSpec(spec, req);
     audit(req, { action: 'web.redirects.set', target: domain, args: { count: spec.redirects.length } });
+    return result;
+  }
+
+  // The Application Manager's reverse-proxy mounts of a domain (contract §65):
+  // persisted on the vhost row so every later sync re-renders them.
+  async function setProxies(domain, proxies, req) {
+    const spec = requireSpec(domain);
+    spec.proxies = (proxies || []).map((p) => ({ path: p.path, port: Number(p.port), websocket: Boolean(p.websocket) }));
+    storeSpec(spec);
+    requireApache();
+    const result = await writeSpec(spec, req);
+    audit(req, { action: 'web.proxies.set', target: domain, args: { count: spec.proxies.length, ports: spec.proxies.map((p) => p.port) } });
     return result;
   }
 
@@ -1990,7 +2004,7 @@ export function createServiceConfigService(ctx) {
 
   return {
     detect, status, apache, logrotate, webdisk, webservices, exim, mailserver, ftp, nameserver, certs,
-    ensureVhost, syncAccount: ensureVhost, removeAccount, applySsl, removeSsl, setRedirects, addAlias, removeAlias, setAccountIpv6, replaceIp, setPhpVersion, writePhpPool, setListenPorts,
+    ensureVhost, syncAccount: ensureVhost, removeAccount, applySsl, removeSsl, setRedirects, setProxies, addAlias, removeAlias, setAccountIpv6, replaceIp, setPhpVersion, writePhpPool, setListenPorts,
     reload: (req) => apache.reload(req), restart: (req) => apache.restart(req), configtest: () => op('web.configtest'),
     vhostFor: (domain) => shapeVhost(stmts.vhostByDomain.get(domain)) ?? null, syncAllJob, removeVhost, vhostsForAccount,
     vhostsUsingPhp: (version) => stmts.vhostsUsingPhp.get(version).n,

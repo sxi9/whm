@@ -34,7 +34,8 @@ export function createAuthService(ctx) {
   // read lazily with safe defaults.
   const defaults = () => ({
     verifiedIpLogin: false, passwordMaxAgeDays: 0, require2faForRoot: Boolean(settings.get('security.2fa.required_for_root')),
-    require2faForResellers: false, sessionTimeoutMinutes: 0, disallowConcurrentSessions: false, apiTokensRequire2fa: false,
+    require2faForResellers: false, require2faForUsers: Boolean(settings.get('security.2fa.required_for_users')),
+    sessionTimeoutMinutes: 0, disallowConcurrentSessions: false, apiTokensRequire2fa: false,
   });
   function policy() {
     try { return { ...defaults(), ...(ctx.security?.policy?.() || {}) }; } catch { return defaults(); }
@@ -108,7 +109,7 @@ export function createAuthService(ctx) {
     throw err;
   }
 
-  const needsEnrollment = (user, p) => !user.totp_enabled && ((user.role === 'root' && p.require2faForRoot) || (user.role === 'reseller' && p.require2faForResellers));
+  const needsEnrollment = (user, p) => !user.totp_enabled && ((user.role === 'root' && p.require2faForRoot) || (user.role === 'reseller' && p.require2faForResellers) || (user.role === 'user' && p.require2faForUsers));
 
   const isNewAddress = (user, ip, p) => Boolean(p.verifiedIpLogin && user.last_login_ip && user.last_login_ip !== ip && !stmts.knownIp.get(user.username, ip, KNOWN_IP_WINDOW));
 

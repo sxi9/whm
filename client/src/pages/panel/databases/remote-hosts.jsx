@@ -11,10 +11,12 @@ import { PanelPage, PanelCapabilityState, FeatureDisabledState, PendingPill } fr
 import { usePanelApi, usePanelMe, panelApi } from '../../../panel/hooks/usePanel.js';
 import { RequestError, InfoNote, isCapabilityError, isFeatureDisabled } from './parts/shared.jsx';
 
-const HOST_RE = /^[A-Za-z0-9.%:_-]{1,255}$/;
+// The CIDR suffix is for PostgreSQL (a pg_hba.conf network, contract §67).
+const HOST_RE = /^[A-Za-z0-9.%:_-]{1,255}(\/\d{1,3})?$/;
 
 export function describeHost(host, t = untranslated) {
   if (host === '%') return t('panel.databases.host_any', 'any host');
+  if (host.includes('/')) return t('panel.databases.host_network', 'network');
   if (host.includes('%') || host.includes('_')) return t('panel.databases.host_pattern', 'pattern');
   if (/^[0-9.]+$/.test(host) || host.includes(':')) return t('panel.databases.host_ip', 'IP address');
   return t('panel.databases.host_name', 'host name');
@@ -32,13 +34,14 @@ export default function RemoteHosts({ fn }) {
   const [lastResult, setLastResult] = useState(null);
   const capability = isCapabilityError(error);
   const unsupported = meta && meta.supported === false;
+  const isPg = meta?.engine === 'postgres';
 
   if (isFeatureDisabled(error)) return <PanelPage fn={fn}><FeatureDisabledState fn={fn} /></PanelPage>;
 
   const add = async (e) => {
     e.preventDefault();
     const value = host.trim();
-    if (!HOST_RE.test(value)) { setFormError({ message: t('panel.databases.host_invalid', 'Enter a host name, an IP address or a pattern with %'), fields: { host: [t('panel.databases.host_invalid_chars', 'Letters, digits, dots, colons, "_", "-" and "%" only')] } }); return; }
+    if (!HOST_RE.test(value)) { setFormError({ message: t('panel.databases.host_invalid', 'Enter a host name, an IP address or a pattern with %'), fields: { host: [isPg ? t('panel.databases.host_invalid_chars_pg', 'An IP address, a network such as 203.0.113.0/24, a host name or a pattern such as 203.0.113.%') : t('panel.databases.host_invalid_chars', 'Letters, digits, dots, colons, "_", "-" and "%" only')] } }); return; }
     setBusy(true); setFormError(null);
     try {
       const { data: res } = await panelApi.post('/databases/access-hosts', { host: value });
@@ -65,11 +68,11 @@ export default function RemoteHosts({ fn }) {
             <PanelCapabilityState error={isCapabilityError(formError) ? formError : null} />
             <RequestError error={formError} />
             {unsupported ? (
-              <EmptyState icon={Globe} title={t('panel.databases.host_pg_title', 'Not available for PostgreSQL')}><p>{t('panel.databases.host_pg_text', 'Remote access rules apply to MySQL and MariaDB. Ask your hosting provider if you need external access to a PostgreSQL database.')}</p></EmptyState>
+              <EmptyState icon={Globe} title={t('panel.databases.host_pg_title', 'Not available for this PostgreSQL server')}><p>{t('panel.databases.host_pg_text', 'Remote access rules are written on the database server itself, and your PostgreSQL server runs on another machine. Ask your hosting provider if you need external access to a PostgreSQL database.')}</p></EmptyState>
             ) : (
               <>
-                <Field label={t('panel.databases.host_label', 'Host name or IP address')} required error={formError?.fields?.host} help={<>{t('panel.databases.host_help_use', 'Use')} <code>%</code> {t('panel.databases.host_help_wildcard', 'as a wildcard, for example')} <code>203.0.113.%</code> {t('panel.databases.host_help_network', 'for a whole network.')} <code>%</code> {t('panel.databases.host_help_alone', 'alone allows every host and is not recommended.')}</>} htmlFor="rh-host">
-                  <TextInput id="rh-host" value={host} onChange={setHost} placeholder="203.0.113.5 or office.example.com" autoCapitalize="none" spellCheck={false} />
+                <Field label={t('panel.databases.host_label', 'Host name or IP address')} required error={formError?.fields?.host} help={isPg ? <>{t('panel.databases.host_help_pg_before', 'An IP address, a network such as')} <code>203.0.113.0/24</code> {t('panel.databases.host_help_pg_or', 'or')} <code>203.0.113.%</code>{t('panel.databases.host_help_pg_after', ', or a host name. The rule names your databases and users on the server (pg_hba.conf) and is updated when you add or remove them.')} <code>%</code> {t('panel.databases.host_help_alone', 'alone allows every host and is not recommended.')}</> : <>{t('panel.databases.host_help_use', 'Use')} <code>%</code> {t('panel.databases.host_help_wildcard', 'as a wildcard, for example')} <code>203.0.113.%</code> {t('panel.databases.host_help_network', 'for a whole network.')} <code>%</code> {t('panel.databases.host_help_alone', 'alone allows every host and is not recommended.')}</>} htmlFor="rh-host">
+                  <TextInput id="rh-host" value={host} onChange={setHost} placeholder={isPg ? '203.0.113.5, 203.0.113.0/24 or office.example.com' : '203.0.113.5 or office.example.com'} autoCapitalize="none" spellCheck={false} />
                 </Field>
                 <FormActions>
                   <Button type="submit" variant="primary" icon={Plus} loading={busy} disabled={!host.trim()}>{t('panel.databases.host_allow_button', 'Allow host')}</Button>
@@ -82,7 +85,7 @@ export default function RemoteHosts({ fn }) {
         <Card title={t('panel.databases.connect_title', 'Connecting from outside')} subtitle={t('panel.databases.connect_subtitle', 'What to enter in a database client or an application running elsewhere.')}>
           <KeyValue items={[
             [t('panel.databases.connect_server', 'Server'), <code key="h">{me?.hostname || me?.account?.domain || '—'}</code>],
-            [t('panel.databases.connect_port', 'Port'), <code key="p">3306</code>],
+            [t('panel.databases.connect_port', 'Port'), <code key="p">{isPg ? 5432 : 3306}</code>],
             [t('panel.databases.connect_user', 'User'), t('panel.databases.connect_user_value', 'A database user of this account')],
             [t('panel.databases.connect_password', 'Password'), t('panel.databases.connect_password_value', 'That user\'s password')],
             [t('panel.databases.connect_database', 'Database'), <code key="d">{`${me?.account?.username || 'account'}_…`}</code>],
@@ -102,7 +105,7 @@ export default function RemoteHosts({ fn }) {
           ]}
           rows={data || []} loading={loading} error={capability ? null : error} rowKey={(r) => r.id}
           rowActions={(r) => [r.editable ? { label: t('panel.databases.remove', 'Remove'), primary: true, danger: true, onClick: () => remove(r) } : null]}
-          emptyText={capability ? t('panel.databases.hosts_empty_capability', 'Allowed hosts appear here once the database server is available.') : unsupported ? t('panel.databases.hosts_empty_pg', 'Remote hosts do not apply to PostgreSQL.') : t('panel.databases.hosts_empty', 'No remote host is allowed yet. Only this server can reach your databases; add an address above to connect from elsewhere.')}
+          emptyText={capability ? t('panel.databases.hosts_empty_capability', 'Allowed hosts appear here once the database server is available.') : unsupported ? t('panel.databases.hosts_empty_pg', 'Remote hosts cannot be managed for a PostgreSQL server on another machine.') : t('panel.databases.hosts_empty', 'No remote host is allowed yet. Only this server can reach your databases; add an address above to connect from elsewhere.')}
         />
         {data?.some((r) => r.scope === 'global') && <div className="card-body"><InfoNote>{t('panel.databases.hosts_global_note', 'Server-wide hosts were allowed by your hosting provider for every account and cannot be removed here.')}</InfoNote></div>}
       </Card>

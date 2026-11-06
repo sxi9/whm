@@ -39,6 +39,7 @@ export const DEFAULT_SETTINGS = {
   'security.cphulk.max_failures_per_ip': 15,
   'security.cphulk.lockout_minutes': 30,
   'security.2fa.required_for_root': false,
+  'security.2fa.required_for_users': false,
   'backup.enabled': false,
   'backup.schedule': '0 2 * * *',
   'backup.retention_daily': 7,
@@ -77,7 +78,7 @@ export const DEFAULT_FEATURES = {
   autossl: true, phpversion: true, multiphp: true, webdisk: true, api: true, passwordchange: true,
   hotlink: true, leechprotect: true, indexmanager: true, errpgs: true, redirects: true, cpanelpro_support: false,
   ipblocker: true, dirprivacy: true, webstats: true, wordpress: true, ddns: true, virusscan: true, traceroute: true, optimizews: true, plugins: true,
-  dbwizard: true,
+  dbwizard: true, gitversioncontrol: true, applicationmanager: true,
 };
 
 export async function seed({ db, config, crypto, logger }) {

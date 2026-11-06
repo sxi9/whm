@@ -341,10 +341,13 @@ export function createPanelService(ctx) {
   // routes/categories/panel.js passes the request path so /me and the enrolment
   // routes stay reachable; the core password seam passes none. Administrators
   // acting as the account answer to the console's own policy, not this one.
+  // Either switch enforces: the panel's own or the core policy
+  // security.2fa.required_for_users (which also flags the login session).
   const TWO_FACTOR_OPEN = (p) => p === '/me' || p.startsWith('/security/two-factor');
+  const twoFactorRequired = () => Boolean(settings.get('panel.require_2fa_for_users')) || Boolean(settings.get('security.2fa.required_for_users'));
   function assertTwoFactor(user, path = null) {
     if (!user || user.role !== 'user' || user.totp_enabled) return;
-    if (!settings.get('panel.require_2fa_for_users')) return;
+    if (!twoFactorRequired()) return;
     if (path != null && TWO_FACTOR_OPEN(path)) return;
     throw new HttpError(403, 'two_factor_required', 'Two-factor authentication is required for your account. Set it up to continue.');
   }
@@ -417,7 +420,8 @@ export function createPanelService(ctx) {
       usage: { diskUsedMb: a.disk_used_mb ?? 0, diskQuotaMb: a.disk_quota_mb ?? null, bandwidthUsedMb: a.bandwidth_used_mb ?? 0, bandwidthLimitMb: a.bandwidth_limit_mb ?? null },
       counts: counts(a.id),
       actingAs: s.actingAs ? { account: a.username, by: s.actingAs.by, expiresAt: s.actingAs.expiresAt } : null,
-      policy: { require2fa: Boolean(settings.get('panel.require_2fa_for_users')), passwordSynced: Boolean(userRow && stmts.linkByUser.get(userRow.id)?.password_synced_at) },
+      policy: { require2fa: twoFactorRequired(), passwordSynced: Boolean(userRow && stmts.linkByUser.get(userRow.id)?.password_synced_at) },
+      mustEnroll2fa: Boolean(req.session?.mustEnroll2fa) || (s.mode === 'user' && Boolean(userRow) && !userRow.totp_enabled && twoFactorRequired()),
       hostname: settings.get('basic.hostname'),
       csrfToken: req.auth?.via === 'session' && req.session ? issueCsrfToken(req, crypto) : null,
     };
@@ -704,7 +708,7 @@ export function createPanelService(ctx) {
     stmts.clearTotp.run(row.id);
     ctx.sessionStore?.destroyUserSessions?.(row.id);
     audit(req, { action: 'panel.admin.2fa.reset', target: username, args: { userId: row.id, wasEnabled } });
-    return { username, totpEnabled: false, wasEnabled, enrollmentRequired: Boolean(settings.get('panel.require_2fa_for_users')) };
+    return { username, totpEnabled: false, wasEnabled, enrollmentRequired: twoFactorRequired() };
   }
 
   // Root's answer to a 409 domain_stale: the mail rows and host files of
@@ -795,6 +799,8 @@ export function createPanelService(ctx) {
       const raw = Object.fromEntries(SETTING_KEYS.map((k) => [k, settings.get(k)]));
       return {
         enabled: raw['panel.enabled'] !== false, require2faForUsers: Boolean(raw['panel.require_2fa_for_users']),
+        // The core login policy (Security Center › Two-Factor Authentication) enforces the same thing.
+        coreRequire2faForUsers: Boolean(settings.get('security.2fa.required_for_users')),
         loginAsTtlMinutes: ttlMinutes(), loginAsAcl: loginAsAclKey(), webmailUrl: String(raw['panel.webmail_url'] || ''),
         uploadChunkBytes: Number(raw['panel.upload_chunk_bytes']) || 1310720,
         // What switching require2faForUsers on will force at next login.

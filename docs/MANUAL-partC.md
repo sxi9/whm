@@ -151,11 +151,14 @@ SSH, like any panel-side change.
 - **Two-factor authentication** is TOTP, enrolled on *Security › Two-factor authentication* (the
   same enrolment the console uses: secret and QR code, then a 6-digit code to confirm). Once
   enabled, the login page asks for the code after the password. The console policies that *force*
-  enrolment (`required_for_root`, `require_2fa_for_resellers`) never apply to account users;
-  instead the operator can turn on the panel setting **Require 2FA for account users**
-  (`panel.require_2fa_for_users`). While it is on and the login has no authenticator, every panel
-  request except `/me` and the two-factor pages answers `403 two_factor_required` and the shell
-  redirects to the enrolment page; disabling 2FA is refused.
+  enrolment for root and resellers (`required_for_root`, `require_2fa_for_resellers`) do not apply to
+  account users; two switches do, and either is enough: the core policy **Require two-factor
+  authentication for account users** (`security.2fa.required_for_users`, *Security Center › Two-Factor
+  Authentication* or *Configure Security Policies*) and the panel setting **Require 2FA for account
+  users** (`panel.require_2fa_for_users`, *Panel › Customization › Account panel*). While one is on and
+  the login has no authenticator, the sign-in answer carries `mustEnroll2fa`, every panel request except
+  `/me` and the two-factor pages answers `403 two_factor_required` and the shell redirects to the
+  enrolment page; disabling 2FA is refused on the panel route and on the console's.
 - **Lost authenticator.** The provider resets it from the console: *List Accounts › Reset 2FA*
   (`POST /api/panel/admin/accounts/:username/2fa/reset`, root or the owning reseller, audited
   `panel.admin.2fa.reset`). The secret is dropped and every session of the login ends; the customer
@@ -176,7 +179,7 @@ the account is loaded, and applies the account's state before any page logic:
 | `accounts.suspended = 1` | `423 account_suspended` on every request (also for an administrator who is viewing the account). | *This account is suspended* |
 | `accounts.demo_mode = 1` (*Account Functions › Manage Demo Mode*) | every non-GET request answers `403 demo_mode`; pages still load. | *Demo mode — this account is read-only* |
 | `accounts.force_password_change = 1` or `users.must_change_password = 1` | only `/me` and `/security/password` pass (`403 password_change_required`). | *A new password is required* |
-| `panel.require_2fa_for_users` and no authenticator | only `/me` and `/security/two-factor*` pass (`403 two_factor_required`). | redirect to the enrolment page |
+| `panel.require_2fa_for_users` or `security.2fa.required_for_users` and no authenticator | only `/me` and `/security/two-factor*` pass (`403 two_factor_required`); `/me` reports `mustEnroll2fa`. | redirect to the enrolment page |
 
 ## C.5 "Log in as": when an administrator views your account
 
@@ -687,6 +690,59 @@ hand-edited lines inside the markers), `POST /files/htaccess/probe { path }` run
   hides listings unless a folder above turned them on; neither screen needs the `filemanager`
   feature (their routes sit ahead of that gate).
 
+#### 5.5 Git version control
+
+- **Purpose:** keep git repositories in your account (`~/repositories/<name>` by default, or any
+  folder under your home), pull the latest commit from their remote and deploy their files into a
+  website folder with a `.keel.yml` task list.
+- **Who:** feature `gitversioncontrol`; also while acting. No token scope: the list and the detail
+  are readable with `panel:read`, every change is a browser-session action. The server needs `git`.
+- **Screen:** *Your repositories* (name, folder, remote, last pull, last deploy, state) with *Open*,
+  *Pull*, *Deploy*, *Forget* (drop the entry, keep the folder) and *Remove* (delete the folder).
+  *New repository* asks for a name, an optional clone URL (empty = an empty repository), an optional
+  folder and *Use the existing folder* to adopt a repository you uploaded or cloned by hand; folders
+  already holding a repository under `~/repositories` are pointed out below the list. The detail
+  card shows the branch, latest commit, remotes, the number of uncommitted files, whether
+  `.keel.yml` was found, and links to the file manager; *Check tasks* runs the deployment as a dry
+  run and shows the plan. A live log follows each clone, pull and deployment. The *Deployment
+  guide* card carries the `.keel.yml` example.
+- **Server:** `GET /git` → `{ data: [{ id, name, dir, url, createdAt, lastPullAt, lastDeployAt,
+  present }], meta: { total, max, defaultRoot, unregistered } }`; `POST /git { name, dir?, url?,
+  adopt? }` → `201 { …row, info }` for an empty or adopted repository, `202 { job, name, dir, url }`
+  for a clone; `GET /git/:id` → `{ …row, info: { branch, head, remotes, dirty, lastPullAt,
+  hasKeelYml } | null, missing }`; `POST /git/:id/pull` and `POST /git/:id/deploy { dryRun? }` →
+  `202 { job }`; `GET /git/jobs/:id[/stream]`; `DELETE /git/:id?confirm=true&files=true|false`.
+  Names are `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` (no `.git` ending), folders home-relative without
+  `..`, at most 50 repositories, and no folder may sit inside or hold another registered one. Every
+  git command runs as your account (`git.init/clone/list/info/pull/deploy/remove`) with
+  `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`, `protocol.allow=never` except https and ssh,
+  and ssh in batch mode: a repository that asks for a password fails at once. Clone URLs are
+  `https://host/path`, `ssh://git@host/path` or `git@host:path` only — `file:`, `ext::`, `http://`
+  and any user name or password in the URL answer `422`. Pull is `git pull --ff-only` (a diverged
+  branch is refused, nothing is rebased or merged). Deploy reads `.keel.yml` (regular file, 64 KiB):
+
+  ```yaml
+  deployment:
+    tasks:
+      - mkdir -p ~/public_html/site
+      - rsync -a --delete dist/ ~/public_html/site/
+      - chmod 644 ~/public_html/site/index.html
+  ```
+
+  Each task is one of `cp`, `rsync`, `mkdir`, `rm`, `chmod` with options from a short list
+  (`cp -r -R -p -a -f -v -n -u -T`, `rsync -a -r -v -q -z -u -c --delete --delete-after --exclude=`,
+  `mkdir -p -v`, `rm -r -R -f -v`, `chmod -R -v` and a plain or symbolic mode without setuid/setgid)
+  and paths that stay inside your home: relative to the repository, `~/` for your home, or
+  absolute under your home. No shell is involved (`$`, backticks, `;`, `|`, `&`, `<`, `>` refuse
+  the task), tasks run one by one as your account from the repository folder, and the first
+  failing task stops the deployment. Audit `panel.git.init|adopt|clone(.done|.failed)|pull(.done|
+  .failed)|deploy(.done|.failed)|remove`.
+- **Gotchas:** private repositories need an `ssh://` URL and a deploy key in `~/.ssh` (SSH keys
+  page); the panel stores no credentials and never prompts. `Remove` deletes the repository folder
+  only — files a deployment copied into `public_html` stay. A repository whose folder disappeared
+  shows *folder missing*; *Forget* clears it. The clone takes at most 15 minutes, a pull or a
+  deployment 10. Without `git` on the server the page answers `501`.
+
 ## 6. Email
 
 Routes under `/email` (`services/panel-email.js`); agent ops `vmail.*` (capabilities `dovecot`
@@ -1041,13 +1097,20 @@ prefix when it is missing, regardless of the console's `db.prefixing` setting.
 #### 7.3 Remote hosts
 
 - **Purpose:** hosts allowed to connect to your databases from outside.
-- **Who:** feature `mysql`; also while acting.
+- **Who:** feature `mysql` (`postgres` on a PostgreSQL server); also while acting.
 - **Screen:** the server-wide hosts (read-only) and yours; **Add** *Host* (name, IP or `%`
-  pattern); *Remove* on your own rows.
+  pattern; on PostgreSQL also a network such as `203.0.113.0/24`); *Remove* on your own rows. The
+  connection card shows port `3306` or `5432` for the server's engine.
 - **Server:** `GET/POST /databases/access-hosts`, `DELETE /databases/access-hosts/:id` → *Database
   Services › Additional MySQL Access Hosts* with the account pinned.
-- **Gotchas:** PostgreSQL profiles have no remote hosts here (`422 unsupported`; the list says
-  `supported: false`).
+- **PostgreSQL:** the rule is a block in the server's `pg_hba.conf` that names your databases and
+  users explicitly (`scram-sha-256`); it is rewritten when you add or remove a database or a user, so a
+  new database is reachable from your allowed hosts without touching this page. `%` alone means every
+  address (`all`); `203.0.113.%` becomes `203.0.113.0/24`; a `%` or `_` inside a name cannot be expressed
+  and is refused (`400`). Connections from outside also need the server's `listen_addresses` and
+  firewall to accept port 5432 — ask your hosting provider.
+- **Gotchas:** a PostgreSQL server on another machine has no remote hosts here (`422 unsupported`;
+  the list says `supported: false`).
 
 #### 7.4 phpMyAdmin
 
@@ -1317,6 +1380,8 @@ Routes under `/security` and `/tokens`. Mutations here are **session-only** (an 
   every scoped request and by the core password seam (`/api/auth/password`).
 - **Gotchas:** *Disable* answers `403` while the operator requires 2FA for account users. The
   console's own enrolment page (*Security Center › Two-Factor Authentication*) shows the same QR code.
+  *Required by policy* means either the panel switch or the core policy
+  `security.2fa.required_for_users` is on ([C.3](#c3-password-and-two-factor-rules)).
 
 #### 13.3 SSH keys
 
@@ -1566,6 +1631,49 @@ group, so installs, updates and removals are session-only; the list is readable 
 - **Gotchas:** a plugin that is disabled by the administrator disappears at once (`404` on its pages);
   API tokens may read the catalog with `panel:read` but a form submission is a browser-session action.
 
+#### 16.3 Application manager
+
+- **Purpose:** run a Node.js or Python program of your own as a service that starts with the server,
+  restarts after a crash and is reachable on a path of one of your domains (for example
+  `https://example.com/app/`).
+- **Who:** feature `applicationmanager`; also while acting.
+- **Screen:** *Add an application* — name (lowercase letters, digits, `-`), type (Node.js or Python),
+  the folder under your home directory that holds the program (`apps/my-app`), the start file inside
+  it (`server.js`, `app.py`), the runtime (every Node.js build and Python version the server has; the
+  list comes from the host), the domain and path, a *WebSockets* switch and `KEY=value` environment
+  variables. *Your applications* lists each app with its runtime, address, port and live state
+  (running / stopped / failed, with PID and memory); row actions **Start** / **Stop**, **Restart**,
+  **Logs** (the newest journal lines), **Install dependencies** (`npm install --omit=dev`, or a `.venv`
+  plus `pip install -r requirements.txt`, with a live log), **Edit** (saving rewrites and restarts the
+  service) and **Remove**.
+- **How it works:** upload the program first (file manager, FTP or Git). Your program must listen on
+  the port in the `PORT` environment variable (`process.env.PORT`, `os.environ["PORT"]`) on
+  `127.0.0.1`; the panel assigns the port (31000–31999 by default, one per app on the whole server)
+  and the web server forwards `https://<domain><path>/` to it, WebSockets included when the switch is
+  on. The service runs as your own account inside your home directory only (read-only elsewhere,
+  private `/tmp`), so it can read and write your files and nothing else. Relative links inside the app
+  work because `/path` is redirected to `/path/`; an app mounted at `/` takes the whole site (PHP files
+  of that domain are no longer served).
+- **Server:** `GET /apps` → `{ data: [{ id, name, type, dir, entry, runtime, port, domain, mount,
+  websocket, env, status, error, unit, url, service }], meta: { sites, portRange, apache, limit } }`;
+  `GET /apps/runtimes`; `POST /apps { name, type, dir, entry, runtime?, domain?, mount?, websocket?, env? }`
+  → `201`; `PUT /apps/:id` (any of `dir, entry, runtime, domain, mount, websocket, env`); `DELETE
+  /apps/:id?confirm=true`; `POST /apps/:id/start|stop|restart`; `POST /apps/:id/deps` → `202 { job }`;
+  `GET /apps/:id/logs?lines=`; `GET /apps/jobs/:id[/stream]`. The service unit is
+  `keel-app-<account>.<name>` (file under `/etc/whm/apps/<account>/`, written from a fixed template as
+  root, run as you); the proxy is part of the domain's virtual host. Audit `panel.apps.create` /
+  `update` / `remove` / `start` / `stop` / `restart` / `deps`; variable values never appear in the audit.
+- **Operators:** `panel.app_port_range` (`[min, max]`, default `[31000, 31999]`) sets the pool; a plan key
+  `app_memory_mb` becomes `MemoryMax=` of every unit of that plan, `max_apps` caps the count. The panel
+  enables Apache's `proxy`, `proxy_http`, `proxy_wstunnel` and `rewrite` modules itself (`a2enmod`, audited as
+  `web.modules.enable`) the first time an app is published; install `python3-venv` for Python apps and
+  Node.js builds through *Software › Install Software*. Removing an app never deletes its files.
+- **Gotchas:** the folder and the start file must exist before you add the app (`404` otherwise); a
+  name, or a domain-and-path, can be used once (`409`); `PORT`, `HOME`, `USER`, `LOGNAME` and `PATH`
+  cannot be set by hand (`422`); when your program exits the service restarts it after 3 s and the
+  state shows *failed* — read **Logs**; an app that does not answer gives visitors a `503` from the web
+  server; without Apache on the host the page says so and `POST` answers `501`.
+
 ---
 
 ## C.9 Administering the account panel
@@ -1583,7 +1691,7 @@ as history* table ([C.9.4](#c94-login-as-history)). The API is `GET/PUT /api/pan
 | Field (setting key) | Meaning |
 |---|---|
 | `enabled` (`panel.enabled`, default `true`) | Off: every `/api/panel/*` request except this one answers `403 panel_disabled` and `/panel` shows *The account panel is switched off*. Account logins are still created and kept in sync, so turning it on later needs no backfill. |
-| `require2faForUsers` (`panel.require_2fa_for_users`, default `false`) | Force account users to enrol an authenticator before using the panel ([C.3](#c3-password-and-two-factor-rules)); also blocks them from disabling it. The answer carries `linkedUsers` and `usersWithoutTotp` (how many logins the switch will send to the enrolment page), the card shows the count under the toggle, and *Security Center › Security Advisor* lists the policy as `panel.2fa.policy` ("Account panel users: two-factor required/optional (N linked users without an authenticator)"). |
+| `require2faForUsers` (`panel.require_2fa_for_users`, default `false`) | Force account users to enrol an authenticator before using the panel ([C.3](#c3-password-and-two-factor-rules)); also blocks them from disabling it. The answer carries `linkedUsers` and `usersWithoutTotp` (how many logins the switch will send to the enrolment page), the card shows the count under the toggle, and *Security Center › Security Advisor* lists the policy as `panel.2fa.policy` ("Account panel users: two-factor required/optional (N linked users without an authenticator)"). The core login policy `security.2fa.required_for_users` (*Security Center › Two-Factor Authentication*) enforces the same rule; the answer reports it as the read-only `coreRequire2faForUsers`, the card says so under the toggle, and the advisor line reads *required* when either switch is on. |
 | `loginAsTtlMinutes` (`panel.login_as_ttl_minutes`, default 60, 5–480) | How long a "Log in as" context lasts. |
 | `webmailUrl` (`panel.webmail_url`, default empty) | An `http(s)` URL shown as the webmail link and in client settings; empty means the webmail published under the hostname site (or otherwise detected, [6.7](#67-webmail)). |
 

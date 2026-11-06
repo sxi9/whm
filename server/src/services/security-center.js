@@ -907,6 +907,7 @@ export function createSecurityCenterService(ctx) {
       passwordMaxAgeDays: Number(settings.get('security.policy.password_max_age_days')) || 0,
       require2faForRoot: Boolean(settings.get('security.2fa.required_for_root')),
       require2faForResellers: Boolean(settings.get('security.policy.require_2fa_for_resellers')),
+      require2faForUsers: Boolean(settings.get('security.2fa.required_for_users')),
       sessionTimeoutMinutes: Number(settings.get('security.policy.session_timeout_minutes')) || 0,
       disallowConcurrentSessions: Boolean(settings.get('security.policy.disallow_concurrent_sessions')),
       apiTokensRequire2fa: Boolean(settings.get('security.policy.api_tokens_require_2fa')),
@@ -1283,7 +1284,8 @@ export function createSecurityCenterService(ctx) {
         const panel = ctx.panel?.settings?.get?.();
         if (panel?.enabled) {
           const n = panel.usersWithoutTotp ?? 0;
-          add({ id: 'panel.2fa.policy', grade: panel.require2faForUsers ? 'ok' : 'info', title: `Account panel users: two-factor ${panel.require2faForUsers ? 'required' : 'optional'} (${n} linked user${n === 1 ? '' : 's'} without an authenticator)`, detail: panel.require2faForUsers ? `${n === 0 ? 'Every' : 'Each remaining'} account login must enrol an authenticator before using anything but the enrolment page.` : 'Account logins may sign in with a password alone. Requiring the second factor forces enrolment at their next login (Panel › Customization › Account panel).', fix: { label: 'Account panel settings', path: '/cpanel/customization' } });
+          const required = Boolean(panel.require2faForUsers || panel.coreRequire2faForUsers);
+          add({ id: 'panel.2fa.policy', grade: required ? 'ok' : 'info', title: `Account panel users: two-factor ${required ? 'required' : 'optional'} (${n} linked user${n === 1 ? '' : 's'} without an authenticator)`, detail: required ? `${n === 0 ? 'Every' : 'Each remaining'} account login must enrol an authenticator before using anything but the enrolment page.` : 'Account logins may sign in with a password alone. Requiring the second factor forces enrolment at their next login (Panel › Customization › Account panel, or the core policy under Security Center › Two-Factor Authentication).', fix: { label: 'Account panel settings', path: '/cpanel/customization' } });
         }
       });
 
