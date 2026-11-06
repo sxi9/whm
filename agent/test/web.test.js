@@ -761,7 +761,7 @@ describe('server hostname site: its own PHP-FPM pool (keel-host)', () => {
     // Its own allowed root, exact: /var/lib/whm is 0750 whmpanel and the pool user cannot traverse it.
     expect(() => ctx.assertAllowedPath('/var/lib/keel-host/tmp', 'write')).not.toThrow();
     expect(() => ctx.assertAllowedPath('/var/lib/keel-host-evil', 'write')).toThrow();
-    expect(() => ctx.assertAllowedPath('/var/lib/keel-host/../whm/x', 'write')).toThrow();
+    expect(() => ctx.assertAllowedPath('/var/lib/keel-host/../keel-host-evil/x', 'write')).toThrow();
     expect(hostPoolPath(debian)).toBe('/etc/php/8.3/fpm/pool.d/keel-host.conf');
     expect(hostPoolPath(keel)).toBe('/opt/keel/php/8.4/etc/php-fpm.d/keel-host.conf');
     expect(hostPoolSocket(debian)).toBe('/run/php/php8.3-fpm-keel-host.sock');

@@ -1014,7 +1014,8 @@ export function hostPoolPath(tree) {
 // Every tree that carries the host pool, newest PHP first; a shadowed distro
 // tree is listed (flagged) so its leftover pool can be dropped, never chosen.
 export function hostPools(layout = phpLayout(), io = { exists }) {
-  return [...layout.versions, ...(layout.shadowed || [])].reverse().filter((v) => io.exists(hostPoolPath(v))).map((v) => ({ version: v.version, flavor: v.flavor, path: hostPoolPath(v), socket: hostPoolSocket(v), units: v.units, ...(v.shadowed ? { shadowed: true } : {}) }));
+  // Live trees newest first, then the shadowed distro trees (cleanup only, never the handler socket).
+  return [...[...layout.versions].reverse(), ...(layout.shadowed || [])].filter((v) => io.exists(hostPoolPath(v))).map((v) => ({ version: v.version, flavor: v.flavor, path: hostPoolPath(v), socket: hostPoolSocket(v), units: v.units, ...(v.shadowed ? { shadowed: true } : {}) }));
 }
 export function hostPoolSocketOf(pools) {
   return pools.find((p) => !p.shadowed)?.socket ?? null;
