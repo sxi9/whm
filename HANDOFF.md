@@ -33,6 +33,7 @@ license + marketplace service with its own React portals (`hub/ui`) · zod 4 eve
 | **Phase 7 — identity** | done: default branding "Keel" (migration `028c`, operators change it under Panel › Customization), labels renamed with **stable keys/routes** via slug overrides in `client/src/nav.js`, i18n catalog, docs (README/INSTALL/MANUAL/SDK), server/agent/hub user-visible strings (legacy managed-block markers still recognised on upgraded hosts), support links, `keel@` sender, `KEEL-` ticket refs | `22001ff`…`643e0a6` |
 | hub/ui portals | on the new kit (`18fe699`; `hub/ui/src/components/SYNC.md`) | hub-ui suite |
 | **Provisioned-host verification** (`nova.hostingsignal.in`, Ubuntu 26.04, EC2) | **done 2026-11-04/05**: 10 probe areas (mail, FTP, MySQL, web/PHP/DNS, SSL, backups/cron/quota, admin API walk, account-panel API walk, security posture, log-derived bugs), 29 confirmed findings (1 refuted), each adversarially verified; every finding with a code component fixed in three rounds under two review lenses; host-side fixes applied (AutoSSL live, ManageSieve 2000 off, fail2ban jails, PureDB auth link, Cloudflare nameservers); the code fixes are **uncommitted and not yet deployed** — §4 lists the deploy and the remaining host steps | `server/test/{http-redirect,request-log,capabilities,services}.test.js`, `agent/test/pkg-backports.test.js`, `client/test/exim-virtual-mail.test.jsx`, extended panel-*/service-configuration/ssl-tls/security-center/vmail/ftp/db/files suites; `https://testuser.hostingsignal.in` serves a Let's Encrypt certificate |
+| **2026-11-06 session 4** | **done and live at `5e31107`**: phpMyAdmin access (§41.2), PHP updater (§52/§63), Phase 8 P5 (§71–§72, 034i), pool bookkeeping fix, sidebar/dashboard UI round | `server/test/{software,service-configuration,panel-webdisk,panel-installers}.test.js`, `agent/test/{web,pkg-runtime,webdisk,app-install,apps}.test.js`, `client/test/{install-software,panel-webdisk,panel-installers,home-collapse,panel-databases}.test.jsx` |
 | **2026-11-06 session 3** | **done and live at `a5d2d19`**: UI round (collapsing, menus, 332-screenshot sweep), direct updates + Updates column (§63), phpMyAdmin admin SSO (§44), Phase 8 P3 (§64–§67) and P4 (§68–§70), PHP removal guards + host-apps pool (§52/§41) | `client/test/{menu,home-collapse,home-updates,phpmyadmin-admin,panel-git,panel-apps,panel-terminal,panel-users,panel-calendars}.test.jsx`, `server/test/{panel-git,panel-apps,panel-terminal,panel-users,dav,auth-2fa-users}.test.js`, `agent/test/{git,apps,term,dav,pkg-runtime}.test.js` |
 | **2026-11-06 PHP source builds + Phase 8 P2** | **done and live on nova**: every catalog PHP version installable (source builds into `/opt/keel/php`, contracts §51/§52), and P2 — plugin pages in /panel, Database Wizard, Errors, Optimize/Hotlink, Track DNS, Dynamic DNS, Virus Scanner, raw-chunk uploads, a11y/wording, quota note, spam docs (contracts §53–§62, migration 034e); §4 "Phase 8 P2 host steps" | `agent/test/{pkg-runtime,ops-imports,dns-track,files-htaccess-web,sec-clamav-as}.test.js`, `server/test/panel-{plugins,ddns,virus,htaccess-web,logs-errors,dns-track}.test.js`, `client/test/panel-{a11y,database-wizard,ddns,dns-track,htaccess-web,logs-errors,upload-transport,usage-scan-note,virus,plugins}.test.jsx` |
 | **2026-11-06 software + ports** | **done and live on nova**: Install Software (one-click runtimes/tools, inline installs, contract §51), PHP Version Manager (§52, offered list, panel Set all domains), account panel on 2083/2082 with the admin shell on 2087/2086 (`middleware/shell.js`, `wrong_port` policy); §4 "2026-11-06" has the verification | `server/test/{software,panel-php,shell-ports}.test.js`, `agent/test/pkg-runtime.test.js`, `client/test/{install-software,panel-php,login-shell}.test.jsx` |
@@ -89,6 +90,39 @@ auth_username_format = %{user | lower} }` in the fragment); Debian's 2.4 `mail_i
 makes a virtual Maildir user try to create `/var/mail/<address>` (`userdb_mail_inbox_path` on every passwd line,
 re-key adds it); Debian's `pure-ftpd-wrapper` has no `CertFile` directive and refused to start (the combined PEM
 now goes to the compiled-in `/etc/ssl/private/pure-ftpd.pem`, only `conf/TLS` is written).
+
+### 2026-11-06 (session 4): phpMyAdmin access, PHP updater, Phase 8 P5, pool fix, UI round (deployed `5e31107`)
+
+- **Owner complaints closed.** phpMyAdmin "cannot be accessed": the hostname site's `keel-host` FPM pool kept PHP sessions under
+  `/var/lib/whm/keel-host` which the pool user cannot traverse (`/var/lib/whm` is 0750 `whmpanel`) — `session_start` failed and
+  the SSO looped. Hotfixed live, then codified: state dir `/var/lib/keel-host` (own allowed root; root-owned dir, pool-owned
+  `tmp` 0700 and `php-error.log` 0640, repaired by descriptor-only chown/chmod on every `web.host.pool.write`; contract §41.2),
+  signon script answers a clear 500 page when the session dir is unwritable; the legacy dir is left in place on nova (not
+  empty) — `sudo rm -r /var/lib/whm/keel-host` is safe now. The account panel's "Open phpMyAdmin" opened `window.open(url,
+  '_blank', 'noopener')`, which returns `null`, so the page navigated the main tab — fixed. "No PHP version updater": the
+  Updates column was there but a packaged minor with an advisory had nothing clickable; now the Keel build of a minor wins over
+  the distro tree (`packagedTwin`), the row offers *Security update · x.y.z from php.net* (source build + resync with `repool`,
+  `/usr/bin/php` relinked) or *Move domains to the Keel build*, and *Remove packages* drops the unused distro packages.
+- **Found by the acceptance:** `testuser.hostingsignal.in` answered 503 — its vhost proxied to `/run/keel-php/php8.4-fpm-testuser.sock`
+  while the 8.4 tree (rebuilt earlier that day) had no `whm-testuser.conf`; the `web_php_pools` row said `applied`, so
+  `ensurePool` never rewrote it. Fixed (`fs.stat` on the row's path before trusting it) and both accounts re-synced with
+  `POST /api/service-config/apache/vhosts/sync`. Any host whose Keel tree was rebuilt before `5e31107` needs that sync once.
+- **Phase 8 P5 host facts:** `rclone` 1.60 installed by the first Web Disk enable (job); `a2enmod proxy proxy_http headers` by
+  the panel; migration 034i applied by `install.sh --upgrade`. Web Disk writes land after rclone's VFS write-back (a few
+  seconds; `--vfs-cache-mode writes`), MOVE/COPY work through the proxy (`ProxyPreserveHost`). Joomla 6.2.0 needs PHP ≥ 8.3
+  (catalog enforces it); Drupal has no non-interactive MySQL installer without Composer, so the page hands over to
+  `core/install.php` with the database pre-configured. Release pins are a static table in `agent/src/ops/app-install.js`
+  (bump = edit the table with the new sha256).
+- **Acceptance on nova (keel-ops → Log in as testuser):** Web Disk enable (rclone install job) → PROPFIND 207, wrong password
+  401, PUT 201 → `/home/testuser/probe-webdisk.txt` owned by testuser, MKCOL 201, MOVE 201, DELETE 204, `.ssh`/`.keel` 404,
+  disable → 405 and unit inactive. Joomla at `/probe-joomla` (configuration.php 0640, database `testuser_joomla`) and Drupal at
+  `/probe-drupal` (settings.php 0640, installer link) installed and removed with their databases; the Joomla/Drupal HTTP GETs
+  during the run answered 503 because of the pool defect above (resolved afterwards; the site serves PHP 8.4.27 again). PHP
+  8.5 row (Keel 8.5.12 over distro 8.5.4) offered *Move domains to the Keel build*, the job finished, catalog clean.
+  the sidebar reopens after collapse (the aside's backdrop-filter had trapped the fixed expand button inside the zero-width aside; the expand control now lives outside it — floating bottom-left and in the top bar beside the brand — and the aside slides width/opacity both ways with focus handed over), Home / panel Home sections and both sidebars' category lists animate open and closed (`components/Collapse.jsx`, grid-rows transition, closed content inert, reduced motion honoured), dashboard tool cards carry a 38 px coloured icon tile with 15 px titles and 13 px descriptions on a wider grid. Verified in a real browser on nova (both shells): collapse → width 0, floating and top-bar expand buttons outside the aside, reopen from either, state persists over reload; section close → rows 0px, inert, hidden; reopen settled; phone drawer unaffected; dark mode checked.
+- **Gate on the host clone at the deploy:** server 1800 (+1 host-env, ClamAV present) / client 656 / agent 913 (+4 host-env) / hub 186 / hub-ui 105 / SDK green / build green. Known host-environment cases unchanged.
+- **Deferred:** mailing lists (mlmmj not packaged for this release); a stale `D:\claude\whm-p4` worktree folder remains on the
+  laptop (merged, no junctions) — remove with `git worktree remove` after checking for junctions.
 
 ### 2026-11-06 (session 3): UI round, direct updates, phpMyAdmin admin SSO, Phase 8 P3 + P4, PHP removal guards (deployed `a5d2d19`)
 

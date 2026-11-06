@@ -187,7 +187,41 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
-- **2026-11-06 (latest): dashboard/UX round, direct updates, phpMyAdmin SSO for admins, Phase 8 P3 + P4, PHP removal
+- **2026-11-06 (latest, session 4): phpMyAdmin access fixed, the PHP version updater, Phase 8 P5 (Web Disk, Joomla/Drupal
+  installers, one installer catalog), a pool-bookkeeping fix after a live 503, and the sidebar/dashboard UI round — deployed
+  to nova at `5e31107`.** Built as three workflow rounds (fix round for the two owner complaints, P5 in a detached worktree,
+  the UI round), each with review lenses and one fix round; gate on the host clone at the deploy: server 1800 (+1 host-env, ClamAV present) / client 656 / agent 913 (+4 host-env) / hub 186 / hub-ui 105 / SDK green / build green.
+  *phpMyAdmin:* the hostname site's `keel-host` pool kept its sessions under `/var/lib/whm` (0750 `whmpanel`, so the pool user
+  could not open them → `session_start` failed and the sign-on looped); the state dir is now `/var/lib/keel-host` (its own
+  allowed root, root-owned dir with pool-owned `tmp`/`php-error.log`, repaired on every pool write through descriptors only,
+  contract §41.2), and the signon script explains a missing session dir instead of looping; the account panel's "Open
+  phpMyAdmin" popup no longer navigates the main tab (`window.open` with `noopener` returns null — the opener is cleared by
+  hand). Verified in a real browser: admin sign-on and account sign-on land on phpMyAdmin.
+  *PHP updater:* a Keel build of a minor now wins over the distribution tree of the same minor (`preferKeelBuilds`, the entry
+  reports the packages as `packagedTwin`; the shadowed distro tree is listed apart and its pool files dropped on write); a
+  packaged minor with an advisory no package fixes offers *Security update · x.y.z from php.net* (source build of the same
+  minor, then every domain on it and the hostname site are re-rendered with `repool`, `/usr/bin/php` relinked); a build never
+  moved onto offers *Move domains to the Keel build*; *Remove packages* drops the unused distro packages only (`POST
+  /api/software/php/remove { packages: true }`). Contracts §52/§63 amendments; Updates column widened. Verified on nova: the 8.5
+  row (Keel 8.5.12 over distro 8.5.4) offered the move, the job ran and the catalog reads up to date.
+  *Live 503 found by the acceptance and fixed:* testuser's vhost pointed at a Keel 8.4 socket whose pool file no longer existed
+  (the 8.4 tree had been wiped and rebuilt while the `web_php_pools` row stayed `applied`); `ensurePool` now trusts an applied
+  row only while its file exists (`fs.stat`) and rewrites it otherwise; both accounts re-synced on nova (`POST
+  /api/service-config/apache/vhosts/sync`), testuser serves PHP 8.4.27 again.
+  *Phase 8 P5 (contracts §71–§72, migration 034i):* Web Disk — one `rclone serve webdav` daemon per account **as the account**
+  (`keel-webdisk-<user>` hardened unit from the shared `agent/src/ops/unit-helpers.js`, bcrypt htpasswd in `~/.keel`, `~/.ssh`
+  and `~/.keel` excluded, loopback port from the apps pool, published as `/webdisk/<user>/` under the hostname site with the
+  prefix kept upstream and `ProxyPreserveHost`, rewritten on Rearrange, removed on termination; Files › Web Disk with client
+  setup for Windows/macOS/iOS/Android/Linux; admin Web Disk Configuration lists the disks); Joomla 6.2.0 and Drupal 11.4.11
+  installers (releases pinned with their SHA-256 in `agent/src/ops/app-install.js`, fetched by root, verified, unpacked as the
+  account with symlink/traversal refusal; Joomla finished by its CLI installer with passwords on stdin, Drupal by a pre-written
+  `settings.php` and the web installer link; compensation on failure); one installer catalog page with WordPress as a tab.
+  Verified on nova as testuser: PROPFIND 207 / wrong password 401 / PUT lands owned by testuser after rclone's write-back /
+  MKCOL, MOVE, DELETE through the proxy / `.ssh` and `.keel` 404 / disable → 405; Joomla and Drupal installed with the pinned
+  checksums (configuration.php / settings.php 0640) and removed with their databases. rclone installed by the first enable.
+  *UI round (owner):* the sidebar reopens after collapse (the aside's backdrop-filter had trapped the fixed expand button inside the zero-width aside; the expand control now lives outside it — floating bottom-left and in the top bar beside the brand — and the aside slides width/opacity both ways with focus handed over), Home / panel Home sections and both sidebars' category lists animate open and closed (`components/Collapse.jsx`, grid-rows transition, closed content inert, reduced motion honoured), dashboard tool cards carry a 38 px coloured icon tile with 15 px titles and 13 px descriptions on a wider grid. Verified in a real browser on nova (both shells): collapse → width 0, floating and top-bar expand buttons outside the aside, reopen from either, state persists over reload; section close → rows 0px, inert, hidden; reopen settled; phone drawer unaffected; dark mode checked.
+  Known host-environment test cases unchanged (4 agent + 1 server + the Windows-only path cases).
+- **2026-11-06 (session 3): dashboard/UX round, direct updates, phpMyAdmin SSO for admins, Phase 8 P3 + P4, PHP removal
   guards — deployed to nova at `a5d2d19`.** Built as nine workflow rounds in one session (each with security + correctness
   lenses and one fix round; large units in detached worktrees merged afterwards — see the worktree rule in "Resume notes").
   *UI:* collapsible tool sections on Home / panel Home with Expand all / Collapse all (`hooks/useCollapsedSections.js`), the
@@ -503,6 +537,11 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   `cmd /c rmdir <junction>` before deleting the worktree — `git worktree remove --force` followed the junctions and emptied the
   main checkout's `client/node_modules` and `agent/node_modules` (restored with `npm install`). Never `git add -A` in the main
   checkout while a workflow is editing it: two commits in this session swept half-finished edits in.
+  It happened again in session 4: a bash loop mangled the `rmdir` path, the junctions stayed, and `git worktree remove --force`
+  emptied client/agent/server node_modules (restored with a root `npm install` after killing hung vitest processes that held
+  rollup's binary). Unlink from PowerShell with literal paths (`cmd /c 'rmdir D:\claude\whm-pN\client\node_modules'`), confirm no
+  ReparsePoint remains, `Remove-Item -Recurse` the folder, then `git worktree prune`. Hung agent vitest runs (the Windows hang)
+  keep node processes alive for hours — kill them before any npm install.
 - Working branch: `claude/kind-meitner-dlnbas` (push with `git push -u origin <branch>`). Phase 7 complete; the
   provisioned-host verification ran on the real host (2026-11-04/05) and its fixes sit uncommitted in the working tree —
   run the full gate, commit, then deploy with `scripts/install.sh --upgrade` and finish the host steps in `HANDOFF.md` §4.
