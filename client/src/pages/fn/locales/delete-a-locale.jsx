@@ -40,7 +40,7 @@ export default function DeleteALocale({ fn }) {
             { key: 'updated', label: 'Updated', render: (l) => <span className="small">{formatDate(l.updatedAt)}</span> },
           ]}
           rowActions={(l) => [
-            { label: 'Download XML first', onClick: () => navigate(`/locales/locale-xml-download?code=${l.code}`) },
+            { label: 'Download XML', primary: true, onClick: () => navigate(`/locales/locale-xml-download?code=${l.code}`) },
             { label: 'Delete', primary: true, danger: true, disabled: l.isDefault, onClick: () => remove(l) },
           ]} />
       </Card>

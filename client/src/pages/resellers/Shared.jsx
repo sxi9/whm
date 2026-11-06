@@ -28,7 +28,7 @@ export function ResellerPicker({ value, onChange, label = 'Reseller', help }) {
   return (
     <>
       <ErrorBanner error={error} onRetry={refetch} />
-      <Field label={label} help={help || (loading ? 'Loading resellers…' : `${resellers.length} reseller(s)`)}>
+      <Field label={label} help={help || (loading ? 'Loading resellers…' : resellers.length === 0 ? 'No resellers yet' : `${resellers.length} ${resellers.length === 1 ? 'reseller' : 'resellers'}`)}>
         <Select value={value} onChange={onChange} options={options} placeholder={resellers.length ? 'Select a reseller' : 'No resellers yet'} />
       </Field>
     </>

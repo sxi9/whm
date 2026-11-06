@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, KeyValue } from '../../../components/Common.jsx';
 import { Field, NumberInput, TextInput, Button, FormActions } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
-import { RequestError, ManagedFileNote } from '../../security/Shared.jsx';
+import { RequestError } from '../../security/Shared.jsx';
 
 export default function ShellForkBombProtection({ fn }) {
   const toast = useToast();
@@ -33,11 +34,15 @@ export default function ShellForkBombProtection({ fn }) {
       {data && draft && (
         <>
           <Card title="Status">
-            <KeyValue items={[['Protection', <StatusPill key="s" status={data.enabled ? 'enabled' : 'disabled'}>{data.enabled ? 'Enabled' : 'Disabled'}</StatusPill>], ['Mechanism', 'pam_limits (/etc/security/limits.d)']]} />
-            {!data.supported && <p className="muted">This host has no /etc/security/limits.d; PAM limits cannot be applied.</p>}
-            <ManagedFileNote path={data.path} />
+            <KeyValue items={[
+              ['Protection', <StatusPill key="s" status={data.enabled ? 'enabled' : 'disabled'}>{data.enabled ? 'Enabled' : 'Disabled'}</StatusPill>],
+              ['Mechanism', 'pam_limits (/etc/security/limits.d)'],
+              ['Supported', <StatusPill key="u" status={data.supported ? 'ok' : 'not-installed'}>{data.supported ? 'Yes' : 'No limits.d on this host'}</StatusPill>],
+              data.path && ['Managed file', <code key="p">{data.path}</code>],
+            ]} />
           </Card>
           <Card title="Limits for shell users" subtitle="Hard limits applied to every PAM login session except root and the exempt groups.">
+            {!data.supported && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Cannot be enabled here</strong><p>This host has no /etc/security/limits.d, so PAM limits cannot be applied.</p></div></div>}
             <div className="form-grid">
               <Field label="Maximum processes (nproc)" help="The classic default is 35."><NumberInput value={draft.maxProcesses} onChange={(v) => setDraft({ ...draft, maxProcesses: v })} min={1} nullable={false} /></Field>
               <Field label="Maximum open files (nofile)"><NumberInput value={draft.maxOpenFiles} onChange={(v) => setDraft({ ...draft, maxOpenFiles: v })} min={16} nullable={false} /></Field>

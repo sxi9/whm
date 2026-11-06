@@ -16,8 +16,8 @@ export default function ShowIpAddressUsage({ fn }) {
     <>
       <PageHeader fn={fn} description="Which account uses each address: the main and shared IPs are used by every account without a dedicated address; dedicated IPs belong to one account; reserved ones are held back. Resellers see only the addresses their accounts use." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
       <IpRequestError error={error} onRetry={refetch} />
-      {s && <Summary items={[['Main', s.main], ['Shared', s.shared], ['Dedicated', s.dedicated], ['Reserved', s.reserved], ['Free', s.free], ['Dynamic', s.unmanaged ?? 0], ['Not recorded', s.unknown]]} />}
-      <Card title="IP address usage" padded={false} actions={<Field inline><Select value={status} onChange={setStatus} options={['main', 'shared', 'dedicated', 'reserved', 'free', 'unmanaged', 'unknown'].map((v) => ({ value: v, label: v === 'unmanaged' ? 'dynamic' : v }))} placeholder="All states" /></Field>}>
+      {s && <Summary items={[['Main', s.main], ['Shared', s.shared], ['Dedicated', s.dedicated], ['Reserved', s.reserved], ['Free', s.free], ['Dynamic', s.unmanaged ?? 0]]} />}
+      <Card title="IP address usage" subtitle={s ? `${(data || []).length} addresses · ${s.unknown || 0} not recorded` : undefined} padded={false} actions={<Field inline><Select value={status} onChange={setStatus} options={['main', 'shared', 'dedicated', 'reserved', 'free', 'unmanaged', 'unknown'].map((v) => ({ value: v, label: v === 'unmanaged' ? 'dynamic' : v }))} placeholder="All states" /></Field>}>
         <DataTable
           columns={[
             { key: 'address', label: 'Address', render: (r) => <><code>{r.address}</code>{r.shared_ip && <> <StatusPill status="info">shared IP</StatusPill></>}</> },
@@ -28,7 +28,7 @@ export default function ShowIpAddressUsage({ fn }) {
             { key: 'account_count', label: 'Accounts', align: 'right', render: (r) => r.account_count },
             { key: 'accounts', label: 'Used by', render: (r) => r.accounts?.length ? <span className="muted">{r.accounts.slice(0, 6).map((a) => a.username).join(', ')}{r.accounts.length > 6 ? ` +${r.accounts.length - 6} more` : ''}</span> : r.reserved_reason ? <span className="muted">{r.reserved_reason}</span> : '' },
           ]}
-          rows={rows} loading={loading} rowKey={(r) => r.address} emptyText="No addresses to show. Rebuild the IP address pool to list every address and the accounts using it."
+          rows={rows} loading={loading} rowKey={(r) => r.address} emptyText={<>No addresses to show. <Link to="/ip-functions/rebuild-the-ip-address-pool">Rebuild the IP address pool</Link> to list every address and the accounts using it.</>}
         />
       </Card>
       {(data || []).some((r) => r.unknown) && (

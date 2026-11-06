@@ -6,7 +6,7 @@ import { useConfirm } from './Modal.jsx';
 
 // A described action with one button and a result panel. Used for restarts,
 // rebuilds, reboots and other "do the thing" functions.
-export function ActionPage({ fn, title, description, buttonLabel = 'Run', danger = false, confirmMessage, typeToConfirm, run, renderResult, children, status }) {
+export function ActionPage({ fn, title, description, buttonLabel = 'Run', danger = false, confirmMessage, typeToConfirm, run, renderResult, children, status, disabled = false, disabledReason }) {
   const toast = useToast();
   const confirm = useConfirm();
   const [state, setState] = useState({ loading: false, result: null, error: null });
@@ -34,7 +34,8 @@ export function ActionPage({ fn, title, description, buttonLabel = 'Run', danger
         {status && <div className="action-status">{status}</div>}
         {children}
         <div className="action-row">
-          <Button variant={danger ? 'danger' : 'primary'} loading={state.loading} onClick={go}>{buttonLabel}</Button>
+          <Button variant={danger ? 'danger' : 'primary'} loading={state.loading} disabled={disabled} onClick={go}>{buttonLabel}</Button>
+          {disabled && disabledReason && <p className="muted small" style={{ marginTop: 8 }}>{disabledReason}</p>}
         </div>
         <CapabilityNotice error={state.error} />
         {state.error && state.error.code !== 'capability_missing' && <ErrorBanner error={state.error} />}

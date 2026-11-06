@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Info, RefreshCw } from 'lucide-react';
+import { Info, RefreshCw, Copy } from 'lucide-react';
 import { Card, StatusPill, KeyValue, formatDate } from '../../../components/Common.jsx';
 import { Button } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
@@ -29,9 +29,15 @@ export function scoreTone(score) {
   return score >= 80 ? '' : score >= 50 ? 'warn' : 'bad';
 }
 
+const RECORD_STYLE = { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'normal' };
+
 export function DeliverabilityTable({ report, onFix, busy, pending }) {
   const { t } = useEmailT();
+  const toast = useToast();
   const elsewhere = notDelegatedHere(report.delegation);
+  const copyRecord = async (value) => {
+    try { await navigator.clipboard.writeText(value); toast.success(t('panel.email.deliverability.record_copied', 'Record copied')); } catch { toast.error(t('panel.email.deliverability.copy_failed', 'Copy failed; select the record and copy it by hand')); }
+  };
   return (
     <div className="table-wrap">
       <table>
@@ -45,11 +51,11 @@ export function DeliverabilityTable({ report, onFix, busy, pending }) {
                 {i.id === 'dkim' && i.signing != null && <div style={{ marginTop: 4 }}><StatusPill status={i.signing ? 'ok' : 'warning'}>{i.signing ? t('panel.email.deliverability.signing', 'Signing') : t('panel.email.deliverability.not_signing', 'Not signing')}</StatusPill></div>}
                 {pending?.[i.id] && <div style={{ marginTop: 4 }}><PendingPill result={pending[i.id]} /></div>}
               </td>
-              <td>{i.current.length ? i.current.map((c) => <div key={c}><code style={{ wordBreak: 'break-all' }}>{c}</code></div>) : <span className="muted">{t('panel.email.common.none', 'None')}</span>}{i.detail && <div className="muted" style={{ marginTop: 4 }}>{i.detail}</div>}{i.signing === false && i.signingHint && <div className="muted" style={{ marginTop: 4 }}>{i.signingHint}</div>}</td>
-              <td>{i.expected ? <code style={{ wordBreak: 'break-all' }}>{i.expected}</code> : <span className="muted">—</span>}</td>
+              <td>{i.current.length ? i.current.map((c) => <div key={c}><code style={RECORD_STYLE}>{c}</code></div>) : <span className="muted">{t('panel.email.common.none', 'None')}</span>}{i.detail && <div className="muted" style={{ marginTop: 4 }}>{i.detail}</div>}{i.signing === false && i.signingHint && <div className="muted" style={{ marginTop: 4 }}>{i.signingHint}</div>}</td>
+              <td>{i.expected ? <code style={RECORD_STYLE}>{i.expected}</code> : <span className="muted">—</span>}</td>
               <td className="actions-col">
                 {i.fixable && i.status !== 'ok' && report.zone && !elsewhere && <Button size="sm" variant="primary" loading={busy} onClick={() => onFix([i.id])}>{t('panel.email.deliverability.fix', 'Fix')}</Button>}
-                {i.fixable && i.status !== 'ok' && report.zone && elsewhere && (i.expected ? <span className="muted">{t('panel.email.deliverability.copy_to', 'Copy to {at}', { at: managedAt(report.delegation) })}</span> : i.id === 'dkim' ? <Button size="sm" loading={busy} onClick={() => onFix([i.id])}>{t('panel.email.deliverability.prepare_record', 'Prepare record')}</Button> : null)}
+                {i.fixable && i.status !== 'ok' && report.zone && elsewhere && (i.expected ? <div style={{ display: 'grid', gap: 4, justifyItems: 'end' }}><Button size="sm" icon={Copy} onClick={() => copyRecord(i.expected)}>{t('panel.email.deliverability.copy_record', 'Copy record')}</Button><small className="muted" style={{ whiteSpace: 'normal' }}>{t('panel.email.deliverability.copy_to', 'Copy to {at}', { at: managedAt(report.delegation) })}</small></div> : i.id === 'dkim' ? <Button size="sm" loading={busy} onClick={() => onFix([i.id])}>{t('panel.email.deliverability.prepare_record', 'Prepare record')}</Button> : null)}
                 {i.id === 'ptr' && i.status !== 'ok' && <span className="muted">{t('panel.email.common.ask_your_provider', 'Ask your provider')}</span>}
               </td>
             </tr>

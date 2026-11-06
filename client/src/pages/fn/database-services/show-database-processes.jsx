@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, formatDuration } from '../../../components/Common.jsx';
@@ -6,14 +6,16 @@ import { DataTable } from '../../../components/DataTable.jsx';
 import { Toggle, Button } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
-import { RequestError, engineLabel } from '../../databases/Shared.jsx';
+import { RequestError, engineLabel, isCapabilityError } from '../../databases/Shared.jsx';
 
 export default function ShowDatabaseProcesses({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
   const [live, setLive] = useState(true);
   const [hideSleeping, setHideSleeping] = useState(false);
-  const { data, loading, error, refetch } = useApi('/databases/processes', { refreshMs: live ? 5000 : 0 });
+  const [missing, setMissing] = useState(false);
+  const { data, loading, error, refetch } = useApi('/databases/processes', { refreshMs: live && !missing ? 5000 : 0 });
+  useEffect(() => { setMissing(isCapabilityError(error)); }, [error]);
   const rows = (data?.processes || []).filter((p) => !hideSleeping || !/^(sleep|idle)$/i.test(p.command || ''));
 
   const kill = async (p, queryOnly) => {
@@ -24,7 +26,7 @@ export default function ShowDatabaseProcesses({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Live connections and running statements on the active database server (SHOW PROCESSLIST). Kill a runaway query or an idle connection." actions={<><Toggle checked={live} onChange={setLive} label="Auto-refresh (5s)" /><Button onClick={() => refetch()}>Refresh</Button></>} />
+      <PageHeader fn={fn} description="Live connections and running statements on the active database server (SHOW PROCESSLIST). Kill a runaway query or an idle connection." actions={<><Toggle checked={live && !missing} disabled={missing} onChange={setLive} label="Auto-refresh (5s)" /><Button onClick={() => refetch()}>Refresh</Button></>} />
       <RequestError error={error} onRetry={refetch} />
       {data && (
         <Card title={`${rows.length} process${rows.length === 1 ? '' : 'es'}${data.profile ? ` on ${data.profile.profile_name} (${engineLabel(data.profile.engine)})` : ''}`} padded={false} actions={<Toggle checked={hideSleeping} onChange={setHideSleeping} label="Hide sleeping" />}>

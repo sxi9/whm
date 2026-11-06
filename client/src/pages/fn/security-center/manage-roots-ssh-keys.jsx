@@ -6,7 +6,7 @@ import { DataTable } from '../../../components/DataTable.jsx';
 import { Field, TextInput, Textarea, Select, Button, FormActions, PasswordInput, Toggle } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { RequestError } from '../../security/Shared.jsx';
+import { RequestError, isCapabilityError } from '../../security/Shared.jsx';
 
 export default function ManageRootsSshKeys({ fn }) {
   const toast = useToast();
@@ -39,13 +39,15 @@ export default function ManageRootsSshKeys({ fn }) {
   };
 
   const bitsOptions = gen.type === 'rsa' ? ['2048', '3072', '4096'] : gen.type === 'ecdsa' ? ['256', '384', '521'] : [];
+  // Without sshd the lists are empty, but authorized_keys can still be edited.
+  const shown = data || (isCapabilityError(error) ? { keys: [], authorized: [], keygenAvailable: false } : null);
 
   return (
     <>
       <PageHeader fn={fn} />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
-      {data && (
+      {shown && (
         <>
           <Card title="Key pairs in /root/.ssh" padded={false}>
             <DataTable columns={[
@@ -55,7 +57,7 @@ export default function ManageRootsSshKeys({ fn }) {
               { key: 'comment', label: 'Comment' },
               { key: 'authorized', label: 'Authorized', render: (k) => <StatusPill status={k.authorized ? 'ok' : 'inactive'}>{k.authorized ? 'yes' : 'no'}</StatusPill> },
               { key: 'createdAt', label: 'Created', render: (k) => formatDate(k.createdAt) },
-            ]} rows={data.keys} rowKey={(k) => k.name} dense emptyText="Key pairs appear here. Generate one below to get started."
+            ]} rows={shown.keys} rowKey={(k) => k.name} dense emptyText="No key pairs yet. Keys you generate below are listed here with their fingerprint."
               rowActions={(k) => [
                 k.authorized ? { label: 'De-authorize', primary: true, onClick: () => deauthorize(k) } : { label: 'Authorize', primary: true, onClick: () => run('Key authorized', () => api.post(`/security/ssh/keys/${k.name}/authorize`)) },
                 k.hasPrivateKey && { label: 'View private key', onClick: () => view(k) },
@@ -69,18 +71,18 @@ export default function ManageRootsSshKeys({ fn }) {
               { key: 'fingerprint', label: 'Fingerprint', render: (k) => <code className="small">{k.fingerprint}</code> },
               { key: 'comment', label: 'Comment' },
               { key: 'options', label: 'Options', render: (k) => (k.options ? <code className="small">{k.options}</code> : '—') },
-            ]} rows={data.authorized} rowKey={(k) => `${k.index}-${k.fingerprint}`} dense emptyText="No key is authorized. Keep password authentication on until one is."
+            ]} rows={shown.authorized} rowKey={(k) => `${k.index}-${k.fingerprint}`} dense emptyText="No key is authorized yet. Keys you import or generate appear here; keep password authentication on until one does."
               rowActions={(k) => [{ label: 'De-authorize', danger: true, primary: true, onClick: () => deauthorize(k) }]} />
           </Card>
           <div className="grid-2">
-            <Card title="Generate a new key" subtitle={data.keygenAvailable ? 'Uses ssh-keygen on the server.' : 'ssh-keygen is not installed on this server.'}>
+            <Card title="Generate a new key" subtitle={shown.keygenAvailable ? 'Uses ssh-keygen on the server.' : 'ssh-keygen is not installed on this server.'}>
               <Field label="Name" required><TextInput value={gen.name} onChange={(v) => setGen({ ...gen, name: v })} /></Field>
               <Field label="Type"><Select value={gen.type} onChange={(v) => setGen({ ...gen, type: v, bits: '' })} options={[{ value: 'ed25519', label: 'Ed25519 (recommended)' }, { value: 'rsa', label: 'RSA' }, { value: 'ecdsa', label: 'ECDSA' }]} /></Field>
               {bitsOptions.length > 0 && <Field label="Bits"><Select value={gen.bits} onChange={(v) => setGen({ ...gen, bits: v })} options={bitsOptions} placeholder="default" /></Field>}
               <Field label="Comment"><TextInput value={gen.comment} onChange={(v) => setGen({ ...gen, comment: v })} placeholder="root@server" /></Field>
               <Field label="Passphrase" help="Optional; protects the private key file at rest. It is handed to ssh-keygen through its environment, never on the command line."><PasswordInput value={gen.passphrase} onChange={(v) => setGen({ ...gen, passphrase: v })} showStrength={false} allowGenerate={false} /></Field>
               <Field inline><Toggle checked={gen.authorize} onChange={(v) => setGen({ ...gen, authorize: v })} label="Authorize immediately" /></Field>
-              <FormActions><Button variant="primary" loading={busy} disabled={!gen.name || !data.keygenAvailable} onClick={generate}>Generate key</Button></FormActions>
+              <FormActions><Button variant="primary" loading={busy} disabled={!gen.name || !shown.keygenAvailable} onClick={generate}>Generate key</Button></FormActions>
             </Card>
             <Card title="Import a public key" subtitle="Paste one OpenSSH public key line to authorize it for root.">
               <Field label="Public key"><Textarea value={imported} onChange={setImported} rows={4} mono placeholder="ssh-ed25519 AAAA... user@laptop" /></Field>

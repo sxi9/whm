@@ -24,6 +24,7 @@ export default function ManageDatabases({ fn }) {
   const [busy, setBusy] = useState(false);
   const engine = status.data?.profile?.engine;
   const prefix = form.account && status.data?.prefixing ? `${form.account}_` : '';
+  const installed = !isCapabilityError(error);
 
   const create = async (e) => {
     e.preventDefault();
@@ -48,9 +49,11 @@ export default function ManageDatabases({ fn }) {
     <>
       <PageHeader fn={fn} description="Create and drop databases on the active database server. Databases created for an account are prefixed with the account name and count against the package's database limit." actions={<Button onClick={() => { refetch(); status.refetch(); }}>Refresh</Button>} />
       <EngineBanner status={status.data} loading={status.loading} error={status.error} onRetry={status.refetch} />
+      {!installed && <RequestError error={error} onRetry={refetch} />}
       <form onSubmit={create}>
         <Card title="Create a database">
           <RequestError error={formError} />
+          <fieldset disabled={!installed} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
           <div className="form-grid">
             <AccountSelect value={form.account} onChange={(v) => setForm((f) => ({ ...f, account: v }))} label="Owner account" allowNone={isRoot} help={isRoot ? 'Optional for root: an unassigned database is server-wide' : undefined} />
             <Field label="Database name" required error={formError?.fields?.name} help={prefix ? `Will be created as ${prefix}${form.name || '…'}` : 'Lowercase letters, digits and underscores'}>
@@ -58,10 +61,10 @@ export default function ManageDatabases({ fn }) {
             </Field>
           </div>
           <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!form.name || (!isRoot && !form.account)}>Create database</Button></FormActions>
+          </fieldset>
         </Card>
       </form>
       <Card title="Databases" padded={false}>
-        {isCapabilityError(error) && <div className="card-body"><RequestError error={error} onRetry={refetch} /></div>}
         <DataTable
           columns={[
             { key: 'name', label: 'Database', sortable: true, render: (r) => <><code>{r.name}</code>{r.system && <> <StatusPill status="info">system</StatusPill></>}</> },

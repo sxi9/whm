@@ -59,7 +59,7 @@ export default function WebTemplateEditor({ fn }) {
         <FormActions>
           <Button variant="primary" loading={busy} disabled={!dirty} onClick={save}>Save</Button>
           <Button disabled={!dirty || busy} onClick={() => setBody(tpl.body)}>Discard changes</Button>
-          <Button variant="danger" loading={busy} disabled={!meta?.customised} onClick={reset}>Reset to default</Button>
+          <Button variant="danger-ghost" style={{ marginLeft: 'auto' }} loading={busy} disabled={!meta?.customised} onClick={reset}>Reset to default</Button>
         </FormActions>
         {lastWrite && lastWrite.name === name && !lastWrite.written && <div className="banner banner-warning"><div><strong>Saved in the panel only</strong><p>{lastWrite.writeError}</p></div></div>}
       </Card>

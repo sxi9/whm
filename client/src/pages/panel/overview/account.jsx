@@ -19,6 +19,13 @@ export function limitText(value, format) {
   return format ? format(value) : String(value);
 }
 
+// Compatibility flags that gate no panel function of their own, named the way
+// the function list names its rows ("Category › Label"); anything else is listed by key.
+const FEATURE_LABELS = {
+  autossl: 'SSL › AutoSSL', awstats: 'Logs › AWStats', cpanelpro_support: 'Support › Priority support', leechprotect: 'Security › Leech protection',
+  multiphp: 'Software › PHP versions', postgres: 'Databases › PostgreSQL', statselect: 'Logs › Statistics selection', webalizer: 'Logs › Webalizer', webdisk: 'Files › Web Disk',
+};
+
 // The plan's feature switches, named after the panel functions they gate; keys
 // without a function (cPanel compatibility flags) are listed by key.
 export function featureRows(features) {
@@ -30,7 +37,7 @@ export function featureRows(features) {
     named.set(fn.feature, fn.category === fn.label ? label : `${category} › ${label}`);
   }
   const keys = new Set([...named.keys(), ...Object.keys(features || {})]);
-  return [...keys].sort().map((key) => ({ key, label: named.get(key) || key, enabled: featureEnabled(features, key) }));
+  return [...keys].sort().map((key) => ({ key, label: named.get(key) || (FEATURE_LABELS[key] ? translate(`panel.account.feature.${key}`, FEATURE_LABELS[key]) : key), enabled: featureEnabled(features, key) }));
 }
 
 export default function AccountDetails({ fn }) {
@@ -38,6 +45,7 @@ export default function AccountDetails({ fn }) {
   const { t } = useT();
   const a = me?.account;
   const limits = a?.limits || {};
+  const limitRows = LIMIT_LABELS.filter(([key]) => key in limits).map(([key, label, format]) => [t(`panel.account.limit.${key}`, label), limitText(limits[key], format)]);
   return (
     <PanelPage fn={fn} actions={!me?.actingAs && (
       <>
@@ -47,7 +55,8 @@ export default function AccountDetails({ fn }) {
     )}>
       {!me && <Loading />}
       {a && (
-        <div className="grid-2">
+        <div className="grid-2" style={{ alignItems: 'start' }}>
+          <div>
           <Card title={t('panel.account.title', 'Account')}>
             <KeyValue items={[
               [t('panel.account.username', 'Username'), a.username],
@@ -63,8 +72,18 @@ export default function AccountDetails({ fn }) {
               a.demoMode && [t('panel.shell.demo_title', 'Demo mode'), <StatusPill key="d" status="warning">{t('panel.overview.read_only', 'read-only')}</StatusPill>],
             ]} />
           </Card>
+          <Card title={t('panel.account.login', 'Sign-in')}>
+            <KeyValue items={[
+              [t('panel.account.login_name', 'Login'), me.user?.username],
+              [t('panel.account.email', 'Email'), me.user?.email],
+              [t('panel.security/two-factor.label', 'Two-factor authentication'), <StatusPill key="t" status={me.user?.totpEnabled ? 'enabled' : 'disabled'} />],
+              me.policy?.require2fa && [t('panel.account.required_2fa', 'Two-factor required'), <StatusPill key="r" status="warning">{t('panel.overview.required', 'required')}</StatusPill>],
+              me.policy && !me.actingAs && [t('panel.account.password_synced', 'Password in sync with the server'), me.policy.passwordSynced ? <StatusPill key="p" status="ok" /> : <StatusPill key="p" status="warning">{t('panel.overview.not_yet', 'not yet')}</StatusPill>],
+            ]} />
+          </Card>
+          </div>
           <Card title={t('panel.account.limits', 'Plan limits')} subtitle={t('panel.account.limits_help', 'What this plan allows on the account.')}>
-            <KeyValue items={LIMIT_LABELS.filter(([key]) => key in limits).map(([key, label, format]) => [t(`panel.account.limit.${key}`, label), limitText(limits[key], format)])} />
+            {limitRows.length ? <KeyValue items={limitRows} /> : <p className="muted" style={{ margin: 0 }}>{t('panel.account.limits_none', 'No limits are set on this plan.')}</p>}
           </Card>
           <Card title={t('panel.account.features', 'Included features')} padded={false}>
             <div className="table-wrap">
@@ -77,15 +96,6 @@ export default function AccountDetails({ fn }) {
                 </tbody>
               </table>
             </div>
-          </Card>
-          <Card title={t('panel.account.login', 'Sign-in')}>
-            <KeyValue items={[
-              [t('panel.account.login_name', 'Login'), me.user?.username],
-              [t('panel.account.email', 'Email'), me.user?.email],
-              [t('panel.security/two-factor.label', 'Two-factor authentication'), <StatusPill key="t" status={me.user?.totpEnabled ? 'enabled' : 'disabled'} />],
-              me.policy?.require2fa && [t('panel.account.required_2fa', 'Two-factor required'), <StatusPill key="r" status="warning">{t('panel.overview.required', 'required')}</StatusPill>],
-              me.policy && !me.actingAs && [t('panel.account.password_synced', 'Password in sync with the server'), me.policy.passwordSynced ? <StatusPill key="p" status="ok" /> : <StatusPill key="p" status="warning">{t('panel.overview.not_yet', 'not yet')}</StatusPill>],
-            ]} />
           </Card>
         </div>
       )}

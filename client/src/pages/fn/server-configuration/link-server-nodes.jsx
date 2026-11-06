@@ -73,9 +73,9 @@ export default function LinkServerNodes({ fn }) {
     <>
       <PageHeader fn={fn} description="Register other panel servers this one can hand work to: DNS cluster members, remote mail or database nodes and backup targets. Each link stores an API token for the remote panel; Test connection calls its status endpoint." actions={<Button variant="primary" onClick={() => { setFormError(null); setModal({ node: null }); }}>Link a server node</Button>} />
       <RequestError error={error} onRetry={refetch} />
-      <Card padded={false}>
+      <Card title="Linked nodes" subtitle={data ? `${data.length} ${data.length === 1 ? 'node' : 'nodes'}` : undefined} padded={false}>
         <DataTable
-          rows={data || []} loading={loading} rowKey={(n) => n.id} emptyText="No linked nodes yet. Each linked server appears here with its roles and connection state; use Link a server node to add one."
+          rows={data || []} loading={loading} rowKey={(n) => n.id} emptyText="No linked nodes yet. Linked servers appear here with their roles and connection state."
           columns={[
             { key: 'name', label: 'Node', render: (n) => <><strong>{n.name}</strong>{!n.enabled && <> <StatusPill status="disabled">disabled</StatusPill></>}<br /><small className="muted"><code>{n.scheme}://{n.hostname}:{n.port}</code> as {n.username}</small></> },
             { key: 'roles', label: 'Roles', render: (n) => (n.roles.length ? <span className="row-actions" style={{ flexWrap: 'wrap' }}>{n.roles.map((r) => <StatusPill key={r} status="pending">{r}</StatusPill>)}</span> : <span className="muted">—</span>) },

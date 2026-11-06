@@ -3,12 +3,12 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, StatusPill } from '../../../components/Common.jsx';
-import { Field, TextInput, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
+import { Field, TextInput, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useT } from '../../../i18n/useT.js';
 import { RequestError, Tabs, useLocales, LocaleSelect, LocalePills, TranslationProgress, LocaleLinks } from '../../locales/Shared.jsx';
 
-const PAGE = 100;
+const PAGE = 50;
 
 export default function EditALocale({ fn }) {
   const toast = useToast();
@@ -131,7 +131,6 @@ export default function EditALocale({ fn }) {
           )}
           <div style={{ padding: '0 16px 12px' }}>
             <ErrorBanner error={saveError} />
-            {!readOnly && <FormActions><Button variant="primary" loading={saving} disabled={!dirty} onClick={save}>Save changes</Button></FormActions>}
             {readOnly && <p className="muted small"><Link to={`/locales/copy-a-locale?from=${code}`}>Copy this locale</Link> to create an editable translation.</p>}
           </div>
         </Card>

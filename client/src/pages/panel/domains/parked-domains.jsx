@@ -57,6 +57,8 @@ export default function ParkedDomains({ fn }) {
   const limit = limits?.max_parked ?? null;
   const full = limitReached(count, limit);
   const noun = t('panel.domains.noun_parked_domains', 'parked domains');
+  // A plan without parked domains: the banner says so once, the table does not invite parking one.
+  const notInPlan = limit === 0;
 
   const onCreated = (res) => {
     setAdding(false);
@@ -91,10 +93,10 @@ export default function ParkedDomains({ fn }) {
           last.webDetail && [t('panel.domains.detail', 'Detail'), String(last.webDetail)],
         ]} />
       )}
-      <Card title={t('panel.domains.parked_domains', 'Parked domains')} subtitle={usageText(count, limit, noun)} padded={false}>
+      <Card title={t('panel.domains.parked_domains', 'Parked domains')} subtitle={notInPlan ? undefined : usageText(count, limit, noun)} padded={false}>
         <PanelCapabilityState error={error} onRetry={refetch} />
         <DataTable columns={columns} rows={parked} loading={loading} error={error && error.status !== 501 ? error : null}
-          emptyText={fill(t('panel.domains.parked_empty', 'No parked domains yet. Park one to show {target} under another name, for example a .net or a misspelling you own.'), { target: target || t('panel.domains.your_main_site', 'your main site') })}
+          emptyText={notInPlan ? fill(t('panel.domains.limit_none', 'Your plan does not include {noun}'), { noun }) : fill(t('panel.domains.parked_empty', 'No parked domains yet. Park one to show {target} under another name, for example a .net or a misspelling you own.'), { target: target || t('panel.domains.your_main_site', 'your main site') })}
           rowKey={(r) => r.domain}
           rowActions={(r) => [{ label: t('panel.domains.remove', 'Remove'), primary: true, danger: true, onClick: () => setRemoving(r) }]} />
       </Card>

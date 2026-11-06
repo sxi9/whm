@@ -73,6 +73,8 @@ export default function DatabaseWizard({ fn }) {
   const quota = quotaOf(meta, me);
   const notIncluded = quota.max === 0;
   const limitReached = quota.max != null && quota.used >= quota.max;
+  // The server is missing: the state gets its own surface and step 1 stays visible but inert.
+  const missing = isCapabilityError(error);
   const privileges = useMemo(() => (isPg ? PG_PRIVILEGES : PRIVILEGES), [isPg]);
   const charsets = [{ value: '', label: t('panel.databases.charset_default', 'Server default') }, { value: 'utf8mb4', label: t('panel.databases.charset_utf8mb4', 'utf8mb4 (recommended)') }, { value: 'utf8mb3', label: 'utf8mb3' }, { value: 'latin1', label: 'latin1' }];
 
@@ -133,8 +135,8 @@ export default function DatabaseWizard({ fn }) {
         <p className="muted small" style={{ marginTop: 12, marginBottom: 0 }}>{t('panel.databases.wizard_intro', 'Three steps: the database, a user that signs in to it, and what that user may do. Each step is saved as you go, so you can leave after any of them.')}</p>
       </Card>
 
-      <PanelCapabilityState error={isCapabilityError(error) ? error : null} onRetry={refetch} />
-      <PanelCapabilityState error={isCapabilityError(formError) ? formError : null} />
+      {missing && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
+      {isCapabilityError(formError) && <Card><PanelCapabilityState error={formError} /></Card>}
       <RequestError error={formError} />
 
       {step === 0 && (
@@ -142,15 +144,15 @@ export default function DatabaseWizard({ fn }) {
           <Card title={t('panel.databases.wizard_database_title', 'Step 1: Create a database')} subtitle={t('panel.databases.create_subtitle', 'Choose a short name; the prefix is added for you.')}>
             {limitReached && <InfoNote>{notIncluded ? t('panel.databases.plan_none', 'Your plan does not include databases. Ask your hosting provider about a plan that includes them.') : plural(t, 'panel.databases.plan_full', quota.max, 'Your plan allows {count} database and all of them are in use. Delete one you no longer need or ask your hosting provider about a larger plan.', 'Your plan allows {count} databases and all of them are in use. Delete one you no longer need or ask your hosting provider about a larger plan.')}</InfoNote>}
             <div className="form-grid">
-              <NameField id="wiz-db-name" label={t('panel.databases.name', 'Database name')} prefix={prefix} value={db.name} onChange={(v) => setDb((f) => ({ ...f, name: v }))} placeholder="shop" maxLength={54} error={formError?.fields?.name} disabled={limitReached} />
+              <NameField id="wiz-db-name" label={t('panel.databases.name', 'Database name')} prefix={prefix} value={db.name} onChange={(v) => setDb((f) => ({ ...f, name: v }))} placeholder="shop" maxLength={54} error={formError?.fields?.name} disabled={limitReached || missing} />
               {!isPg && (
                 <Field label={t('panel.databases.charset', 'Character set')} help={t('panel.databases.charset_help', 'Leave the default unless your application asks for a specific one')} error={formError?.fields?.charset} htmlFor="wiz-db-charset">
-                  <Select id="wiz-db-charset" value={db.charset} onChange={(v) => setDb((f) => ({ ...f, charset: v }))} options={charsets} disabled={limitReached} />
+                  <Select id="wiz-db-charset" value={db.charset} onChange={(v) => setDb((f) => ({ ...f, charset: v }))} options={charsets} disabled={limitReached || missing} />
                 </Field>
               )}
             </div>
             <FormActions>
-              <Button type="submit" variant="primary" icon={Plus} loading={busy} disabled={busy || !db.name || limitReached}>{t('panel.databases.wizard_next_step', 'Next step')}</Button>
+              <Button type="submit" variant="primary" icon={Plus} loading={busy} disabled={busy || !db.name || limitReached || missing}>{t('panel.databases.wizard_next_step', 'Next step')}</Button>
               {db.name && <span className="muted small">{t('panel.databases.creates', 'Creates')} <code>{prefix}{db.name}</code></span>}
             </FormActions>
           </Card>

@@ -127,7 +127,7 @@ export function SpamUnavailable({ reason, detail, onRetry }) {
     <Card>
       <EmptyState icon={ShieldOff} title={t('panel.email.spam.unavailable_title', 'Spam filtering is not available on this server')}>
         <p>{unavailableText(reason)}</p>
-        {detail && <p className="muted">{detail}</p>}
+        {detail && reason !== 'exim_missing' && reason !== 'spamd_missing' && <p className="muted">{detail}</p>}
         {reason === 'exim_no_content_scan' && <p className="muted">{t('panel.email.spam.no_scan_thresholds', 'Incoming mail is delivered unscored, so a per-account threshold would have nothing to compare against; the settings cannot be saved here until the scanning build is installed.')}</p>}
         <p className="muted">{t('panel.email.spam.unavailable_text', 'Ask your hosting provider to enable it. Your other mail settings keep working.')}</p>
         {onRetry && <p><button className="btn btn-sm" onClick={onRetry}>{t('panel.email.common.recheck', 'Re-check')}</button></p>}

@@ -50,7 +50,7 @@ export default function ResetMailmanPassword({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} actions={<Button onClick={refetch}>Refresh</Button>} />
+      <PageHeader fn={fn} actions={!isCapabilityError(error) && <Button onClick={refetch}>Refresh</Button>} />
       <CapabilityNotice error={error} onRetry={refetch} />
       {error && !isCapabilityError(error) && <ErrorBanner error={error} onRetry={refetch} />}
       {data && (

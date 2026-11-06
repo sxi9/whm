@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { RESTART_SERVICE_MAP } from '../../nav.js';
@@ -9,16 +10,19 @@ import { StatusPill, KeyValue, formatBytes } from '../../components/Common.jsx';
 export default function RestartService({ fn }) {
   const service = RESTART_SERVICE_MAP[fn.slug];
   const { data: status, refetch } = useApi(`/system/services/${service}`);
+  const missing = status?.installed === false;
   return (
     <ActionPage
       fn={fn}
       buttonLabel={`Restart ${fn.label}`}
       confirmMessage={`Restart ${fn.label} now? Active connections will be dropped briefly.`}
       run={async () => { const { data } = await api.post(`/system/services/${service}/restart`); await refetch(); return data; }}
+      disabled={missing}
+      disabledReason={<>{fn.label} is not installed on this server. Install it first (<Link to="/software/install-distro-packages?tab=search">Install Software</Link>) and manage it under <Link to="/service-configuration/service-manager">Service Manager</Link>.</>}
       status={status && (
         <KeyValue items={[
-          ['Unit', status.unit ? <code key="u">{status.unit}</code> : 'not installed'],
-          ['State', <StatusPill key="s" status={status.installed === false ? 'not-installed' : status.active ? 'active' : 'down'}>{status.installed === false ? 'Not installed' : status.active ? 'Up' : 'Down'}</StatusPill>],
+          ['Unit', status.unit ? <code key="u">{status.unit}</code> : null],
+          ['State', <StatusPill key="s" status={missing ? 'not-installed' : status.active ? 'active' : 'down'}>{missing ? 'Not installed' : status.active ? 'Up' : 'Down'}</StatusPill>],
           status.pid && ['PID', status.pid], status.memoryBytes != null && ['Memory', formatBytes(status.memoryBytes)], status.startedAt && ['Started', status.startedAt],
         ]} />
       )}

@@ -39,6 +39,9 @@ export default function Tokens({ fn }) {
   const needs2fa = Boolean(me?.policy?.apiTokensRequire2fa) && !me?.user?.totpEnabled;
   const never = t('panel.security.never', 'Never');
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  // The server withholds the list while an admin acts as the account: a read-only
+  // listing, not a failure, so it reads as an empty table under the blue notice.
+  const withheld = Boolean(actingAs) && error?.code === 'not_while_impersonating';
 
   if (planOff || isFeatureDisabled(error)) return <PanelPage fn={fn}><FeatureDisabledState fn={fn} /></PanelPage>;
 
@@ -77,8 +80,7 @@ export default function Tokens({ fn }) {
         <div className="banner banner-warning" role="alert"><ShieldAlert size={18} /><div><strong>{t('panel.security.token_needs_2fa_title', 'Two-factor authentication is needed before tokens can be issued')}</strong><p>{t('panel.security.token_needs_2fa_text', 'The server policy asks for it.')} <Link to={PANEL_PATHS.twoFactor}>{t('panel.security.token_set_it_up', 'Set it up')}</Link>{t('panel.security.token_then_create', ', then create tokens here.')}</p></div></div>
       )}
       <Card title={t('panel.security.tokens_title', 'API tokens')} subtitle={data?.length ? plural(t, 'panel.security.tokens_count', data.length, '{count} token for {login}', '{count} tokens for {login}', { login: me?.user?.username || t('panel.security.this_login', 'this login') }) : t('panel.security.tokens_subtitle', 'Tokens let scripts and tools use the panel API as this login, limited to the scopes you choose.')} padded={false}>
-        {isCapabilityError(error) && <div className="card-body"><PanelCapabilityState error={error} onRetry={refetch} /></div>}
-        <DataTable
+        {isCapabilityError(error) ? <div className="card-body"><PanelCapabilityState error={error} onRetry={refetch} /></div> : <DataTable
           columns={[
             { key: 'name', label: t('panel.security.col_name', 'Name'), render: (tk) => <strong>{tk.name}</strong> },
             { key: 'prefix', label: t('panel.security.col_starts_with', 'Starts with'), render: (tk) => <code className="small">{tk.prefix}…</code> },
@@ -87,11 +89,11 @@ export default function Tokens({ fn }) {
             { key: 'lastUsedAt', label: t('panel.security.col_last_used', 'Last used'), render: (tk) => (tk.lastUsedAt ? formatDate(tk.lastUsedAt) : <span className="muted">{never}</span>) },
             { key: 'createdAt', label: t('panel.security.col_created', 'Created'), render: (tk) => formatDate(tk.createdAt) },
           ]}
-          rows={rows} loading={loading} error={isCapabilityError(error) ? null : error} rowKey={(tk) => tk.id} dense
+          rows={rows} loading={loading} error={withheld ? null : error} rowKey={(tk) => tk.id} dense
           searchable={Boolean(data?.length)} q={q} onSearch={setQ} searchPlaceholder={t('panel.security.tokens_search', 'Search tokens')}
           rowActions={(tk) => [{ label: t('panel.security.token_revoke', 'Revoke'), danger: true, primary: true, disabled: Boolean(actingAs), onClick: () => revoke(tk) }]}
-          emptyText={q ? t('panel.security.tokens_empty_search', 'No token matches the search.') : t('panel.security.tokens_empty', 'No API tokens yet. Create one to let a script or tool work with this account; it appears here with its scopes, expiry and last use.')}
-        />
+          emptyText={withheld ? error.message : q ? t('panel.security.tokens_empty_search', 'No token matches the search.') : t('panel.security.tokens_empty', 'No API tokens yet. Create one to let a script or tool work with this account; it appears here with its scopes, expiry and last use.')}
+        />}
       </Card>
       <Card title={t('panel.security.token_using_title', 'Using a token')}>
         <KeyValue items={[

@@ -59,15 +59,17 @@ export default function InitialQuotaSetup({ fn }) {
               <KeyValue items={[['Account homes', <code key="h">{data.homeRoot}</code>], ['Filesystem holding homes', data.homeFilesystem ? <code key="f">{data.homeFilesystem}</code> : 'not found'], ['User quotas on that filesystem', <YesNo key="q" value={data.enabled} yes="enabled" no="not enabled" />], ['Quota tools (quotacheck, quotaon, quotaoff, repquota, setquota)', <YesNo key="t" value={data.toolsInstalled} yes="installed" no="missing" />], ['Package disk limits enforceable', <span key="e" className="row-actions" style={{ gap: 8 }}><YesNo value={data.enforceable} yes="yes" no="no" />{!data.enforceable && <small className="muted">{data.enabled ? 'tools missing' : 'quotas not enabled'}</small>}</span>]]} />
               {!data.toolsInstalled && (
                 <div style={{ marginTop: 12 }}>
-                  <CapabilityNotice error={{ code: 'capability_missing', message: `The quota tools are not installed. Install the "${data.installPackages.join('", "')}" package, then enable quotas below.` }} onRetry={refetch} />
-                  <div className="row-actions" style={{ marginTop: 8 }}>
-                    {data.pkgAvailable ? <Button variant="primary" loading={busy === 'install'} onClick={installTools}>Install quota tools</Button> : quotaPackages(data).length ? <InstallPackages packages={quotaPackages(data)} label="Install quota tools" onFinished={refetch} /> : <Link className="btn" to="/software/install-distro-packages?tab=search&q=quota">Open Install Software</Link>}
-                  </div>
+                  <CapabilityNotice error={{ code: 'capability_missing', message: `The quota tools are not installed. Install the "${data.installPackages.join('", "')}" package, then enable quotas below.` }} packages={quotaPackages(data)} onRetry={refetch} />
+                  {!quotaPackages(data).length && (
+                    <div className="row-actions" style={{ marginTop: 8 }}>
+                      {data.pkgAvailable ? <Button loading={busy === 'install'} onClick={installTools}>Install quota tools</Button> : <Link className="btn" to="/software/install-distro-packages?tab=search&q=quota">Open Install Software</Link>}
+                    </div>
+                  )}
                 </div>
               )}
             </Card>
             <Card title="Options">
-              <Field inline><Toggle checked={groupQuota} onChange={setGroupQuota} label="Also enable group quotas" description="Adds grpquota alongside usrquota; needed for per-group limits only." /></Field>
+              <Field inline><Toggle checked={groupQuota} onChange={setGroupQuota} disabled={!data.toolsInstalled} label="Also enable group quotas" description="Adds grpquota alongside usrquota; needed for per-group limits only." /></Field>
               <p className="muted">Quotas are enforced by the kernel per filesystem. The <code>usrquota</code> mount option (or the ext4 <code>quota</code> feature) must be present; <code>quotacheck</code> then builds the accounting files and <code>quotaon</code> activates them. XFS reads its <code>uquota</code> option only at mount time, so it needs a reboot after the fstab change.</p>
             </Card>
           </div>

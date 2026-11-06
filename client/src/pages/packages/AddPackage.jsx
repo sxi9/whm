@@ -29,7 +29,7 @@ export default function AddPackage({ fn }) {
       <PageHeader fn={fn} />
       <form onSubmit={submit}>
         <PackageForm form={form} setForm={setForm} error={error} />
-        <FormActions><Button type="submit" variant="primary" loading={busy}>Add</Button></FormActions>
+        <div className="sticky-actions"><FormActions><Button type="submit" variant="primary" loading={busy}>Add</Button></FormActions></div>
       </form>
     </>
   );

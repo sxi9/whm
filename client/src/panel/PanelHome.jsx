@@ -27,10 +27,16 @@ export function usageMeters(me, usage, t = untranslated) {
   const limits = usage?.limits || me?.account?.limits || {};
   // Server convention (assertLimit): null is unlimited, 0 means the plan does not include the object.
   const unlimited = (v) => v == null;
-  const row = (key, used, limit, format = (v) => (v == null ? '—' : String(v))) => ({
-    key, label: t(`panel.home.meter_${key}`, METER_LABELS[key]), used, limit: unlimited(limit) ? null : limit, percent: unlimited(limit) || limit === 0 ? null : percentOf(used, limit),
-    text: unlimited(limit) ? fill(t('panel.home.meter_unlimited', '{used} · unlimited'), { used: format(used) }) : limit === 0 ? t('panel.shell.feature_disabled_title', 'Not included in your plan') : fill(t('panel.home.meter_of', '{used} of {limit}'), { used: format(used), limit: format(limit) }),
-  });
+  // `text` is the sentence assistive technology reads; a tile shows `value` and,
+  // for an object the plan does not include, the short `note` instead of a meter.
+  const row = (key, used, limit, format = (v) => (v == null ? '—' : String(v))) => {
+    const none = !unlimited(limit) && limit === 0;
+    const text = unlimited(limit) ? fill(t('panel.home.meter_unlimited', '{used} · unlimited'), { used: format(used) }) : none ? t('panel.shell.feature_disabled_title', 'Not included in your plan') : fill(t('panel.home.meter_of', '{used} of {limit}'), { used: format(used), limit: format(limit) });
+    return {
+      key, label: t(`panel.home.meter_${key}`, METER_LABELS[key]), used, limit: unlimited(limit) ? null : limit, percent: unlimited(limit) || none ? null : percentOf(used, limit),
+      text, value: none ? '—' : text, note: none ? t('panel.usage.none_in_plan', 'none in plan') : null,
+    };
+  };
   return [
     row('disk', usage?.disk?.usedMb ?? u.diskUsedMb ?? 0, usage?.disk?.quotaMb ?? u.diskQuotaMb, formatMb),
     row('bandwidth', usage?.bandwidth?.usedMb ?? u.bandwidthUsedMb ?? 0, usage?.bandwidth?.limitMb ?? u.bandwidthLimitMb, formatMb),
@@ -50,8 +56,8 @@ export function UsageMeters({ me, usage }) {
       {meters.map((m) => (
         <div className="stat" key={m.key} data-meter={m.key}>
           <div className="label">{m.label}</div>
-          <div className="value" style={{ fontSize: 17 }}>{m.text}</div>
-          <Meter percent={m.percent} label={m.label} text={m.text} name={m.key} />
+          <div className="value" style={{ fontSize: 17 }} title={m.note ? m.text : undefined}>{m.value}</div>
+          {m.note ? <div className="label">{m.note}</div> : <Meter percent={m.percent} label={m.label} text={m.text} name={m.key} />}
         </div>
       ))}
     </div>
@@ -66,21 +72,20 @@ export function DomainsList({ account, ssl = {} }) {
   const main = account?.domain;
   const rows = [main && !domains.some((d) => d.domain === main && d.type === 'main') ? { domain: main, type: 'main', docroot: null } : null, ...domains].filter(Boolean);
   if (!rows.length) return <p className="muted">{t('panel.home.no_domains', 'No domains on this account yet.')}</p>;
+  // A stacked list (the `.kv` hairline rows) rather than a table: the side column is
+  // 340px wide and a document root does not fit next to two other columns there.
   return (
-    <div className="table-wrap">
-      <table>
-        <thead><tr><th>{t('panel.home.col_domain', 'Domain')}</th><th>{t('panel.home.col_type', 'Type')}</th><th>{t('panel.home.col_docroot', 'Document root')}</th></tr></thead>
-        <tbody>
-          {rows.map((d) => (
-            <tr key={`${d.type}:${d.domain}`}>
-              <td><a href={siteUrl(d.domain, ssl[d.domain])} target="_blank" rel="noopener noreferrer">{d.domain} <ExternalLink size={12} aria-hidden="true" /></a></td>
-              <td><StatusPill status={d.type === 'main' ? 'ok' : 'info'}>{t(`panel.home.domain_type_${d.type}`, d.type)}</StatusPill></td>
-              <td className="muted">{d.docroot || (d.type === 'main' ? `${account?.homeDir || ''}/public_html` : '—')}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <dl className="kv home-domains">
+      {rows.map((d) => (
+        <div key={`${d.type}:${d.domain}`}>
+          <dt style={{ flex: '1 1 auto', minWidth: 0 }}>
+            <a href={siteUrl(d.domain, ssl[d.domain])} target="_blank" rel="noopener noreferrer">{d.domain} <ExternalLink size={12} aria-hidden="true" /></a>
+            <small className="muted" style={{ display: 'block', overflowWrap: 'anywhere' }}>{d.docroot || (d.type === 'main' ? `${account?.homeDir || ''}/public_html` : '—')}</small>
+          </dt>
+          <dd><StatusPill status={d.type === 'main' ? 'ok' : 'info'}>{t(`panel.home.domain_type_${d.type}`, d.type)}</StatusPill></dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 
@@ -202,7 +207,7 @@ export function PanelHome({ header = null }) {
         </div>
 
         <aside className="home-side">
-          <Card title={t('panel.home.domains', 'Domains')} actions={hasFeature('addondomains') ? <Link className="link-button" to={`${PANEL_BASE}/domains/domains`}>{t('panel.home.manage', 'Manage')}</Link> : null} padded={false}>
+          <Card title={t('panel.home.domains', 'Domains')} actions={hasFeature('addondomains') ? <Link className="link-button" to={`${PANEL_BASE}/domains/domains`}>{t('panel.home.manage', 'Manage')}</Link> : null}>
             <DomainsList account={account} ssl={sslByDomain} />
           </Card>
           <Card title={t('panel.home.account', 'Account')}>

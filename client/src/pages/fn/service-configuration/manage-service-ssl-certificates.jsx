@@ -49,7 +49,7 @@ export default function ManageServiceSslCertificates({ fn }) {
                     const days = s.daysRemaining;
                     return (
                       <tr key={s.service}>
-                        <td><strong>{s.label}</strong><div className="muted"><code>{s.paths?.dir}</code></div></td>
+                        <td><strong>{s.label}</strong>{s.paths?.dir && <div className="muted"><code className="small">{s.paths.dir}</code></div>}</td>
                         <td>{s.daemonPresent == null ? <StatusPill status="unknown">—</StatusPill> : s.daemonPresent ? <StatusPill status="installed">installed</StatusPill> : <StatusPill status="not-installed">not installed</StatusPill>}</td>
                         <td>{s.hasCertificate ? <span><StatusPill status={s.selfSigned ? 'warning' : 'ok'}>{s.selfSigned ? 'self-signed' : 'signed'}</StatusPill> <span className="muted">{s.subject}</span></span> : <StatusPill status="pending">none installed</StatusPill>}</td>
                         <td>{s.notAfter ? <StatusPill status={days < 0 ? 'failed' : days <= 14 ? 'warning' : 'ok'}>{days < 0 ? `expired ${-days}d ago` : `${days}d · ${formatDate(s.notAfter).split(',')[0]}`}</StatusPill> : '—'}</td>

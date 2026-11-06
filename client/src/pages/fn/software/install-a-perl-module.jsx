@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
+import { PageHeader, Card, StatusPill, Loading, RefreshButton } from '../../../components/Common.jsx';
 import { Field, TextInput, Textarea, Toggle, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { RequestError, useJobRunner, JobPanel, JobHistory, InstallPackages } from '../../software/Shared.jsx';
 
@@ -23,14 +23,18 @@ export default function InstallAPerlModule({ fn }) {
   const invalid = modules.filter((m) => !MODULE_RE.test(m));
   const items = (data?.modules || []).filter((m) => !q || m.name.toLowerCase().includes(q.toLowerCase()));
   const installer = installers.data?.perl;
+  // Without perl itself the CPAN banner would offer an install that cannot work.
+  const perlMissing = Boolean(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
+  const installerText = installers.data ? (installer ? `${installer}${installers.data.versions.perl ? ` · perl ${installers.data.versions.perl}` : ''}` : 'no CPAN client') : null;
 
   const install = () => runner.start(() => api.post('/software/perl/install', { modules, notest }), `Install ${modules.join(', ')}`).then((d) => { if (d) setText(''); });
 
   return (
     <>
-      <PageHeader fn={fn} actions={installers.data && <StatusPill status={installer ? 'ok' : 'not-installed'}>{installer ? `installer: ${installer}${installers.data.versions.perl ? ` · perl ${installers.data.versions.perl}` : ''}` : 'no CPAN client'}</StatusPill>} />
-      <Card title="Install from CPAN" subtitle="Modules are built and installed non-interactively as a background job (cpanm when available, otherwise cpan with default answers).">
-        {installers.data && !installer && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>No CPAN client</strong><p>Install <code>{cpanPackages(installers.data)[0]}</code> first; module installs are refused until it is present.</p><InstallPackages packages={cpanPackages(installers.data)} label="Install cpanminus" onFinished={() => installers.refetch()} /></div></div>}
+      <PageHeader fn={fn} />
+      {perlMissing && <RequestError error={error} onRetry={refetch} />}
+      <Card title="Install from CPAN" subtitle={installerText ? `Installer: ${installerText}. Modules are built and installed non-interactively as a background job.` : 'Modules are built and installed non-interactively as a background job (cpanm when available, otherwise cpan with default answers).'}>
+        {installers.data && !installer && !perlMissing && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>No CPAN client</strong><p>Install <code>{cpanPackages(installers.data)[0]}</code> first; module installs are refused until it is present.</p><InstallPackages packages={cpanPackages(installers.data)} label="Install cpanminus" onFinished={() => installers.refetch()} /></div></div>}
         <Field label="Module names" help="One per line or separated by spaces, e.g. DBD::mysql, JSON::XS, LWP::UserAgent" error={invalid.length ? [`Not a Perl module name: ${invalid.join(', ')}`] : null} required>
           <Textarea value={text} onChange={setText} rows={4} mono placeholder={'DBD::mysql\nJSON::XS'} />
         </Field>
@@ -39,8 +43,8 @@ export default function InstallAPerlModule({ fn }) {
         <ErrorBanner error={runner.error} />
       </Card>
       <JobPanel runner={runner} title="Install log" />
-      <Card title="Installed modules" subtitle={data ? `${data.modules.length} modules registered with ExtUtils::Installed` : undefined} actions={<Button onClick={() => refetch()} loading={loading}>Refresh</Button>}>
-        <RequestError error={error} onRetry={refetch} />
+      <Card title="Installed modules" subtitle={data ? `${data.modules.length} modules registered with ExtUtils::Installed` : undefined} actions={<RefreshButton size="sm" onClick={() => refetch()} loading={loading} />}>
+        {!perlMissing && <RequestError error={error} onRetry={refetch} />}
         {loading && !data && <Loading />}
         {data && (
           <>

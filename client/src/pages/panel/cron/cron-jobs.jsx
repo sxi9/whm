@@ -99,7 +99,7 @@ export function chooseSchedule(value, preset) {
   return { ...value, custom: false, schedule: preset };
 }
 
-export function JobForm({ value, onChange, errors, idPrefix }) {
+export function JobForm({ value, onChange, errors, idPrefix, disabled = false }) {
   const fields = splitSchedule(value.schedule) || ['*', '*', '*', '*', '*'];
   const custom = isCustomSchedule(value);
   const preset = custom ? 'custom' : presetFor(value.schedule);
@@ -108,20 +108,20 @@ export function JobForm({ value, onChange, errors, idPrefix }) {
   return (
     <>
       <Field label="Schedule" required htmlFor={`${idPrefix}-preset`} help={<>{describeSchedule(value.schedule)} · <code>{value.schedule || '—'}</code></>} error={errors?.schedule}>
-        <Select id={`${idPrefix}-preset`} value={preset} onChange={choose} options={PRESETS} />
+        <Select id={`${idPrefix}-preset`} value={preset} onChange={choose} options={PRESETS} disabled={disabled} />
       </Field>
       {custom && (
         <div className="form-grid" style={{ gridTemplateColumns: 'repeat(5, 1fr)', gap: '0 10px' }}>
           {FIELD_NAMES.map((name, i) => (
             <Field key={name} label={name[0].toUpperCase() + name.slice(1)} htmlFor={`${idPrefix}-${name}`}>
-              <TextInput id={`${idPrefix}-${name}`} value={fields[i]} onChange={(v) => setField(i, v)} spellCheck={false} />
+              <TextInput id={`${idPrefix}-${name}`} value={fields[i]} onChange={(v) => setField(i, v)} spellCheck={false} disabled={disabled} />
             </Field>
           ))}
           <p className="muted small" style={{ gridColumn: '1 / -1', marginTop: -4 }}>Minute 0–59, hour 0–23, day 1–31, month 1–12, weekday 0–7 (0 and 7 are Sunday). <code>*</code> means every, <code>*/5</code> every fifth, <code>1,15</code> a list, <code>1-5</code> a range.</p>
         </div>
       )}
       <Field label="Command" required htmlFor={`${idPrefix}-command`} help={<>Runs in your home directory as your account. Use full paths, for example <code>/usr/bin/php ~/public_html/cron.php</code>; add <code>&gt;/dev/null 2&gt;&amp;1</code> to silence the mail.</>} error={errors?.command}>
-        <TextInput id={`${idPrefix}-command`} value={value.command} onChange={(v) => onChange({ ...value, command: v })} placeholder="/usr/bin/php ~/public_html/cron.php" spellCheck={false} autoCapitalize="none" />
+        <TextInput id={`${idPrefix}-command`} value={value.command} onChange={(v) => onChange({ ...value, command: v })} placeholder="/usr/bin/php ~/public_html/cron.php" spellCheck={false} autoCapitalize="none" disabled={disabled} />
       </Field>
     </>
   );
@@ -226,6 +226,8 @@ export default function CronJobs({ fn }) {
   };
 
   const envFieldError = (err) => { const k = Object.keys(err?.fields || {}).find((x) => x.startsWith('env.')); return k ? err.fields[k] : err?.fields?.key; };
+  // With cron missing the forms stay visible for orientation but cannot submit.
+  const blockedSubtitle = capability ? 'Available once cron is installed on this server.' : null;
 
   return (
     <PanelPage fn={fn} actions={<Button icon={RefreshCw} onClick={() => refetch()}>Refresh</Button>}>
@@ -234,27 +236,27 @@ export default function CronJobs({ fn }) {
 
       <div className="grid-2">
         <form onSubmit={saveMail}>
-          <Card title="Cron email" subtitle="Whatever a job prints is mailed after each run; the subject names the command.">
+          <Card title="Cron email" subtitle={blockedSubtitle || 'Whatever a job prints is mailed after each run; the subject names the command.'}>
             <PanelCapabilityState error={isCapabilityError(mailError) ? mailError : null} />
             <RequestError error={mailError} />
             <Field label="Send output to" htmlFor="cron-mailto" help={mail.silent ? 'Output is discarded' : `Leave empty to use the mailbox of ${me?.account?.username || 'your account'} on this server`} error={envFieldError(mailError)}>
-              <TextInput id="cron-mailto" type="email" value={mail.value} onChange={(v) => setMail((m) => ({ ...m, value: v }))} placeholder={me?.account?.contactEmail || 'you@example.com'} disabled={mail.silent} autoCapitalize="none" spellCheck={false} />
+              <TextInput id="cron-mailto" type="email" value={mail.value} onChange={(v) => setMail((m) => ({ ...m, value: v }))} placeholder={me?.account?.contactEmail || 'you@example.com'} disabled={mail.silent || capability} autoCapitalize="none" spellCheck={false} />
             </Field>
-            <Toggle checked={mail.silent} onChange={(v) => setMail((m) => ({ ...m, silent: v }))} label="Do not send any mail" description={<>Sets <code>MAILTO=""</code>; useful for jobs that print a lot</>} />
+            <Toggle checked={mail.silent} onChange={(v) => setMail((m) => ({ ...m, silent: v }))} label="Do not send any mail" description={<>Sets <code>MAILTO=""</code>; useful for jobs that print a lot</>} disabled={capability} />
             <FormActions>
-              <Button type="submit" variant="primary" icon={Mail} loading={busy === 'mail'} disabled={Boolean(busy)}>Save email</Button>
+              <Button type="submit" variant="primary" icon={Mail} loading={busy === 'mail'} disabled={Boolean(busy) || capability}>Save email</Button>
               {lastResult && <PendingPill result={lastResult} />}
             </FormActions>
           </Card>
         </form>
 
         <form onSubmit={add}>
-          <Card title="Add a cron job" subtitle="Pick how often, then the command. It is saved to your crontab straight away.">
+          <Card title="Add a cron job" subtitle={blockedSubtitle || 'Pick how often, then the command. It is saved to your crontab straight away.'}>
             <PanelCapabilityState error={isCapabilityError(addError) ? addError : null} />
             <RequestError error={addError} />
-            <JobForm value={draft} onChange={setDraft} errors={fieldErrorsAt(addError, jobs.length)} idPrefix="cron-new" />
+            <JobForm value={draft} onChange={setDraft} errors={fieldErrorsAt(addError, jobs.length)} idPrefix="cron-new" disabled={capability} />
             <FormActions>
-              <Button type="submit" variant="primary" icon={Plus} loading={busy === 'add'} disabled={Boolean(busy) || !draft.command.trim() || !draft.schedule.trim()}>Add cron job</Button>
+              <Button type="submit" variant="primary" icon={Plus} loading={busy === 'add'} disabled={Boolean(busy) || capability || !draft.command.trim() || !draft.schedule.trim()}>Add cron job</Button>
             </FormActions>
           </Card>
         </form>
@@ -276,16 +278,16 @@ export default function CronJobs({ fn }) {
         />
       </Card>
 
-      <Card title="Environment" subtitle="Variables placed at the top of the crontab, available to every job.">
+      <Card title="Environment" subtitle={blockedSubtitle || 'Variables placed at the top of the crontab, available to every job.'}>
         <PanelCapabilityState error={isCapabilityError(envError) ? envError : null} />
         <RequestError error={envError} />
         {otherEnv.length > 0 && (
           <KeyValue items={otherEnv.map((e) => [e.key, <span key={e.key} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}><code>{e.value || '""'}</code><button type="button" className="btn btn-sm btn-danger-ghost" onClick={() => removeEnv(e)} disabled={Boolean(busy)} aria-label={`Remove ${e.key}`}>Remove</button></span>])} />
         )}
         <form onSubmit={addEnv} className="form-grid" style={{ marginTop: otherEnv.length ? 12 : 0 }}>
-          <Field label="Name" htmlFor="cron-env-key" error={envError?.fields?.key}><TextInput id="cron-env-key" value={envDraft.key} onChange={(v) => setEnvDraft((d) => ({ ...d, key: v.toUpperCase() }))} placeholder="PATH" spellCheck={false} /></Field>
-          <Field label="Value" htmlFor="cron-env-value" error={envFieldError(envError)}><TextInput id="cron-env-value" value={envDraft.value} onChange={(v) => setEnvDraft((d) => ({ ...d, value: v }))} placeholder="/usr/local/bin:/usr/bin:/bin" spellCheck={false} /></Field>
-          <div style={{ gridColumn: '1 / -1' }}><FormActions><Button type="submit" loading={busy === 'env'} disabled={Boolean(busy) || !envDraft.key.trim()}>Set variable</Button></FormActions></div>
+          <Field label="Name" htmlFor="cron-env-key" error={envError?.fields?.key}><TextInput id="cron-env-key" value={envDraft.key} onChange={(v) => setEnvDraft((d) => ({ ...d, key: v.toUpperCase() }))} placeholder="PATH" spellCheck={false} disabled={capability} /></Field>
+          <Field label="Value" htmlFor="cron-env-value" error={envFieldError(envError)}><TextInput id="cron-env-value" value={envDraft.value} onChange={(v) => setEnvDraft((d) => ({ ...d, value: v }))} placeholder="/usr/local/bin:/usr/bin:/bin" spellCheck={false} disabled={capability} /></Field>
+          <div style={{ gridColumn: '1 / -1' }}><FormActions><Button type="submit" loading={busy === 'env'} disabled={Boolean(busy) || capability || !envDraft.key.trim()}>Set variable</Button></FormActions></div>
         </form>
         <p className="muted small" style={{ marginTop: 10 }}><Info size={12} style={{ verticalAlign: '-2px' }} /> <code>SHELL</code> may be <code>/bin/bash</code> or <code>/bin/sh</code>. Times follow the server clock{me?.hostname ? ` of ${me.hostname}` : ''}; see <Link to={USAGE_PATH}>usage</Link> for your plan's limits.</p>
       </Card>

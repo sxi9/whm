@@ -62,12 +62,12 @@ export default function BackupRestoration({ fn }) {
     <>
       <PageHeader fn={fn} description="Restore a complete account from one of its archives: home directory, databases and their users, DNS zones and mail routing. A terminated account is recreated from the metadata stored in the archive." />
       <BackupCapabilityBanner status={status.data} error={status.error} onRetry={status.refetch} />
-      <Card title="1. Choose the account and the backup date">
+      <Card title="Choose the account and backup">
         <BackupPicker key={refreshKey} account={account} onAccountChange={setAccount} backup={backup} onBackupChange={setBackup} requireLocal />
         <FetchButton backup={backup} onQueued={(id) => { setJobId(id); toast.info('Fetching the archive in the background'); }} />
       </Card>
       {backup && (
-        <Card title="2. What to restore">
+        <Card title="What to restore">
           <RequestError error={info.error} onRetry={info.refetch} />
           {info.data && (
             <KeyValue items={[

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Eye, EyeOff, RefreshCw } from 'lucide-react';
+import { Eye, EyeOff, RefreshCw, AlertTriangle } from 'lucide-react';
 
 export function Field({ label, help, error, required, children, inline = false, htmlFor }) {
   const errors = Array.isArray(error) ? error : error ? [error] : [];
@@ -85,10 +85,13 @@ export function generatePassword(length = 16) {
   return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
 }
 
+const STRENGTH_WORDS = { 'very-weak': 'Very weak', weak: 'Weak', good: 'Good', strong: 'Strong' };
+
 export function PasswordInput({ value, onChange, showStrength = true, allowGenerate = true, minStrength = 65, ...rest }) {
   const [visible, setVisible] = useState(false);
   const strength = useMemo(() => passwordStrength(value), [value]);
   const level = strength >= 80 ? 'strong' : strength >= minStrength ? 'good' : strength >= 40 ? 'weak' : 'very-weak';
+  const strengthText = `${STRENGTH_WORDS[level]}${strength < minStrength ? ' · needs to be stronger' : ''}`;
   return (
     <div className="password-input">
       <div className="input-group">
@@ -97,9 +100,9 @@ export function PasswordInput({ value, onChange, showStrength = true, allowGener
         {allowGenerate && <button type="button" className="btn btn-icon" onClick={() => { onChange(generatePassword()); setVisible(true); }} aria-label="Generate password" title="Generate"><RefreshCw size={16} /></button>}
       </div>
       {showStrength && (
-        <div className={`strength strength-${level}`}>
+        <div className={`strength ${value ? `strength-${level}` : 'strength-empty'}`} title={value ? `Strength ${strength} of 100, minimum ${minStrength}` : undefined} aria-hidden={value ? undefined : true}>
           <div className="strength-bar"><span style={{ width: `${strength}%` }} /></div>
-          <span className="strength-text">Strength: {strength} {value && strength < minStrength ? `(minimum ${minStrength})` : ''}</span>
+          {value && <span className="strength-text">{strengthText}</span>}
         </div>
       )}
     </div>
@@ -120,12 +123,17 @@ export function Button({ children, variant = 'default', loading = false, icon: I
 }
 
 // Generic error banner for a failed request (shows field errors when present).
-export function ErrorBanner({ error, onRetry }) {
+// `title` gives the page a plain-language heading; the server message then becomes the body.
+export function ErrorBanner({ error, onRetry, title, hint }) {
   if (!error) return null;
+  const detail = hint || error.hint || error.detail;
   return (
     <div className="banner banner-error" role="alert">
+      <AlertTriangle size={18} />
       <div>
-        <strong>{error.message}</strong>
+        <strong>{title || error.message}</strong>
+        {title && <p>{error.message}</p>}
+        {detail && <p className="muted">{detail}</p>}
         {error.fields && (
           <ul>{Object.entries(error.fields).map(([k, v]) => <li key={k}><code>{k}</code>: {Array.isArray(v) ? v.join(', ') : String(v)}</li>)}</ul>
         )}

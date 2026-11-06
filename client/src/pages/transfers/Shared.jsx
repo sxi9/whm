@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { useApi } from '../../hooks/useApi.js';
-import { Card, StatusPill, formatDate, formatBytes } from '../../components/Common.jsx';
+import { Card, StatusPill, formatDate, formatBytes, RefreshButton } from '../../components/Common.jsx';
 import { InstallPackages } from '../../components/InstallPackages.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
 import { Button, FormActions, Select, Toggle, Field } from '../../components/Form.jsx';
@@ -34,7 +34,7 @@ export function ToolingNotice({ caps, needs = [], onInstalled }) {
       <AlertTriangle size={18} />
       <div>
         <strong>Missing tools on this server</strong>
-        <ul>{missing.map((n) => <li key={n} style={{ marginBottom: 6 }}>{caps[n].label}: <code>{caps[n].packages}</code> <InstallPackages packages={toolPackages(caps[n].packages, family)} label={`Install ${caps[n].label}`} onFinished={onInstalled} /></li>)}</ul>
+        <ul>{missing.map((n) => <li key={n} style={{ marginBottom: 6 }}>{caps[n].label}: <code>{caps[n].packages}</code> <InstallPackages packages={toolPackages(caps[n].packages, family)} variant="default" label={`Install ${caps[n].label}`} onFinished={onInstalled} /></li>)}</ul>
         <p className="muted">Steps that need them finish as pending or are refused until they are installed.</p>
       </div>
     </div>
@@ -149,7 +149,7 @@ export function RunPanel({ job, runId, title, onReset, resetLabel = 'Start anoth
         <ProgressLog jobId={job.id} onFinished={done} />
         <FormActions>
           <Button onClick={onReset}>{resetLabel}</Button>
-          {finished && <Button variant="ghost" onClick={() => refetch()}>Refresh</Button>}
+          {finished && <RefreshButton onClick={() => refetch()} />}
           <Link className="btn btn-ghost" to="/transfers/review-transfers-and-restores">Review all runs</Link>
         </FormActions>
       </Card>
@@ -165,7 +165,7 @@ export function RunHistory({ kind, refreshKey, limit = 10 }) {
   const { data: open } = useApi(openId ? `/transfers/runs/${openId}` : null, { enabled: Boolean(openId) });
   return (
     <>
-      <Card title="Recent runs" padded={false} actions={<Button size="sm" variant="ghost" onClick={() => refetch()}>Refresh</Button>}>
+      <Card title="Recent runs" padded={false} actions={<RefreshButton size="sm" onClick={() => refetch()} />}>
         <DataTable
           columns={[
             { key: 'id', label: 'Run', render: (r) => `#${r.id}` },

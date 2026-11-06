@@ -90,11 +90,14 @@ export default function InstallCertificate({ fn }) {
                 <Select value={domain} onChange={(v) => { setDomain(v); setCertId(''); setResult(null); }} options={list.map((d) => ({ value: d.domain, label: d.type === 'main' ? d.domain : `${d.domain} (${typeName[d.type] || d.type})` }))} placeholder={domains.loading ? t('panel.ssl.loading', 'Loading…') : list.length ? t('panel.ssl.select_domain', 'Select a domain') : t('panel.ssl.no_domains_on_account', 'No domains on this account')} />
               </Field>
               {domain && (
-                <KeyValue items={[
-                  [t('panel.ssl.current_certificate', 'Current certificate'), current ? <StatePill key="s" state={current.state} /> : <StatusPill key="n" status="warning">{t('panel.ssl.none', 'none')}</StatusPill>],
-                  current && [t('panel.ssl.issued_by', 'Issued by'), current.selfSigned ? t('panel.ssl.self_signed', 'Self-signed') : current.issuer || '—'],
-                  current && [t('panel.ssl.expires', 'Expires'), <ExpiryPill key="e" notAfter={current.notAfter} daysRemaining={current.daysRemaining} />],
-                ]} />
+                <Field label={t('panel.ssl.current_certificate', 'Current certificate')}>
+                  {/* Sits on the control line of the select beside it, not on its label line. */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minHeight: 36 }}>
+                    {current ? <StatePill state={current.state} /> : <StatusPill status="warning">{t('panel.ssl.none', 'none')}</StatusPill>}
+                    {current && <span className="muted small">{t('panel.ssl.issued_by', 'Issued by')} {current.selfSigned ? t('panel.ssl.self_signed', 'Self-signed') : current.issuer || '—'}</span>}
+                    {current && <ExpiryPill notAfter={current.notAfter} daysRemaining={current.daysRemaining} />}
+                  </div>
+                </Field>
               )}
             </div>
           </Card>
@@ -126,7 +129,7 @@ export default function InstallCertificate({ fn }) {
               <div className="form-grid">
                 <Field label={t('panel.ssl.cert_pem', 'Certificate (PEM)')} required error={error?.fields?.certPem}><Textarea value={form.certPem} onChange={(v) => setForm({ ...form, certPem: v })} rows={7} mono spellCheck={false} placeholder="-----BEGIN CERTIFICATE-----" /></Field>
                 <Field label={t('panel.ssl.key_pem', 'Private key (PEM)')} required error={error?.fields?.keyPem} help={t('panel.ssl.key_pem_help', 'Unencrypted. It is stored encrypted and never shown again.')}><Textarea value={form.keyPem} onChange={(v) => setForm({ ...form, keyPem: v })} rows={7} mono spellCheck={false} placeholder="-----BEGIN PRIVATE KEY-----" /></Field>
-                <Field label={t('panel.ssl.chain_pem', 'Chain / CA bundle (PEM)')} help={t('panel.ssl.chain_pem_help', 'Intermediate certificates from your certificate authority, if any.')} error={error?.fields?.chainPem}><Textarea value={form.chainPem} onChange={(v) => setForm({ ...form, chainPem: v })} rows={5} mono spellCheck={false} placeholder="-----BEGIN CERTIFICATE-----" /></Field>
+                <Field label={t('panel.ssl.chain_pem', 'Chain / CA bundle (PEM)')} help={t('panel.ssl.chain_pem_help', 'Intermediate certificates from your certificate authority, if any.')} error={error?.fields?.chainPem}><Textarea value={form.chainPem} onChange={(v) => setForm({ ...form, chainPem: v })} rows={7} mono spellCheck={false} placeholder="-----BEGIN CERTIFICATE-----" /></Field>
               </div>
             )}
             {error && !isCapabilityError(error) && !error.fields && <ErrorBanner error={error} />}

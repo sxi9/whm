@@ -181,7 +181,8 @@ export function planTasks(tasks, { home, repo }) {
     for (const w of words.slice(1)) {
       if (!optionsDone && w.startsWith('-')) {
         if (w === '--') { optionsDone = true; argv.push(w); continue; }
-        const ok = spec.options.includes(w) || spec.options.some((o) => o.endsWith('=') && w.startsWith(o) && w.length > o.length && !/[\0]/.test(w));
+        const combined = /^-[A-Za-z]{2,}$/.test(w) && [...w.slice(1)].every((c) => spec.options.includes(`-${c}`));
+        const ok = combined || spec.options.includes(w) || spec.options.some((o) => o.endsWith('=') && w.startsWith(o) && w.length > o.length && !/[\0]/.test(w));
         if (!ok) throw new OpError('invalid_args', `task "${line}": option "${w}" is not allowed for ${program}`);
         argv.push(w);
         continue;

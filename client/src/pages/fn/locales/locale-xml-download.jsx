@@ -34,7 +34,7 @@ export default function LocaleXmlDownload({ fn }) {
       {locales.length > 0 && (
         <Card title="Export a locale as XML" subtitle="The file holds every translated string of the locale as <string key=…> elements and can be edited offline, then re-imported with Locale XML Upload.">
           <Field label="Locale"><LocaleSelect value={code} onChange={(v) => setParams({ code: v })} locales={locales} placeholder={null} /></Field>
-          {selected && <KeyValue items={[['Name', selected.name], ['Strings', `${selected.stats.translated} translated of ${selected.stats.total}${selected.stats.extra ? ` (+${selected.stats.extra} extra)` : ''}`], ['Progress', <TranslationProgress key="p" stats={selected.stats} />], preview && ['File', `${preview.filename} · ${preview.bytes} bytes`]]} />}
+          {selected && <KeyValue items={[['Name', selected.name], ['Translated', <span key="p"><TranslationProgress stats={selected.stats} />{selected.stats.extra ? <span className="muted small"> +{selected.stats.extra} extra</span> : null}</span>], preview && ['File', `${preview.filename} · ${preview.bytes} bytes`]]} />}
           <ErrorBanner error={fetchError} />
           <FormActions>
             <Button variant="primary" icon={Download} loading={busy} disabled={!code} onClick={download}>Download {code ? `${code}.xml` : ''}</Button>

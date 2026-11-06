@@ -27,7 +27,7 @@ export default function RebuildRpmDatabase({ fn }) {
             <Info size={18} />
             <div>
               <strong>This is not an RPM-based system</strong>
-              <p>The RPM database only exists on RHEL-family distributions (AlmaLinux, Rocky Linux, CloudLinux, CentOS, Fedora). This host uses <code>{data.manager || 'an unknown package manager'}</code>{data.family === 'debian' ? ' (dpkg), whose database does not need rebuilding; dpkg --configure -a runs as part of System Update when needed.' : '.'}</p>
+              <p>The RPM database only exists on RHEL-family distributions (AlmaLinux, Rocky Linux, CloudLinux, CentOS, Fedora). This host uses {data.manager ? <code>{data.manager}</code> : 'an unknown package manager'}{data.family === 'debian' ? ' (dpkg), whose database does not need rebuilding; dpkg --configure -a runs as part of System Update when needed.' : '.'}</p>
             </div>
           </div>
           <div className="action-row"><Button variant="primary" disabled>Rebuild RPM database</Button></div>

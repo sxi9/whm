@@ -82,10 +82,8 @@ export function ContactManager() {
         />
       </Card>
 
-      <div className="grid-2" style={{ alignItems: 'start' }}>
-        <NotificationSettings settings={settings} capability={capability} smtpSecurity={data.smtpSecurity} onSaved={refreshAll} />
-        <ChecksCard settings={settings} schedule={data.schedule} openAlerts={data.openAlerts} onChanged={refreshAll} />
-      </div>
+      <NotificationSettings settings={settings} capability={capability} smtpSecurity={data.smtpSecurity} onSaved={refreshAll} />
+      <ChecksCard settings={settings} schedule={data.schedule} openAlerts={data.openAlerts} onChanged={refreshAll} />
 
       <EventCatalog events={data.events} />
       <DeliveryLog version={logVersion} events={data.events} />
@@ -133,12 +131,16 @@ function NotificationSettings({ settings, capability, smtpSecurity, onSaved }) {
   };
 
   return (
-    <Card title="Notification settings" subtitle={`Email leaves through ${capability.mailTransport === 'exim' ? 'Exim on this server' : capability.mailTransport === 'smtp' ? `the SMTP relay ${settings.smtp.host}` : 'nothing yet: install Exim or configure a relay'}.`}>
+    <>
+    <Card title="Delivery" subtitle={`Email leaves through ${capability.mailTransport === 'exim' ? 'Exim on this server' : capability.mailTransport === 'smtp' ? `the SMTP relay ${settings.smtp.host}` : 'nothing yet: install Exim or configure a relay'}.`}
+      actions={<div className="input-group"><TextInput value={testTo} onChange={setTestTo} placeholder="you@example.com" type="email" aria-label="Send a test message to" /><Button size="sm" icon={Send} loading={testing} disabled={!testTo.trim() || dirty} onClick={sendTest} title={dirty ? 'Save the settings first' : 'Send a test message'}>Send test</Button></div>}>
       <Field inline><Toggle checked={draft.enabled} onChange={(v) => set('enabled', v)} label="Send notifications" description="When off, events are still raised but nothing is delivered." /></Field>
-      <Field label="From address" help={`Blank uses ${settings.effectiveFrom ? settings.effectiveFrom : 'the default sender'} (mail.notification_from, or the panel's address at this hostname).`} error={error?.fields?.fromAddress}><TextInput value={draft.fromAddress} onChange={(v) => set('fromAddress', v)} placeholder={settings.effectiveFrom || 'notifications@host.example.com'} /></Field>
-      <Field label="Keep the delivery log for (days)"><NumberInput value={draft.retentionDays} onChange={(v) => set('retentionDays', v ?? 1)} min={1} max={3650} nullable={false} /></Field>
-      <h3 style={{ margin: '14px 0 6px' }}>SMTP relay</h3>
-      <p className="muted">Used when Exim is not installed, or always when “prefer the relay” is on. Leave the host blank to disable.</p>
+      <div className="form-grid">
+        <Field label="From address" help={`Blank uses ${settings.effectiveFrom ? settings.effectiveFrom : 'the default sender'} (mail.notification_from, or the panel's address at this hostname).`} error={error?.fields?.fromAddress}><TextInput value={draft.fromAddress} onChange={(v) => set('fromAddress', v)} placeholder={settings.effectiveFrom || 'notifications@host.example.com'} /></Field>
+        <Field label="Keep the delivery log for (days)"><NumberInput value={draft.retentionDays} onChange={(v) => set('retentionDays', v ?? 1)} min={1} max={3650} nullable={false} /></Field>
+      </div>
+    </Card>
+    <Card title="SMTP relay" subtitle="Used when Exim is not installed, or always when “prefer the relay” is on. Leave the host blank to disable.">
       <div className="form-grid">
         <Field label="Host" error={error?.fields?.['smtp.host']}><TextInput value={draft.smtp.host} onChange={(v) => setSmtp('host', v)} placeholder="smtp.example.net" /></Field>
         <Field label="Port"><NumberInput value={draft.smtp.port} onChange={(v) => setSmtp('port', v ?? 587)} min={1} max={65535} nullable={false} /></Field>
@@ -158,19 +160,18 @@ function NotificationSettings({ settings, capability, smtpSecurity, onSaved }) {
       <Field inline><Toggle checked={draft.smtp.allowSelfSigned} onChange={(v) => setSmtp('allowSelfSigned', v)} label="Accept the relay's self-signed certificate" /></Field>
       <Field inline><Toggle checked={draft.smtp.allowPlaintextAuth} onChange={(v) => setSmtp('allowPlaintextAuth', v)} label="Allow plaintext authentication" description="Send the relay password over a plain connection to a non-loopback host. Only for an isolated network." /></Field>
       <Field inline><Toggle checked={draft.smtp.prefer} onChange={(v) => setSmtp('prefer', v)} label="Prefer the relay even when Exim is installed" /></Field>
-      <h3 style={{ margin: '14px 0 6px' }}>Webhooks</h3>
+    </Card>
+    <Card title="Webhooks">
       <Field inline><Toggle checked={draft.webhook.allowPrivate} onChange={(v) => setDraft((d) => ({ ...d, webhook: { ...d.webhook, allowPrivate: v } }))} label="Allow webhooks to private addresses" description="Loopback, link-local and RFC 1918 targets are refused unless this is on, so a contact cannot be pointed at internal services." /></Field>
+    </Card>
+    <div className="sticky-actions">
       <ErrorBanner error={error} />
       <FormActions>
-        <Button variant="primary" loading={saving} disabled={!dirty} onClick={save}>Save</Button>
+        <Button variant="primary" loading={saving} disabled={!dirty} onClick={save}>Save notification settings</Button>
         <Button disabled={!dirty || saving} onClick={() => setDraft(initial())}>Reset</Button>
       </FormActions>
-      <h3 style={{ margin: '14px 0 6px' }}>Send a test message</h3>
-      <div className="input-group">
-        <TextInput value={testTo} onChange={setTestTo} placeholder="you@example.com" type="email" />
-        <Button icon={Send} loading={testing} disabled={!testTo.trim() || dirty} onClick={sendTest} title={dirty ? 'Save the settings first' : undefined}>Send</Button>
-      </div>
-    </Card>
+    </div>
+    </>
   );
 }
 

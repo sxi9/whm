@@ -68,7 +68,7 @@ export default function EditZoneTemplates({ fn }) {
           </div>
           <FormActions>
             <Button variant="primary" loading={busy} onClick={save} disabled={body === current.body}>Save</Button>
-            <Button onClick={doPreview} loading={busy}>Save and preview</Button>
+            <Button onClick={doPreview} loading={busy}>{body === current.body ? 'Preview' : 'Save and preview'}</Button>
             <Button onClick={() => setBody(current.body)} disabled={body === current.body}>Reset</Button>
             {!current.builtin && <Button variant="danger" onClick={remove}>Delete template</Button>}
           </FormActions>

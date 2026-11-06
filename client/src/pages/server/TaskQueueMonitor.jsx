@@ -18,7 +18,7 @@ export default function TaskQueueMonitor({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Background jobs: backups, transfers, bulk changes and builds. Open a job to follow its live log." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
-      <Card padded={false}>
+      <Card title="Jobs" subtitle={data ? `${data.length} most recent · ${data.filter((j) => ['queued', 'running'].includes(j.status)).length} active` : undefined} padded={false}>
         <DataTable
           columns={[
             { key: 'id', label: '#', width: 60 },

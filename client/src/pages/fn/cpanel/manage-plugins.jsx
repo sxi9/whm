@@ -317,7 +317,7 @@ export default function ManagePlugins({ fn }) {
   const columns = [
     { key: 'name', label: 'Plugin', render: (p) => <><strong>{p.name}</strong> <span className="muted small">{p.version}</span><br /><code className="small">{p.id}</code></> },
     { key: 'state', label: 'State', render: (p) => <><StatusPill status={p.state} />{p.lastError ? <span className="muted small"> {p.lastError.message}</span> : null}</> },
-    { key: 'signed', label: 'Package', render: (p) => <>{p.signed ? <span className="pill pill-ok">signed · {p.signer}</span> : <span className="pill pill-warn">unsigned</span>} <span className={`pill ${p.source === 'marketplace' ? 'pill-info' : p.source === 'bundled' ? 'pill-muted' : 'pill-warn'}`}>{sourceLabel(p.source)}</span></> },
+    { key: 'signed', label: 'Package', render: (p) => <>{p.signed ? <span className="pill pill-ok">Signed · {p.signer}</span> : <span className="pill pill-warn">Unsigned</span>} <span className={`pill ${p.source === 'marketplace' ? 'pill-info' : p.source === 'bundled' ? 'pill-muted' : 'pill-warn'}`}>{sourceLabel(p.source)}</span></> },
     { key: 'permissions', label: 'Permissions', render: (p) => <span title={p.permissions.join('\n')}>{p.permissions.length}</span> },
     { key: 'installedAt', label: 'Installed', render: (p) => formatDate(p.installedAt) },
   ];

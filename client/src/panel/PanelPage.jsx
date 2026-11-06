@@ -18,12 +18,14 @@ export function PanelPageHeader({ fn, title, description, actions, children }) {
   const id = fn ? panelId(fn) : null;
   const heading = title || (fn && t(`${shell.i18nPrefix}.${id}.label`, fn.label));
   const text = description || (fn && t(`${shell.i18nPrefix}.${id}.description`, fn.description));
+  // A category landing page is named after its category ("Domains › Domains"): one crumb is enough.
+  const categoryLabel = fn ? t(`${shell.categoryPrefix}.${fn.categorySlug}`, fn.category) : null;
   return (
     <header className="page-header">
       <div className="page-header-main">
         <nav className="breadcrumbs" aria-label={t('panel.shell.breadcrumb', 'Breadcrumb')}>
           <Link to={shell.home}>{t('panel.common.home', 'Home')}</Link>
-          {fn && <><span>›</span><span>{t(`${shell.categoryPrefix}.${fn.categorySlug}`, fn.category)}</span></>}
+          {fn && categoryLabel !== heading && <><span>›</span><span>{categoryLabel}</span></>}
           {heading && <><span>›</span><span className="current">{heading}</span></>}
         </nav>
         <div className="page-title-row">
@@ -62,25 +64,30 @@ export const isCapabilityError = (error) => Boolean(error) && !isPlanSettingErro
 // 501 from the API: the daemon behind this screen is not installed on the server.
 // Customers cannot install anything, so the prompt tells them whom to ask. A plan
 // setting (`shell_disabled` and the other PLAN_SETTING_CODES) is worded as such.
-export function PanelCapabilityState({ error, onRetry }) {
+// `card` gives the state its own surface when it is the whole page body; inside
+// a card body, a form or a modal the bare state is the right one.
+export function PanelCapabilityState({ error, onRetry, card = false }) {
   const { t } = useT();
   if (!error) return null;
+  let state = null;
   if (isPlanSettingError(error)) {
-    return (
+    state = (
       <EmptyState icon={AlertTriangle} title={t('panel.shell.feature_disabled_title', 'Not included in your plan')}>
         <p>{error.message || t('panel.shell.feature_disabled_generic', 'This feature is not part of the hosting plan on this account.')}</p>
         <p className="muted">{t('panel.shell.feature_disabled_help', 'Ask your hosting provider about upgrading the plan.')}</p>
       </EmptyState>
     );
+  } else if (isCapabilityError(error)) {
+    state = (
+      <EmptyState icon={PackageX} title={t('panel.shell.capability_title', 'Not available on this server')}>
+        <p>{error.message || t('panel.shell.capability_text', 'The service behind this screen is not installed.')}</p>
+        <p className="muted">{t('panel.shell.capability_help', 'Ask your hosting provider to enable it. Everything else in the account panel keeps working.')}</p>
+        {onRetry && <p><button className="btn btn-sm" onClick={onRetry}>{t('panel.shell.recheck', 'Re-check')}</button></p>}
+      </EmptyState>
+    );
   }
-  if (!isCapabilityError(error)) return null;
-  return (
-    <EmptyState icon={PackageX} title={t('panel.shell.capability_title', 'Not available on this server')}>
-      <p>{error.message || t('panel.shell.capability_text', 'The service behind this screen is not installed.')}</p>
-      <p className="muted">{t('panel.shell.capability_help', 'Ask your hosting provider to enable it. Everything else in the account panel keeps working.')}</p>
-      {onRetry && <p><button className="btn btn-sm" onClick={onRetry}>{t('panel.shell.recheck', 'Re-check')}</button></p>}
-    </EmptyState>
-  );
+  if (!state) return null;
+  return card ? <Card>{state}</Card> : state;
 }
 
 // A mutation answered `applied:false, reason:'capability_missing'` (dev hosts): the

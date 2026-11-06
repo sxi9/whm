@@ -88,6 +88,9 @@ export default function MultiPhpManager({ fn }) {
   const current = catalog.data?.effectiveDefault ?? versions.data?.effectiveDefault;
   const rows = domains.data?.domains || [];
   const matrix = catalog.data?.versions || [];
+  // One OS note shared by every uninstalled version is printed once above the rows.
+  const noted = matrix.filter((v) => !v.installed && v.note);
+  const sharedNote = noted.length > 1 && noted.every((v) => v.note === noted[0].note) ? noted[0].note : null;
 
   const setDefault = async (version) => {
     if (!version || version === current) return;
@@ -165,10 +168,11 @@ export default function MultiPhpManager({ fn }) {
         <Card title="PHP versions" subtitle={`Every version of the catalog for ${catalog.data.os?.id || catalog.data.family || 'this host'}${catalog.data.os?.versionId ? ` ${catalog.data.os.versionId}` : ''}: install, remove, pick the system default and choose what accounts may select.`} actions={<Button onClick={refetchAll}>Re-detect</Button>} padded={false}>
           <div className="table-wrap">
             <table>
-              <thead><tr><th>Version</th><th>State</th><th>PHP-FPM</th><th>Default</th><th>Domains</th><th>Offered to accounts</th><th /></tr></thead>
+              <thead><tr><th style={{ minWidth: 220 }}>Version</th><th>State</th><th>PHP-FPM</th><th>Default</th><th>Domains</th><th>Offered to accounts</th><th /></tr></thead>
               <tbody>
                 {matrix.length === 0 && <tr><td colSpan={7} className="table-state">The catalog is empty for this OS. Add a version with <Link to="/software/easyapache-4">EasyApache 4</Link> or install packages by hand.</td></tr>}
                 {matrix.some((v) => !v.installed && v.method === 'source') && <tr><td colSpan={7} className="muted small" style={{ padding: '8px 16px' }}>Versions marked <em>Source build</em> have no packages for this OS yet; Install compiles them from the official php.net source into {PHP_SOURCE_PREFIX}/&lt;version&gt; with their own PHP-FPM service (about 15 minutes, the build log streams below).</td></tr>}
+                {sharedNote && <tr><td colSpan={7} className="muted small" style={{ padding: '8px 16px' }}>{sharedNote}</td></tr>}
                 {matrix.map((v) => {
                   const blocker = removeBlocker(v, matrix.filter((x) => x.installed).length);
                   return (
@@ -176,13 +180,13 @@ export default function MultiPhpManager({ fn }) {
                       <td><strong>{v.label || `PHP ${v.id}`}</strong> {v.version && <span className="muted">{v.version}</span>} <SourceBuildPill row={v} /> <PhpAdvisoryBadge advisories={v.advisories} />
                         {v.installed && v.binary && <><br /><code className="small">{v.binary}</code></>}
                         {!v.installed && v.method === 'source' && <><br /><code className="small">{PHP_SOURCE_PREFIX}/{v.id}</code></>}
-                        {!v.installed && v.note && <><br /><span className="muted small">{v.note}</span></>}
+                        {!v.installed && v.note && v.note !== sharedNote && <><br /><span className="muted small" style={{ display: 'block', maxWidth: 360 }}>{v.note}</span></>}
                       </td>
                       <td><PhpStatePill state={v.state} /></td>
                       <td>{v.installed ? (v.fpmInstalled ? <StatusPill status={v.fpmActive ? 'active' : v.fpmActive === false ? 'inactive' : 'unknown'}>{v.fpmUnit || 'FPM'}{v.fpmActive === false ? ' · stopped' : ''}</StatusPill> : <StatusPill status="not-installed">no FPM</StatusPill>) : <span className="muted">—</span>}</td>
                       <td>{v.isSystemDefault && <StatusPill status="ok">system default</StatusPill>}{v.isDefault && !v.isSystemDefault && <StatusPill status="info">CLI</StatusPill>}</td>
                       <td>{v.installed ? v.domains ?? 0 : <span className="muted">—</span>}</td>
-                      <td><Toggle checked={Boolean(v.offered)} disabled={!v.installed || busy} onChange={(on) => setOffered(v, on)} label={v.installed ? (v.offered ? 'Offered' : 'Hidden') : 'Install first'} /></td>
+                      <td style={{ whiteSpace: 'nowrap' }}><Toggle checked={Boolean(v.offered)} disabled={!v.installed || busy} onChange={(on) => setOffered(v, on)} label={v.installed ? (v.offered ? 'Offered' : 'Hidden') : 'Install first'} /></td>
                       <td className="actions-col">
                         {!v.installed && <Button size="sm" variant="primary" loading={runner.busy} disabled={v.state === 'unsupported'} title={v.state === 'unsupported' ? v.note || 'Not available for this OS' : v.method === 'source' ? `Built from the php.net source into ${PHP_SOURCE_PREFIX}/${v.id}` : undefined} onClick={() => install(v)}>Install</Button>}
                         {v.installed && !v.isSystemDefault && <Button size="sm" loading={busy} onClick={() => setDefault(v.id)}>Set as default</Button>}

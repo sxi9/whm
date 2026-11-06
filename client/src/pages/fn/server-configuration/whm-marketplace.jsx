@@ -5,7 +5,7 @@ import { useApi } from '../../../hooks/useApi.js';
 import { queryString } from '../../../api/client.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, Loading, StatusPill, EmptyState } from '../../../components/Common.jsx';
-import { TextInput, Select } from '../../../components/Form.jsx';
+import { TextInput, Select, Button } from '../../../components/Form.jsx';
 import { RequestError } from '../../server-configuration/Shared.jsx';
 import { MarketplaceTab, MarketplaceDisabledNotice } from '../../cpanel/MarketplaceTab.jsx';
 
@@ -20,12 +20,12 @@ export default function WhmMarketplace({ fn }) {
       <PageHeader fn={fn} description={hubOn ? 'Plugins published on the Keel marketplace hub, verified and signed by the vendor, plus the distribution packages that extend the host.' :'Add-ons that extend the panel. This is a read-only catalog for now: each entry links to the distribution packages behind it and the page that configures it once installed.'} />
       {status.data && !hubOn && user?.role === 'root' && <MarketplaceDisabledNotice />}
       {hubOn && <MarketplaceTab manage={user?.role === 'root'} status={status.data} />}
-      <StaticCatalog title={hubOn ? 'Distribution packages' : null} />
+      <StaticCatalog title={hubOn ? 'Distribution packages' : null} showNote={!(status.data && !hubOn && user?.role === 'root')} />
     </>
   );
 }
 
-export function StaticCatalog({ title = null }) {
+export function StaticCatalog({ title = null, showNote = true }) {
   const [q, setQ] = useState('');
   const [category, setCategory] = useState('');
   const { data, loading, error, refetch } = useApi(`/server-config/marketplace${queryString({ q, category })}`);
@@ -33,7 +33,7 @@ export function StaticCatalog({ title = null }) {
   return (
     <>
       <RequestError error={error} onRetry={refetch} />
-      {data?.note && !title && <div className="banner banner-info"><Info size={18} /><div><strong>Marketplace preview</strong><p>{data.note}</p></div></div>}
+      {data?.note && !title && showNote && <div className="banner banner-info"><Info size={18} /><div><strong>Marketplace preview</strong><p>{data.note}</p></div></div>}
       <Card padded={false} title={title || undefined} subtitle={title ? 'Host software the panel can install through the package manager; not plugins.' : undefined}>
         <div className="datatable-toolbar">
           <TextInput value={q} onChange={setQ} placeholder="Search add-ons…" style={{ maxWidth: 280 }} aria-label="Search add-ons" />
@@ -55,7 +55,7 @@ export function StaticCatalog({ title = null }) {
                   {item.price} · {item.packagesForHost?.length ? <>packages: {item.packagesForHost.map((p) => <code key={p} style={{ marginRight: 4 }}>{p}</code>)}</> : 'packages: see distribution'}
                 </small>
                 <div className="row-actions" style={{ justifyContent: 'flex-start', flexWrap: 'wrap', marginTop: 'auto', paddingTop: 4 }}>
-                  {!item.installed && <Link className="btn btn-sm btn-primary" to={item.installPath}>Install packages</Link>}
+                  {!item.installed && (data.packageManager ? <Link className="btn btn-sm" to={item.installPath}>Install packages</Link> : <Button size="sm" disabled title="No package manager was detected on this host">Install packages</Button>)}
                   {item.installed && item.configure && <Link className="btn btn-sm" to={item.configure}>Configure</Link>}
                   {item.docs && <a className="btn btn-sm btn-ghost" href={item.docs} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Docs</a>}
                 </div>

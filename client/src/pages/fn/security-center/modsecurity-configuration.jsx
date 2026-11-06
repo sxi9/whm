@@ -45,6 +45,20 @@ export default function ModsecurityConfiguration({ fn }) {
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
       {data && !data.installed && <CapabilityNotice error={{ code: 'capability_missing', message: 'ModSecurity is not installed. Install libapache2-mod-security2 (Debian/Ubuntu) or mod_security (RHEL) and refresh.' }} onRetry={refetch} />}
+      {data && !data.installed && (
+        <Card title="Engine directives" subtitle="Shown for reference; the directives can be set once ModSecurity is installed.">
+          <fieldset disabled style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+            <div className="form-grid">
+              {DIRECTIVES.map((d) => (
+                <Field key={d.key} label={d.label} help={d.help}>
+                  {d.type === 'select' ? <Select value="" onChange={() => {}} options={d.options} placeholder="inherit" disabled /> : d.type === 'number' ? <NumberInput value={null} onChange={() => {}} placeholder="inherit" disabled /> : <TextInput value="" onChange={() => {}} placeholder={d.placeholder} disabled />}
+                </Field>
+              ))}
+            </div>
+            <FormActions><Button variant="primary" disabled>Save and reload Apache</Button></FormActions>
+          </fieldset>
+        </Card>
+      )}
       {data && data.installed && (
         <>
           <Card title="Status">

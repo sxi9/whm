@@ -91,7 +91,8 @@ export default function ErrorPages({ fn }) {
         <Card title={t('panel.advanced.responses_title', 'Error responses')} padded={false}>
           {capability && <div className="card-body"><PanelCapabilityState error={pages.error} onRetry={pages.refetch} /></div>}
           {!capability && pages.error && <div className="card-body"><RequestError error={pages.error} onRetry={pages.refetch} /></div>}
-          <DataTable
+          {/* A failed read shows the banner alone; the table would otherwise sit under it saying "Loading…" forever. */}
+          {!pages.error && <DataTable
             dense
             columns={[
               { key: 'code', label: t('panel.advanced.col_code', 'Code'), width: 90, render: (r) => <code>{r.code}</code> },
@@ -104,8 +105,8 @@ export default function ErrorPages({ fn }) {
               { label: r.exists ? t('common.edit', 'Edit') : t('panel.advanced.create', 'Create'), primary: true, onClick: () => openEditor(r) },
               ...(r.exists || r.active ? [{ label: t('panel.advanced.use_default', 'Use default'), danger: true, onClick: () => remove(r) }] : []),
             ]}
-            emptyText={capability ? t('panel.advanced.empty_capability', 'Error pages can be edited once the file manager is available on this server.') : t('panel.advanced.loading_pages', 'Loading the error pages of this domain…')}
-          />
+            emptyText={t('panel.advanced.loading_pages', 'Loading the error pages of this domain…')}
+          />}
         </Card>
       )}
       <p className="muted small"><FileWarning size={12} /> {t('panel.advanced.note_before', 'Pages are plain HTML with your text only (no scripts); a page you wrote yourself in')} <code>errors/</code> {t('panel.advanced.note_after', 'is kept as it is and only switched on.')}</p>

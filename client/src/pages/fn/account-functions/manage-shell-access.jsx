@@ -23,6 +23,8 @@ export default function ManageShellAccess({ fn }) {
   const [shell, setShell] = useState('/usr/sbin/nologin');
   const [busy, setBusy] = useState(false);
   const [lastError, setLastError] = useState(null);
+  const [q, setQ] = useState('');
+  const rows = (data || []).filter((r) => !q || `${r.username} ${r.domain} ${r.owner}`.toLowerCase().includes(q.toLowerCase()));
 
   const apply = async (usernames) => {
     if (shell !== '/usr/sbin/nologin' && !(await confirm({ title: `Give ${usernames.length} account(s) a ${label(shell).toLowerCase()}?`, message: 'The Linux login shell is changed with usermod -s. The owner can log in over SSH with the account password or keys.', confirmLabel: 'Apply' }))) return;
@@ -55,7 +57,8 @@ export default function ManageShellAccess({ fn }) {
             { key: 'shell', label: 'Current shell', render: (r) => <><StatusPill status={r.shell === '/usr/sbin/nologin' ? 'disabled' : 'enabled'}>{label(r.shell)}</StatusPill> <code className="muted">{r.shell}</code></> },
             { key: 'systemUser', label: 'Linux user', render: (r) => <StatusPill status={r.systemUser ? 'ok' : 'warning'}>{r.systemUser ? `UID ${r.uid}` : 'not provisioned'}</StatusPill> },
           ]}
-          rows={data || []} loading={loading} rowKey={(r) => r.username} selectable selected={selected} onSelectedChange={setSelected}
+          rows={rows} loading={loading} rowKey={(r) => r.username} selectable selected={selected} onSelectedChange={setSelected}
+          searchable q={q} onSearch={setQ} searchPlaceholder="Filter by user, domain or owner" emptyText="No accounts yet. Accounts created with Create a New Account appear here."
           rowActions={(r) => [{ label: `Set ${label(shell)}`, primary: true, disabled: r.shell === shell, onClick: () => apply([r.username]) }]}
           toolbar={<Button variant="primary" disabled={!selected.length} loading={busy} onClick={() => apply(selected)}>Apply to selected ({selected.length})</Button>}
         />

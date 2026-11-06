@@ -35,7 +35,7 @@ export default function ServerInformation({ fn }) {
             <div className="table-wrap">
               <table className="dense">
                 <thead><tr><th>Mount</th><th className="align-right">Size</th><th className="align-right">Used</th><th>Usage</th></tr></thead>
-                <tbody>{data.disks.map((d) => <tr key={d.filesystem + d.mountpoint}><td><div>{d.mountpoint}</div><small className="muted">{d.filesystem}</small></td><td className="align-right">{formatBytes(d.sizeBytes)}</td><td className="align-right">{formatBytes(d.usedBytes)}</td><td style={{ minWidth: 90 }}>{d.usedPercent}%<Meter used={d.usedPercent} total={100} /></td></tr>)}</tbody>
+                <tbody>{data.disks.length === 0 && <tr><td colSpan={4} className="table-state">No disks reported</td></tr>}{data.disks.map((d) => <tr key={d.filesystem + d.mountpoint}><td><div>{d.mountpoint}</div><small className="muted">{d.filesystem}</small></td><td className="align-right">{formatBytes(d.sizeBytes)}</td><td className="align-right">{formatBytes(d.usedBytes)}</td><td style={{ minWidth: 90 }}>{d.usedPercent}%<Meter used={d.usedPercent} total={100} /></td></tr>)}</tbody>
               </table>
             </div>
           </Card>
@@ -43,7 +43,7 @@ export default function ServerInformation({ fn }) {
             <div className="table-wrap">
               <table className="dense">
                 <thead><tr><th>Interface</th><th>Addresses</th></tr></thead>
-                <tbody>{data.interfaces.map((i) => <tr key={i.name}><td><code>{i.name}</code></td><td>{i.addresses.length ? i.addresses.map((a) => <div key={a.address}><code>{a.address}</code> <span className="muted">{a.family}</span></div>) : <span className="muted">—</span>}</td></tr>)}</tbody>
+                <tbody>{data.interfaces.map((i) => <tr key={i.name}><td><code style={{ whiteSpace: 'nowrap' }}>{i.name}</code></td><td>{i.addresses.length ? i.addresses.map((a) => <div key={a.address}><code className="small">{a.address}</code> <span className="muted">{a.family}</span></div>) : <span className="muted">—</span>}</td></tr>)}</tbody>
               </table>
             </div>
           </Card>

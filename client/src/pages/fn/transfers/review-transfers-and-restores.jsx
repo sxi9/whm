@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, StatusPill, formatDate } from '../../../components/Common.jsx';
+import { PageHeader, Card, StatusPill, formatDate, RefreshButton } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
-import { Field, Select, Button } from '../../../components/Form.jsx';
+import { Select } from '../../../components/Form.jsx';
 import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { KIND_LABELS, RunDetail, Totals } from '../../transfers/Shared.jsx';
 
@@ -16,11 +16,9 @@ function Runs() {
   return (
     <>
       <Totals items={[['Runs', rows.length], ['Accounts', sum('total')], ['Done', sum('done')], ['Pending', sum('pending')], ['Failed', sum('failed')]]} />
-      <Card title="Transfers and restores" padded={false} actions={<Button size="sm" variant="ghost" onClick={() => refetch()}>Refresh</Button>}>
-        <div className="card-body form-narrow">
-          <Field label="Kind"><Select value={kind} onChange={setKind} options={Object.entries(KIND_LABELS).map(([value, label]) => ({ value, label }))} placeholder="All kinds" /></Field>
-        </div>
+      <Card title="Transfers and restores" padded={false} actions={<RefreshButton size="sm" onClick={() => refetch()} />}>
         <DataTable
+          toolbar={<Select value={kind} onChange={setKind} options={Object.entries(KIND_LABELS).map(([value, label]) => ({ value, label }))} placeholder="All kinds" aria-label="Kind" />}
           columns={[
             { key: 'id', label: 'Run', render: (r) => `#${r.id}` },
             { key: 'kind', label: 'Kind', render: (r) => KIND_LABELS[r.kind] || r.kind },
@@ -47,11 +45,9 @@ function Jobs() {
   const { data: job } = useApi(openId ? `/transfers/jobs/${openId}` : null, { enabled: Boolean(openId) });
   return (
     <>
-      <Card title="Job queue entries" subtitle="Every transfer.* and restore.* job, including restores started from other tools." padded={false} actions={<Button size="sm" variant="ghost" onClick={() => refetch()}>Refresh</Button>}>
-        <div className="card-body form-narrow">
-          <Field label="Status"><Select value={status} onChange={setStatus} options={['queued', 'running', 'done', 'failed', 'cancelled']} placeholder="Any status" /></Field>
-        </div>
+      <Card title="Job queue entries" subtitle="Every transfer.* and restore.* job, including restores started from other tools." padded={false} actions={<RefreshButton size="sm" onClick={() => refetch()} />}>
         <DataTable
+          toolbar={<Select value={status} onChange={setStatus} options={['queued', 'running', 'done', 'failed', 'cancelled']} placeholder="Any status" aria-label="Status" />}
           columns={[
             { key: 'id', label: 'Job', render: (j) => `#${j.id}` },
             { key: 'type', label: 'Type', render: (j) => <code>{j.type}</code> },

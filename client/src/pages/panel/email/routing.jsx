@@ -94,10 +94,12 @@ export default function Routing({ fn }) {
   return (
     <PanelPage fn={fn} actions={<Button size="sm" icon={RefreshCw} onClick={() => refetch()} loading={loading && Boolean(data)}>{t('panel.email.routing.recheck_mx', 'Re-check MX')}</Button>}>
       <Card padded={false} title={t('panel.email.routing.title', 'Where mail for your domains is delivered')} subtitle={t('panel.email.routing.subtitle', 'Each domain is delivered on this server unless you route it to a remote mail exchanger; the MX column shows what the public DNS says today.')}>
-        <div className="card-body">
-          <PanelRequestError error={error} fn={fn} onRetry={refetch} />
-          {loading && !data && !error && <p className="muted">{t('panel.email.common.loading', 'Loading…')}</p>}
-        </div>
+        {(error || (loading && !data)) && (
+          <div className="card-body">
+            <PanelRequestError error={error} fn={fn} onRetry={refetch} />
+            {loading && !data && !error && <p className="muted">{t('panel.email.common.loading', 'Loading…')}</p>}
+          </div>
+        )}
         {data && rows.length === 0 && <EmptyState title={t('panel.email.common.no_domains_title', 'No domains on this account yet')} />}
         {rows.length > 0 && (
           <div className="table-wrap">

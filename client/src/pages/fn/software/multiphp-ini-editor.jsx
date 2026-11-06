@@ -62,8 +62,8 @@ export default function MultiPhpIniEditor({ fn }) {
               <Select value={scope} onChange={setScope} options={[{ value: 'version', label: 'A PHP version (php.ini, server-wide)' }, { value: 'domain', label: 'A domain (.user.ini in its document root)' }]} />
             </Field>
           )}
-          {scope === 'version' && <Field label="PHP version"><Select value={version} onChange={setVersion} options={versionOptions} placeholder={versions.data ? 'Select a version…' : 'Loading…'} /></Field>}
-          {scope === 'domain' && <Field label="Domain"><Select value={domain} onChange={setDomain} options={domainOptions} placeholder={domains.data ? 'Select a domain…' : 'Loading…'} /></Field>}
+          {scope === 'version' && <Field label="PHP version"><Select value={version} onChange={setVersion} options={versionOptions} disabled={Boolean(versions.error)} placeholder={versions.error ? 'No PHP versions installed' : versions.data ? 'Select a version…' : 'Loading…'} /></Field>}
+          {scope === 'domain' && <Field label="Domain"><Select value={domain} onChange={setDomain} options={domainOptions} disabled={Boolean(domains.error)} placeholder={domains.error ? 'No domains available' : domains.data ? 'Select a domain…' : 'Loading…'} /></Field>}
         </div>
         <RequestError error={versions.error || domains.error} onRetry={() => { versions.refetch(); domains.refetch(); }} />
         {scope === 'version' && isRoot && ini.data?.sapis && (() => {

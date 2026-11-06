@@ -38,6 +38,9 @@ export default function Bandwidth({ fn }) {
   const limitKnown = Boolean(data) || me?.account?.plan?.bandwidth_mb != null;
   const percent = current && !unlimited ? percentOf(current.usedMb, limitMb) : null;
   const total = rows.reduce((s, r) => s + (Number(r.bytes) || 0), 0);
+  // Months are filled in for the range even before a log was read; a run of 0 B
+  // rows then reads as real traffic, so the table shows its empty state instead.
+  const nothingRecorded = rows.length > 0 && total === 0 && !(data?.sources?.length);
   const ranges = RANGES.map((value) => ({ value, label: fill(t('panel.logs.last_months', 'Last {count} months'), { count: value }) }));
 
   if (isFeatureDisabled(error)) return <PanelPage fn={fn}><FeatureDisabledState fn={fn} /></PanelPage>;
@@ -72,7 +75,7 @@ export default function Bandwidth({ fn }) {
               return <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}><div className={`meter ${unlimited ? '' : meterTone(pct)}`} style={{ flex: 1, marginTop: 0, minWidth: 120 }}><span style={{ width: `${Math.min(100, pct)}%` }} /></div><span className="muted small" style={{ minWidth: 38, textAlign: 'right' }}>{pct}%</span></div>;
             } },
           ]}
-          rows={rows} loading={loading} error={capability || isFeatureDisabled(error) ? null : error} rowKey={(r) => r.period} dense
+          rows={nothingRecorded ? [] : rows} loading={loading} error={capability || isFeatureDisabled(error) ? null : error} rowKey={(r) => r.period} dense
           emptyText={capability ? t('panel.logs.traffic_empty_capability', 'Traffic appears here once the web server is available on this server.') : t('panel.logs.traffic_empty', 'No traffic recorded yet. Figures appear here after the first hour of visits to your domains.')}
         />
       </Card>

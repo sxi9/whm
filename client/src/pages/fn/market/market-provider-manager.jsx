@@ -73,22 +73,22 @@ export default function MarketProviderManager({ fn }) {
           <TestResultCard result={lastResult} />
           <Card title="Providers" padded={false}>
             <DataTable dense rows={rows} rowKey={(p) => p.name} columns={[
-              { key: 'displayName', label: 'Provider', render: (p) => (
+              { key: 'displayName', label: 'Provider', width: '32%', render: (p) => (
                 <div>
-                  <strong>{p.displayName}</strong>
-                  <div className="muted"><code>{p.name}</code> · {p.adapterLabel}</div>
-                  {p.url && <a href={p.url} target="_blank" rel="noreferrer">{p.url.replace(/^https:\/\//, '')}</a>}
+                  <strong>{p.displayName}</strong> <code className="small">{p.name}</code>
+                  <div className="muted small">{p.adapterLabel}</div>
+                  {p.url && <a className="small" href={p.url} target="_blank" rel="noreferrer">{p.url.replace(/^https:\/\//, '')}</a>}
                 </div>
               ) },
-              { key: 'type', label: 'Type', render: (p) => TYPE_LABELS[p.type] || p.type },
+              { key: 'type', label: 'Type', render: (p) => <span style={{ whiteSpace: 'nowrap' }}>{TYPE_LABELS[p.type] || p.type}</span> },
               { key: 'enabled', label: 'Status', render: (p) => <ProviderStatus p={p} /> },
-              { key: 'products', label: isRoot ? 'Products (resale)' : 'Products', render: (p) => (p.type === 'ssl'
-                ? (p.products.length ? <ul className="list-plain">{p.products.map((x) => <li key={x.id || x.name}>{x.name} <span className="muted">{money(x.price, x.currency)}</span></li>)}</ul> : <span className="muted">None</span>)
+              { key: 'products', label: isRoot ? 'Products (resale)' : 'Products', width: '28%', render: (p) => (p.type === 'ssl'
+                ? (p.products.length ? <ul className="list-plain">{p.products.map((x) => <li key={x.id || x.name}>{x.name} <span className="muted" style={{ whiteSpace: 'nowrap' }}>{money(x.price, x.currency).replace(/ /g, '\u00a0')}</span></li>)}</ul> : <span className="muted">None</span>)
                 : <span className="muted">Catalog from the hub{p.adapter === 'hub' && <><br /><Link to={LICENSE_PATH}>License key is entered under Basic Setup → License</Link></>}</span>) },
               ...(isRoot ? [
-                { key: 'commissionPercent', label: 'Commission', align: 'right', render: (p) => (p.readOnly ? '—' : `${p.commissionPercent}%`) },
+                { key: 'commissionPercent', label: 'Commission', align: 'right', render: (p) => <span style={{ whiteSpace: 'nowrap' }}>{p.readOnly ? '—' : `${p.commissionPercent}%`}</span> },
                 { key: 'orders', label: 'Orders', align: 'right', render: (p) => (p.orders == null ? '—' : p.orders) },
-                { key: 'lastTest', label: 'Last test', render: (p) => <LastTest p={p} /> },
+                { key: 'lastTest', label: 'Last test', render: (p) => <span style={{ whiteSpace: 'nowrap' }}><LastTest p={p} /></span> },
               ] : []),
             ]} rowActions={(p) => (p.readOnly ? [
               { label: 'Manage AutoSSL', primary: true, onClick: () => navigate(p.manageAt) },
