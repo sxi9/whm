@@ -133,9 +133,8 @@ function ensureUsersFile(ctx) {
   const file = ctx.assertAllowedPath(RADICALE.users, 'write');
   const gid = groupId(RADICALE.group);
   if (gid == null) throw new OpError('capability_missing', `The "${RADICALE.group}" group does not exist; install the radicale package first`);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o750 });
-  fs.chmodSync(dir, 0o750);
-  fs.chownSync(dir, 0, gid);
+  // The package's own directory: the radicale user must traverse it (it cannot traverse /etc/whm, 0750 root:whmpanel).
+  fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
   let st = null;
   try { st = fs.lstatSync(file); } catch { st = null; }
   if (!st) writeAtomic(file, '', { mode: 0o640, gid });

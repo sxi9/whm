@@ -13,5 +13,5 @@ export const PG_HBA_ROOTS = ['/etc/postgresql', '/var/lib/pgsql'];
 export const TERM_RUN_DIR = '/run/whm/term';
 // Radicale (CalDAV/CardDAV, dav.*): the distro config file, the panel's htpasswd directory under /etc/whm and the
 // collections store; lib.js adds the two roots outside /etc/whm to the allowed list.
-export const RADICALE = Object.freeze({ configDir: '/etc/radicale', config: '/etc/radicale/config', usersDir: '/etc/whm/radicale', users: '/etc/whm/radicale/users', storage: '/var/lib/radicale/collections', unit: 'radicale', user: 'radicale', group: 'radicale', host: '127.0.0.1', port: 5232, packages: ['radicale', 'python3-bcrypt'] });
+export const RADICALE = Object.freeze({ configDir: '/etc/radicale', config: '/etc/radicale/config', usersDir: '/etc/radicale', users: '/etc/radicale/users', storage: '/var/lib/radicale/collections', unit: 'radicale', user: 'radicale', group: 'radicale', host: '127.0.0.1', port: 5232, packages: ['radicale', 'python3-bcrypt'] });
 export const RADICALE_ROOTS = ['/etc/radicale', '/var/lib/radicale'];

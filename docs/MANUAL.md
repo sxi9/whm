@@ -878,7 +878,7 @@ The **Calendars (Radicale)** card on the same page is the CalDAV/CardDAV server 
 `radicale` and `python3-bcrypt` packages through the agent's package installer, then the agent
 writes `/etc/radicale/config` (managed; the distribution file is kept once as
 `config.keel-orig`) pinned to `127.0.0.1:5232`, `htpasswd` authentication with bcrypt on
-`/etc/whm/radicale/users` (0640 root:radicale), `rights = owner_only` and the store
+`/etc/radicale/users` (0640 root:radicale), `rights = owner_only` and the store
 `/var/lib/radicale/collections`, enables and restarts the unit, and — when Apache and a fully
 qualified hostname exist — publishes it. **Publish** (also *Publish again*) enables `proxy`,
 `proxy_http` and `headers` with `a2enmod` when they are missing, writes
@@ -890,7 +890,7 @@ touching packages. **Server:** `GET /api/service-config/dav`, `POST …/dav/inst
 package names; Apache for the publication. **Gotchas:** port 5232 is never exposed — the
 proxy is the only public path; DAV passwords are hashed by the panel (bcrypt) and only the
 hash reaches the agent, so a sub-user's User Manager password is *not* its DAV password; the
-`radicale` unit must be able to read `/etc/whm/radicale` (the group is set at install).
+`radicale` unit must be able to read `/etc/radicale` (the group is set at install).
 
 #### 7.5 Exim Configuration Manager
 

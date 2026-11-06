@@ -1,5 +1,5 @@
 -- Phase 8 P4-3 Calendars and Contacts: which DAV logins of an account carry a
--- password in Radicale's htpasswd file (/etc/whm/radicale/users, written by the
+-- password in Radicale's htpasswd file (/etc/radicale/users, written by the
 -- agent). The hash lives only on the host; this row records that one was set,
 -- for whom (the account itself or a P4-2 sub-user) and when.
 CREATE TABLE IF NOT EXISTS panel_dav_logins (

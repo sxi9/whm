@@ -118,7 +118,10 @@ export function createPanelTerminalService(ctx) {
   function gate(scope) {
     if (!scope?.username || !scope.accountId) throw new HttpError(403, 'panel_scope_required', 'No hosting account is bound to this session');
     assertFeature(scope, FEATURE);
-    if (!scope.account?.plan?.has_shell) throw new HttpError(501, 'shell_disabled', 'Shell access is not included in your hosting plan, so the terminal cannot be opened');
+    // The plan grants shell, or the operator granted it to this account alone (Manage Shell Access).
+    const accountShell = String(ctx.db.prepare('SELECT shell FROM accounts WHERE id = ?').get(scope.accountId)?.shell || '');
+    const loginShell = accountShell && !/(nologin|false)$/.test(accountShell);
+    if (!scope.account?.plan?.has_shell && !loginShell) throw new HttpError(501, 'shell_disabled', 'Shell access is not included in your hosting plan and has not been granted to this account (Manage Shell Access), so the terminal cannot be opened');
     const home = scope.account?.home_dir;
     if (!home || !path.isAbsolute(home)) throw new HttpError(409, 'no_home', 'This account has no home directory on the server yet');
   }

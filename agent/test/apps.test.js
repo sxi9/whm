@@ -217,8 +217,8 @@ describe('vhost proxies (web.vhost.write)', () => {
     for (const p of ['/', '/app', '/a/b.c-d_e', '/.well-known']) expect(PROXY_PATH_RE.test(p), p).toBe(true);
     for (const p of ['', 'app', '/a b', '/../x', '/./x', '/a/../b', '/x?y', '/x#y', '/x;y']) expect(PROXY_PATH_RE.test(p), p).toBe(false);
   });
-  it('web.modules.* accept only the three proxy modules and mod_rewrite', async () => {
-    for (const modules of [['php8.3'], ['proxy', 'headers'], ['ssl'], [], ['proxy; id'], 'proxy']) {
+  it('web.modules.* accept only the proxy modules, mod_rewrite and mod_headers', async () => {
+    for (const modules of [['php8.3'], ['proxy', 'userdir'], ['ssl'], [], ['proxy; id'], 'proxy']) {
       expect((await opError(runOp('web.modules.enable', { modules }, ctx))).code, JSON.stringify(modules)).toBe('invalid_args');
       if (Array.isArray(modules) && modules.length) expect((await opError(runOp('web.modules.status', { modules }, ctx))).code, JSON.stringify(modules)).toBe('invalid_args');
     }

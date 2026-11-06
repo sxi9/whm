@@ -2155,9 +2155,9 @@ file the panel owns; one collection tree per DAV login; the panel hashes every p
   packages, config: { path, exists, managed, inSync, meta }, users: { path, exists, count }, storage: { path, exists }, unit: { name,
   present, active, enabled, pid } }`; `dav.install { restart? }` (packages are **not** its job — the server installs `radicale` and
   `python3-bcrypt` through `pkg.install` first) renders `/etc/radicale/config` from `renderRadicaleConfig()` (constants only:
-  `hosts = 127.0.0.1:5232`, `[auth] type = htpasswd`, `htpasswd_filename = /etc/whm/radicale/users`, `htpasswd_encryption = bcrypt`,
+  `hosts = 127.0.0.1:5232`, `[auth] type = htpasswd`, `htpasswd_filename = /etc/radicale/users`, `htpasswd_encryption = bcrypt`,
   `[rights] type = owner_only`, `[storage] filesystem_folder = /var/lib/radicale/collections`, `[web] type = internal`; marker line
-  `# keel-radicale {json}`; the distro file is copied once to `config.keel-orig`), creates `/etc/whm/radicale` 0750 and the users file
+  `# keel-radicale {json}`; the distro file is copied once to `config.keel-orig`), creates `/etc/radicale` 0750 and the users file
   0640 root:radicale (atomic temp + rename, symlinks refused), chowns the store to `radicale`, `systemctl enable --now` and restarts
   on change, `command_failed` with the journal tail when the unit is not active afterwards; `capability_missing` without the
   `radicale` binary or group. `dav.user.set { login, hash }` — `login` matches `DAV_LOGIN_RE` (`local@domain`, lowercase, no `:`),

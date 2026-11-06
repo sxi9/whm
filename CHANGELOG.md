@@ -37,7 +37,7 @@ not for the commit log.
   published) → `{ url, user, account, expiresAt, grantOption }`; audit `db.phpmyadmin.signon.admin` /
   `db.phpmyadmin.signon.as` with the actor; agent op `db.grant.global`. Manual §20.9, contract §44.
 - **Calendars and Contacts (CalDAV/CardDAV) for every account.** Radicale from the distribution runs on loopback
-  with bcrypt htpasswd logins the panel manages (`/etc/whm/radicale/users`, one collection tree per login) and is published
+  with bcrypt htpasswd logins the panel manages (`/etc/radicale/users`, one collection tree per login) and is published
   as `/dav/` under the server hostname site; the admin installs and publishes it from *Service Configuration › Panel Web
   Services Configuration › Calendars (Radicale)* (`GET|POST|DELETE /api/service-config/dav[/install|/publish]`, job
   `dav.install`), the account panel's *Email › Calendars and contacts* page shows the server address, the account's DAV

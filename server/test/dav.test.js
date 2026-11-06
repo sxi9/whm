@@ -12,7 +12,7 @@ const state = { installed: false, published: false, users: new Map(), modulesLoa
 const davStatus = () => ({
   installed: state.installed, version: state.installed ? '3.6.0' : null, bcrypt: state.installed ? true : null, listen: { host: '127.0.0.1', port: 5232 }, packages: DAV_PACKAGES,
   config: { path: '/etc/radicale/config', exists: state.installed, managed: state.installed, inSync: state.installed, meta: null },
-  users: { path: '/etc/whm/radicale/users', exists: state.users.size > 0, count: state.users.size },
+  users: { path: '/etc/radicale/users', exists: state.users.size > 0, count: state.users.size },
   storage: { path: '/var/lib/radicale/collections', exists: state.installed },
   unit: state.installed ? { name: 'radicale', present: true, active: state.unitActive, enabled: true, pid: 4242 } : { name: 'radicale', present: false, active: null, enabled: null },
 });
@@ -34,10 +34,10 @@ function davAgent() {
     'dav.status': davStatus,
     'dav.install': () => {
       if (!state.installed) { const err = new Error('Radicale is not installed'); err.code = 'capability_missing'; throw err; }
-      return { config: { path: '/etc/radicale/config', changed: true }, users: { path: '/etc/whm/radicale/users' }, storage: { path: '/var/lib/radicale/collections', created: false }, unit: { name: 'radicale', present: true, active: true, enabled: true, restarted: true }, listen: { host: '127.0.0.1', port: 5232 } };
+      return { config: { path: '/etc/radicale/config', changed: true }, users: { path: '/etc/radicale/users' }, storage: { path: '/var/lib/radicale/collections', created: false }, unit: { name: 'radicale', present: true, active: true, enabled: true, restarted: true }, listen: { host: '127.0.0.1', port: 5232 } };
     },
-    'dav.user.set': ({ login, hash }) => { const existed = state.users.has(login); state.users.set(login, hash); return { login, path: '/etc/whm/radicale/users', created: !existed, replaced: existed }; },
-    'dav.user.remove': ({ login }) => ({ login, path: '/etc/whm/radicale/users', removed: state.users.delete(login) }),
+    'dav.user.set': ({ login, hash }) => { const existed = state.users.has(login); state.users.set(login, hash); return { login, path: '/etc/radicale/users', created: !existed, replaced: existed }; },
+    'dav.user.remove': ({ login }) => ({ login, path: '/etc/radicale/users', removed: state.users.delete(login) }),
     'dav.collections': ({ login }) => (state.users.has(login) ? { login, path: `/var/lib/radicale/collections/collection-root/${login}`, exists: true, collections: [{ name: 'work', kind: 'calendar', tag: 'VCALENDAR', displayName: 'Work', description: null, color: '#ff0000', items: 3, updatedAt: '2026-11-06T10:00:00.000Z' }] } : { login, path: `/var/lib/radicale/collections/collection-root/${login}`, exists: false, collections: [] }),
   });
 }

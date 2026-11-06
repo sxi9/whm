@@ -25,9 +25,9 @@ describe('dav.* op family', () => {
   it('renders a pinned loopback configuration from constants only', () => {
     const text = renderRadicaleConfig();
     expect(text.startsWith('# Managed by Keel (Calendars and Contacts)')).toBe(true);
-    expect(parseConfigMeta(text)).toEqual({ host: '127.0.0.1', port: 5232, users: '/etc/whm/radicale/users', storage: '/var/lib/radicale/collections' });
+    expect(parseConfigMeta(text)).toEqual({ host: '127.0.0.1', port: 5232, users: '/etc/radicale/users', storage: '/var/lib/radicale/collections' });
     expect(text).toContain('[server]\nhosts = 127.0.0.1:5232\n');
-    expect(text).toContain('[auth]\ntype = htpasswd\nhtpasswd_filename = /etc/whm/radicale/users\nhtpasswd_encryption = bcrypt\n');
+    expect(text).toContain('[auth]\ntype = htpasswd\nhtpasswd_filename = /etc/radicale/users\nhtpasswd_encryption = bcrypt\n');
     expect(text).toContain('[rights]\ntype = owner_only\n');
     expect(text).toContain('[storage]\ntype = multifilesystem\nfilesystem_folder = /var/lib/radicale/collections\n');
     expect(text).not.toMatch(/0\.0\.0\.0|\[::\]/);
@@ -88,7 +88,7 @@ describe('dav.* op family', () => {
     expect(Object.keys(s).sort()).toEqual(['bcrypt', 'config', 'installed', 'listen', 'packages', 'storage', 'unit', 'users', 'version']);
     expect(s.listen).toEqual({ host: '127.0.0.1', port: 5232 });
     expect(s.config.path).toBe('/etc/radicale/config');
-    expect(s.users.path).toBe('/etc/whm/radicale/users');
+    expect(s.users.path).toBe('/etc/radicale/users');
     if (!s.installed) {
       const err = await opError(runOp('dav.install', {}, ctx));
       expect(err).toBeInstanceOf(OpError);
